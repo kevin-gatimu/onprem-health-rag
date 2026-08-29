@@ -1,10 +1,11 @@
 # 20 — Performance Fast Path (latency & throughput)
 
-> Status: PLANNED. Goal: **fast** — cut time-to-first-token (TTFT) and total answer time on the
+> Status: IN PROGRESS. Goal: **fast** — cut time-to-first-token (TTFT) and total answer time on the
 > default chat path without sacrificing the accuracy stack. Current default path costs 1–3 LLM
 > calls (rewrite, expansion, generation) + embed + 2×(1+variants) DB searches + rerank before the
 > first token streams. Companions: `17` (router already removes whole stages for conversational),
 > `21` (latency instrumentation proves each win).
+> Done: 20.1, 20.2, 20.3, 20.4. Skipped: 20.5, 20.6, 20.7, 20.8 (scope/eval gated).
 
 ## Measured shape of a default turn (from code survey)
 
@@ -20,7 +21,7 @@
 
 ## Improvements (ordered)
 
-### 20.1 Fold rewrite + expansion into ONE call — biggest single win
+### 20.1 Fold rewrite + expansion into ONE call — biggest single win [DONE]
 - Replace the two sequential GPU calls with one `AgentKind::QueryRewrite` call returning a strict
   tool-call `rewrite { standalone: string, variants: [string; 2] }`. Same total tokens, one fewer
   round trip + one fewer prefill (~300–800 ms saved every history turn).
@@ -29,20 +30,20 @@
 - Files: `rag/mod.rs` (`prepare_queries()` replaces `rewrite_query`+`expand_queries`),
   `foundry/mod.rs` (tool), config: `ONPREM_MULTI_QUERY_COUNT` still honored.
 
-### 20.2 Parallelize retrieval fan-out
+### 20.2 Parallelize retrieval fan-out [DONE]
 - All (variant × side) searches are independent: `futures::future::join_all` over 6 aggregations,
   and embed all variants in **one** fastembed batch (it's batched anyway — one `spawn_blocking`
   instead of N). DocumentDB handles 6 concurrent cursors trivially.
 - Files: `retrieval/mod.rs`. Expected: retrieval wall time ≈ slowest single search (~50–150 ms)
   instead of the sum.
 
-### 20.3 Query/embedding LRU caches
+### 20.3 Query/embedding LRU caches [DONE]
 - `embed_query` LRU (normalized text → vector, 1024 entries ≈ 4 MB) — repeat and follow-up turns
   hit constantly because rewrite output converges. Invalidation: never (embeddings are pure).
 - Router decision cache is plan 17; rerank/citation results are NOT cached (stale-data risk).
 - Files: `embed/mod.rs` behind the existing `OnceLock`, `Mutex<LruCache>`.
 
-### 20.4 Warm start (kill the first-request cliff)
+### 20.4 Warm start (kill the first-request cliff) [DONE]
 - Today embedder, reranker, and chat model all lazy-load on first use — first user question can pay
   minutes (model download) or tens of seconds (load). Add `ONPREM_WARMUP=true`: on boot, spawn a
   background task that (a) initializes fastembed embedder + reranker (1-text dummy calls),

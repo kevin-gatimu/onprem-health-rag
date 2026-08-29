@@ -17,7 +17,7 @@ use rocket::serde::json::Json;
 use rocket::{State, post};
 use serde::{Deserialize, Serialize};
 
-use super::{ChatTurn, build_prompt, expand_queries, rewrite_query, SYSTEM_PROMPT};
+use super::{ChatTurn, build_prompt, prepare_queries, SYSTEM_PROMPT};
 use crate::answer::{Structured, run_structured};
 use crate::auth::guard::AuthUser;
 use crate::config::RetrievalMode;
@@ -78,8 +78,8 @@ pub async fn search(
     let (mode, rerank, top_k) = resolve(state, &body.opts);
     let foundry = state.foundry()?;
 
-    let standalone = rewrite_query(foundry, &body.history, &body.query).await;
-    let queries = expand_queries(foundry, &state.config, &standalone).await;
+    let (standalone, queries) =
+        prepare_queries(foundry, &state.config, &body.history, &body.query).await;
     let passages =
         retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k).await?;
 
@@ -414,6 +414,24 @@ pub async fn chat(
                         }
                     }
                 }
+
+                // Post-stream citation check: flag [N] references that exceed the
+                // number of passages (the model cited something that doesn't exist).
+                if !had_error && !passages_for_persist.is_empty() {
+                    let n = passages_for_persist.len();
+                    let invalid: Vec<usize> = extract_citation_refs(&full_answer)
+                        .into_iter()
+                        .filter(|&r| r > n)
+                        .collect();
+                    if !invalid.is_empty() {
+                        let verify_json = serde_json::to_string(&serde_json::json!({
+                            "status": "citation_overflow",
+                            "invalid": invalid,
+                        }))
+                        .unwrap_or_default();
+                        yield Event::data(verify_json).event("verify");
+                    }
+                }
             }
         }
 
@@ -433,8 +451,7 @@ async fn build_semantic_chat_data(
     rerank: bool,
     top_k: usize,
 ) -> AppResult<ChatData> {
-    let standalone = rewrite_query(foundry, history, question).await;
-    let queries = expand_queries(foundry, &state.config, &standalone).await;
+    let (standalone, queries) = prepare_queries(foundry, &state.config, history, question).await;
     let passages =
         retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k).await?;
 
@@ -462,4 +479,41 @@ async fn build_semantic_chat_data(
 /// bare `data:` field — fusing words together on the client.
 fn token_event(text: &str) -> Event {
     Event::data(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())).event("token")
+}
+
+/// Extract every unique 1-based citation index from `[N]` patterns in `text`.
+/// Returns a sorted, deduplicated list. Used for the post-stream overflow check.
+fn extract_citation_refs(text: &str) -> Vec<usize> {
+    let mut refs = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '[' {
+            continue;
+        }
+        let mut digits = String::new();
+        loop {
+            match chars.peek() {
+                Some(&d) if d.is_ascii_digit() => {
+                    digits.push(d);
+                    chars.next();
+                }
+                Some(&']') => {
+                    chars.next();
+                    break;
+                }
+                _ => {
+                    digits.clear();
+                    break;
+                }
+            }
+        }
+        if let Ok(n) = digits.parse::<usize>() {
+            if n > 0 {
+                refs.push(n);
+            }
+        }
+    }
+    refs.sort_unstable();
+    refs.dedup();
+    refs
 }

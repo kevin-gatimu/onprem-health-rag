@@ -16,6 +16,7 @@ mod error;
 mod foundry;
 mod ingest;
 mod logstream;
+mod nl2sql;
 mod rag;
 mod retrieval;
 mod router;
@@ -79,6 +80,10 @@ async fn rocket() -> _ {
             if let Err(e) = documentdb::ensure_chat_indexes(&db).await {
                 tracing::warn!(error = %e, "chat index creation failed (non-fatal)");
             }
+            // Create nl2sql schema_catalog indexes (idempotent, best-effort).
+            if let Err(e) = nl2sql::catalog::ensure_nl2sql_indexes(&db, config.embedding_dims).await {
+                tracing::warn!(error = %e, "nl2sql index creation failed (non-fatal)");
+            }
             // Build catalog from ingested data now that the DB is reachable.
             aggregation::catalog::build_from_store(&db).await
         }
@@ -105,6 +110,26 @@ async fn rocket() -> _ {
     // Register execution providers into the in-process core in the background.
     if let Some(f) = &foundry {
         f.spawn_startup_registration();
+    }
+
+    // Warm start: prime the fastembed embedder and reranker in the background so
+    // the first real request does not pay the ONNX model-load latency (~1–3 s).
+    if config.warmup_enabled {
+        let wc = config.clone();
+        tokio::spawn(async move {
+            let _ = crate::embed::embed_query(&wc, "warmup")
+                .await
+                .inspect(|_| tracing::info!("warmup: embedder ready"))
+                .inspect_err(|e| tracing::warn!(error = %e, "warmup: embedder init failed"));
+            let _ = crate::retrieval::rerank::rerank(
+                &wc,
+                "warmup".to_string(),
+                vec!["warmup".to_string()],
+            )
+            .await
+            .inspect(|_| tracing::info!("warmup: reranker ready"))
+            .inspect_err(|e| tracing::warn!(error = %e, "warmup: reranker init failed"));
+        });
     }
 
     // Bind address/port come from our config rather than Rocket.toml.
@@ -201,4 +226,11 @@ async fn rocket() -> _ {
             ],
         )
         .mount("/", rocket::routes![agents::routes::agent])
+        .mount(
+            "/",
+            rocket::routes![
+                nl2sql::routes::nl_query,
+                nl2sql::routes::catalog_refresh,
+            ],
+        )
 }

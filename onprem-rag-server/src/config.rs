@@ -51,6 +51,23 @@ pub struct RouterConfig {
     pub model_router_enabled: bool, // ONPREM_ROUTER_MODEL_ENABLED
     /// Capacity of the per-process Tier-2 route-decision LRU cache (entries).
     pub router_cache_size: usize,   // ONPREM_ROUTER_CACHE_SIZE
+
+    // --- NL-to-SQL (plan 18) ---
+    /// Master switch: when false the router never selects `SourceSql` and the
+    /// `/nl2sql/<id>` endpoints still work but are direct-call only (no routing).
+    pub text2sql_enabled: bool,      // ONPREM_TEXT2SQL_ENABLED
+    /// Model alias for SQL generation (phi-4-mini-instruct works well).
+    pub sql_model: String,           // ONPREM_MODEL_TEXT2SQL
+    /// Maximum schema cards (table cards) injected into the generation prompt.
+    pub nl2sql_tables_max: usize,    // ONPREM_NL2SQL_TABLES_MAX
+    /// Few-shot examples per prompt (retrieved by question-vector similarity).
+    pub nl2sql_fewshots: usize,      // ONPREM_NL2SQL_FEWSHOTS
+    /// Hard cap on rows returned by a SQL query (injected as LIMIT/TOP).
+    pub nl2sql_max_rows: i64,        // ONPREM_NL2SQL_MAX_ROWS
+    /// Query-level timeout in seconds; queries that exceed it are killed.
+    pub nl2sql_timeout_secs: u64,    // ONPREM_NL2SQL_TIMEOUT_SECS
+    /// Per-column sample-value count for schema cards (0 disables sampling).
+    pub nl2sql_sample_values: usize, // ONPREM_NL2SQL_SAMPLE_VALUES
 }
 
 impl RouterConfig {
@@ -70,6 +87,13 @@ impl RouterConfig {
             npu_ctx_cap: env_parse("ONPREM_NPU_CTX_CAP", 4224_u64),
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
+            text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", false),
+            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini-instruct"),
+            nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
+            nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
+            nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
+            nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
+            nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
         }
     }
 }
@@ -117,11 +141,14 @@ pub struct Config {
     pub retrieve_per_side: i64,
     pub rerank_top_n: usize,
     pub context_top_k: usize,
-    /// Optional rerank-score floor (anti-hallucination gate): if the best passage
-    /// scores below this, `/chat` refuses to generate and answers "no relevant
-    /// records". Unset (default) disables the gate — `bge-reranker` scores aren't
-    /// normalised, so tune this against real data before enabling.
+    /// Rerank-score floor (anti-hallucination gate): if the top passage scores below
+    /// this after sigmoid normalisation (plan 19.1), `/chat` refuses to generate.
+    /// Scores are in (0, 1) after sigmoid; 0.30 is the production default.
+    /// Set `ONPREM_SCORE_GATE=0` to disable.
     pub score_gate: Option<f64>,
+    /// Pre-load fastembed embedder and reranker at boot so the first real request
+    /// does not pay the ONNX model-load latency.
+    pub warmup_enabled: bool,
 
     // Query expansion
     pub multi_query_enabled: bool,
@@ -187,8 +214,12 @@ impl Config {
             retrieve_per_side: env_parse("ONPREM_RETRIEVE_PER_SIDE", 50),
             rerank_top_n: env_parse("ONPREM_RERANK_TOP_N", 30),
             context_top_k: env_parse("ONPREM_CONTEXT_TOP_K", 6),
-            // No default floor: leave the gate off unless a site sets a tuned value.
-            score_gate: env::var("ONPREM_SCORE_GATE").ok().and_then(|v| v.parse().ok()),
+            // Default gate 0.30 (post-sigmoid scale). Env var overrides; set to 0 to disable.
+            score_gate: env::var("ONPREM_SCORE_GATE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or(Some(0.30)),
+            warmup_enabled: env_parse("ONPREM_WARMUP_ENABLED", true),
 
             multi_query_enabled: env_parse("ONPREM_MULTI_QUERY_ENABLED", true),
             multi_query_count: env_parse("ONPREM_MULTI_QUERY_COUNT", 3),

@@ -86,6 +86,87 @@ pub async fn expand_queries(foundry: &FoundryManager, config: &Config, query: &s
     out
 }
 
+/// Rewrite and expand queries in one step. When there is no history, the original
+/// question is returned as-is (no model call). When there is history AND multi-query
+/// expansion is enabled, a single model call produces both the standalone rewrite and
+/// the alternative phrasings — saving one round-trip compared to two sequential calls.
+///
+/// Never fails the caller: on any model error it falls back to the two-step path.
+pub async fn prepare_queries(
+    foundry: &FoundryManager,
+    config: &Config,
+    history: &[ChatTurn],
+    question: &str,
+) -> (String, Vec<String>) {
+    let want_expansion = config.multi_query_enabled && config.multi_query_count > 1;
+
+    // No history: standalone is the original question. Optionally expand.
+    if history.is_empty() {
+        if !want_expansion {
+            return (question.to_string(), vec![question.to_string()]);
+        }
+        let queries = expand_queries(foundry, config, question).await;
+        return (question.to_string(), queries);
+    }
+
+    // History present, no expansion: rewrite only.
+    if !want_expansion {
+        let standalone = rewrite_query(foundry, history, question).await;
+        return (standalone.clone(), vec![standalone]);
+    }
+
+    // History present + expansion: one combined model call.
+    let extra = config.multi_query_count - 1;
+    let convo = history
+        .iter()
+        .map(|t| format!("{}: {}", t.role, t.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = format!(
+        "You are a health-records search assistant. Resolve the follow-up question into a \
+         standalone query, then produce {extra} alternative phrasings.\n\
+         Format (output only these lines):\n\
+         STANDALONE: <self-contained question with pronouns resolved>\n\
+         VARIANT: <alternative phrasing>\n\
+         (one VARIANT line per alternative)"
+    );
+    let user = format!("Conversation:\n{convo}\n\nFollow-up question: {question}");
+
+    match foundry.complete(&system, &user).await {
+        Ok(text) => {
+            let mut standalone = question.to_string();
+            let mut variants: Vec<String> = Vec::new();
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if let Some(s) = line.strip_prefix("STANDALONE:") {
+                    let s = s.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+                    if !s.is_empty() {
+                        standalone = s.to_string();
+                    }
+                } else if let Some(v) = line.strip_prefix("VARIANT:") {
+                    let v = strip_list_marker(v.trim());
+                    if !v.is_empty() {
+                        variants.push(v);
+                    }
+                }
+            }
+            variants.truncate(extra);
+            let mut all = vec![standalone.clone()];
+            for v in variants {
+                if !all.iter().any(|q: &String| q.eq_ignore_ascii_case(&v)) {
+                    all.push(v);
+                }
+            }
+            (standalone, all)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "prepare_queries combined call failed; falling back to two-step");
+            let standalone = rewrite_query(foundry, history, question).await;
+            let queries = expand_queries(foundry, config, &standalone).await;
+            (standalone, queries)
+        }
+    }
+}
+
 /// The grounded system prompt: answer only from context, cite by number, refuse when
 /// the context doesn't support an answer (anti-hallucination — this is PHI).
 pub const SYSTEM_PROMPT: &str = "You are a clinical records assistant. Answer the user's question \

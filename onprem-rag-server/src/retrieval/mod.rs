@@ -5,11 +5,15 @@
 //! into a prompt:
 //!
 //! ```text
-//! queries ─┬─ embed → cosmosSearch (vector) ─┐
-//!          └─ $text (lexical, hybrid only) ───┤─→ RRF fuse (rank, k=60)
-//!                                             │      → take top-N
-//!                                             └──────→ cross-encoder rerank (query[0])
-//!                                                        → top-k Passages
+//! queries ─┬─ embed (batch) ──┬─ cosmosSearch (vector) ─┐
+//!          │                  └─ $text (lexical, hybrid) ─┤  all concurrent
+//!          └──────────────────────────────────────────────┘
+//!                                         ↓
+//!                              RRF fuse (rank, k=60)
+//!                                → take top-N
+//!                                → cross-encoder rerank (query[0])
+//!                                    → adaptive trim (gate/2)
+//!                                        → top-k Passages
 //! ```
 //!
 //! Fusion is by **rank** (RRF), not score, because cosine and TSVector scores aren't
@@ -20,7 +24,11 @@ pub mod rerank;
 pub mod rrf;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::LazyLock;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, RetrievalMode};
@@ -63,6 +71,36 @@ impl Passage {
     }
 }
 
+// ICD-10 codes (e.g. E11.9) and all-caps drug tokens (e.g. METFORMIN) should be
+// quoted in $text queries so the server matches the exact token rather than stemming it.
+static RE_ICD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap()
+});
+static RE_DRUG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b[A-Z]{4,}\b").unwrap()
+});
+
+/// Wrap ICD codes and all-caps drug tokens with double quotes so the MongoDB $text
+/// operator matches them exactly. Other query words are left unchanged.
+fn enhance_text_query(query: &str) -> String {
+    let mut extras: Vec<String> = Vec::new();
+    for m in RE_ICD.find_iter(query) {
+        extras.push(format!("\"{}\"", m.as_str()));
+    }
+    for m in RE_DRUG.find_iter(query) {
+        let s = m.as_str();
+        // Skip tokens already captured by RE_ICD to avoid double-quoting.
+        if !RE_ICD.is_match(s) {
+            extras.push(format!("\"{}\"", s));
+        }
+    }
+    if extras.is_empty() {
+        query.to_string()
+    } else {
+        format!("{} {}", extras.join(" "), query)
+    }
+}
+
 /// Run retrieval for a set of queries and return the top-k passages.
 ///
 /// `queries` is the primary query followed by any multi-query expansions; the primary
@@ -77,28 +115,44 @@ pub async fn retrieve(
     rerank_enabled: bool,
     top_k: usize,
 ) -> AppResult<Vec<Passage>> {
-    let queries: Vec<&String> = queries.iter().filter(|q| !q.trim().is_empty()).collect();
+    let queries: Vec<String> = queries
+        .iter()
+        .filter(|q| !q.trim().is_empty())
+        .map(|q| q.to_string())
+        .collect();
     if queries.is_empty() || top_k == 0 {
         return Ok(Vec::new());
     }
 
-    // Collect every hit by id (dedup across queries/sides) plus the per-list rank
-    // orderings RRF fuses. Each vector query and each $text query is its own list.
+    // Embed all queries in one batch — one spawn_blocking call, one fastembed
+    // invocation, LRU cache checked for each before going to the model.
+    let query_vecs = embed::embed_queries(config, queries.clone()).await?;
+
+    // Build every search future (vector + optional $text per query) and run
+    // them all concurrently. Each future captures an owned DocumentDb clone
+    // (cheap: it's a reference-counted MongoDB client handle).
+    let per_side = config.retrieve_per_side;
+    let mut futs: Vec<Pin<Box<dyn Future<Output = AppResult<Vec<Hit>>> + Send>>> = Vec::new();
+
+    for (q, qv) in queries.iter().zip(query_vecs) {
+        let db_v = db.clone();
+        futs.push(Box::pin(async move {
+            crate::documentdb::vector::vector_search(&db_v, qv, per_side).await
+        }));
+        if mode == RetrievalMode::Hybrid {
+            let db_t = db.clone();
+            let enhanced = enhance_text_query(q);
+            futs.push(Box::pin(async move {
+                crate::documentdb::vector::text_search(&db_t, &enhanced, per_side).await
+            }));
+        }
+    }
+
     let mut by_id: HashMap<String, Hit> = HashMap::new();
     let mut rankings: Vec<Vec<String>> = Vec::new();
 
-    for q in &queries {
-        // Vector side: embed the query with the same encoder as documents (BGE-M3).
-        let qv = embed::embed_query(config, q).await?;
-        let vhits = crate::documentdb::vector::vector_search(db, qv, config.retrieve_per_side).await?;
-        rankings.push(collect(&mut by_id, vhits));
-
-        // Lexical side (hybrid only): exact-term recall the embeddings miss.
-        if mode == RetrievalMode::Hybrid {
-            let thits =
-                crate::documentdb::vector::text_search(db, q, config.retrieve_per_side).await?;
-            rankings.push(collect(&mut by_id, thits));
-        }
+    for result in futures::future::join_all(futs).await {
+        rankings.push(collect(&mut by_id, result?));
     }
 
     let fused = rrf::fuse(&rankings, config.rrf_k);
@@ -136,6 +190,20 @@ pub async fn retrieve(
             }
         }
     }
+
+    // Adaptive trim: drop passages from the tail whose score falls below gate/2.
+    // With sigmoid-normalised scores and a gate of 0.30 the trim floor is 0.15 —
+    // passages that weak are nearly always noise. Never truncates to zero.
+    if let Some(gate) = config.score_gate {
+        let half = gate / 2.0;
+        while passages.len() > 1 {
+            match passages.last() {
+                Some(p) if p.score < half => { passages.pop(); }
+                _ => break,
+            }
+        }
+    }
+
     Ok(passages)
 }
 

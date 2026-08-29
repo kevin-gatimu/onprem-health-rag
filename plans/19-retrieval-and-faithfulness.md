@@ -1,9 +1,10 @@
 # 19 — Retrieval Quality & Faithfulness Improvements
 
-> Status: PLANNED. The semantic path (hybrid vector+`$text` → RRF → bge-reranker-v2-m3 → grounded
+> Status: IN PROGRESS. The semantic path (hybrid vector+`$text` → RRF → bge-reranker-v2-m3 → grounded
 > generation) is live and correct. This plan makes it **more precise, more faithful, and more
 > useful for generation** without changing the architecture. Ordered by impact-per-effort.
 > Companions: `20-performance-fast-path.md` (latency), `21-eval-harness.md` (proves each change).
+> Done: 19.1, 19.4, 19.6. Skipped: 19.2, 19.3, 19.5, 19.7 (scope/eval gated).
 
 ## Current gaps (from code survey)
 
@@ -22,7 +23,7 @@
 
 ## Improvements
 
-### 19.1 Calibrated score gate (default ON) — small, highest safety ROI
+### 19.1 Calibrated score gate (default ON) — small, highest safety ROI [DONE]
 - bge-reranker-v2-m3 emits raw logits; apply `sigmoid` in `rerank.rs` so scores are comparable
   probabilities, then gate at `ONPREM_SCORE_GATE=0.30` default (tune with 21's eval set).
 - Behavior change: when the **best** passage < gate → stream the fixed "no relevant records found
@@ -55,7 +56,7 @@
 - Files: `retrieval/mod.rs` (expand step), `rag/mod.rs` (`build_prompt` headers). Gate: eval
   faithfulness + answer-relevance up on multi-chunk rows; context tokens bounded.
 
-### 19.4 Citation discipline + verification pass (optional, default OFF at first)
+### 19.4 Citation discipline + verification pass (optional, default OFF at first) [DONE]
 - **Prompt tightening**: require every factual sentence to end with `[n]`; forbid uncited claims;
   give a one-line few-shot exemplar in `SYSTEM_PROMPT`.
 - **Post-stream citation check** (cheap, deterministic): scan the final answer for `[n]` tokens;
@@ -75,7 +76,7 @@
 - Re-chunking requires re-ingest; note in Sources UI. Gate: eval retrieval hit-rate unchanged or up;
   ingest throughput regression < 25%.
 
-### 19.6 `$text` phrase & code handling
+### 19.6 `$text` phrase & code handling [DONE]
 - Clinical exact-tokens (ICD codes "E11.9", drug names) are the `$text` side's whole job, but the
   Porter stemmer mangles dotted codes. At query time, detect code-like tokens
   (regex `[A-Z]\d{2}(\.\d+)?`, all-caps drug tokens) and add a quoted phrase to the `$search`

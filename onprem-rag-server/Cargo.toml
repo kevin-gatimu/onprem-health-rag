@@ -47,6 +47,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "reg
 # jobs), i.e. a database key indexed in Postgres underneath — v7 sorts by creation
 # and keeps inserts local in the B-tree. (v4 random UUIDs would scatter them.)
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
+# SQL AST parsing for the nl2sql policy gate (SELECT-only + dangerous-function checks).
+sqlparser = { version = "0.53", default-features = false }
+# LRU cache for repeated embed_query calls (same query text -> cached vector).
+lru = "0.12"
 
 # Windows uses the WinML-backed native engine loader for Foundry Local.
 [target.'cfg(windows)'.dependencies]

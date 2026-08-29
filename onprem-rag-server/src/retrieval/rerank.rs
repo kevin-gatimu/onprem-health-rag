@@ -32,6 +32,15 @@ fn resolve_model(name: &str) -> RerankerModel {
     }
 }
 
+/// Map a raw cross-encoder logit to a probability in (0, 1).
+/// bge-reranker-v2-m3 outputs unbounded logits; sigmoid makes them comparable
+/// across queries and lets the score gate (`ONPREM_SCORE_GATE`) use a stable
+/// 0–1 scale rather than a logit-specific threshold.
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 /// Get the process-global reranker, loading it on first call (download on first run).
 fn get_or_init(model: RerankerModel) -> AppResult<&'static Mutex<TextRerank>> {
     if let Some(r) = RERANKER.get() {
@@ -65,7 +74,7 @@ pub async fn rerank(config: &Config, query: String, documents: Vec<String>) -> A
         let results = tr
             .rerank(query.as_str(), docs, false, None)
             .map_err(|e| AppError::Internal(format!("rerank failed: {e}")))?;
-        Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
+        Ok(results.into_iter().map(|r| (r.index, sigmoid(r.score))).collect())
     })
     .await
     .map_err(|e| AppError::Internal(format!("rerank task panicked: {e}")))??;

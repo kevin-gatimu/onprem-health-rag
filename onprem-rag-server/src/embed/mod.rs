@@ -8,9 +8,11 @@
 //! `&mut self`. We therefore hold one process-global model behind a `Mutex` and do
 //! all embedding inside `spawn_blocking` so the Tokio reactor is never blocked.
 
+use std::num::NonZeroUsize;
 use std::sync::{Mutex, OnceLock};
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use lru::LruCache;
 
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
@@ -20,6 +22,17 @@ use crate::error::{AppError, AppResult};
 static EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
 /// Serialises initialisation so two concurrent first-callers don't both download.
 static INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Per-process LRU cache mapping normalised query text to its vector. 1 KiB of
+/// entries covers typical warm-session reuse; the mutex is held only briefly
+/// (clone the hit, release). Serialised writes are negligible vs. spawn_blocking.
+static QUERY_CACHE: OnceLock<Mutex<LruCache<String, Vec<f32>>>> = OnceLock::new();
+
+fn query_cache() -> &'static Mutex<LruCache<String, Vec<f32>>> {
+    QUERY_CACHE.get_or_init(|| {
+        Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap()))
+    })
+}
 
 /// Map the configured model name to a fastembed variant. Defaults to BGE-M3.
 fn resolve_model(name: &str) -> EmbeddingModel {
@@ -88,8 +101,47 @@ pub async fn embed_documents(config: &Config, texts: Vec<String>) -> AppResult<V
     embed_batch(config, texts).await
 }
 
-/// Embed a single query for retrieval (WS6). (BGE-M3 uses no query prefix.)
+/// Embed multiple queries for retrieval, checking and filling a per-process LRU
+/// cache. All cache misses are embedded in one `spawn_blocking` call so multi-query
+/// expansion (typically 3 variants) costs at most one model call.
+pub async fn embed_queries(config: &Config, queries: Vec<String>) -> AppResult<Vec<Vec<f32>>> {
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys: Vec<String> = queries.iter().map(|q| q.trim().to_ascii_lowercase()).collect();
+    let mut results: Vec<Option<Vec<f32>>> = vec![None; keys.len()];
+    let mut miss_indices: Vec<usize> = Vec::new();
+
+    {
+        let mut cache = query_cache()
+            .lock()
+            .map_err(|_| AppError::Internal("embed cache lock poisoned".into()))?;
+        for (i, key) in keys.iter().enumerate() {
+            if let Some(v) = cache.get(key) {
+                results[i] = Some(v.clone());
+            } else {
+                miss_indices.push(i);
+            }
+        }
+    }
+
+    if !miss_indices.is_empty() {
+        let miss_texts: Vec<String> = miss_indices.iter().map(|&i| keys[i].clone()).collect();
+        let vecs = embed_batch(config, miss_texts).await?;
+        let mut cache = query_cache()
+            .lock()
+            .map_err(|_| AppError::Internal("embed cache lock poisoned".into()))?;
+        for (&mi, vec) in miss_indices.iter().zip(vecs) {
+            cache.put(keys[mi].clone(), vec.clone());
+            results[mi] = Some(vec);
+        }
+    }
+
+    Ok(results.into_iter().map(|v| v.unwrap_or_default()).collect())
+}
+
+/// Embed a single query for retrieval (cached via `embed_queries`).
 pub async fn embed_query(config: &Config, query: &str) -> AppResult<Vec<f32>> {
-    let mut out = embed_batch(config, vec![query.to_string()]).await?;
+    let mut out = embed_queries(config, vec![query.to_string()]).await?;
     out.pop().ok_or_else(|| AppError::Internal("embedding produced no vector".into()))
 }

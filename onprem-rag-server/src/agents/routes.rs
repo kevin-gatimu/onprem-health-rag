@@ -37,7 +37,7 @@ use crate::answer::{
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::foundry::router::AgentKind;
-use crate::rag::{SYSTEM_PROMPT, build_prompt, expand_queries, rewrite_query};
+use crate::rag::{SYSTEM_PROMPT, build_prompt, prepare_queries};
 use crate::retrieval;
 use crate::state::AppState;
 
@@ -188,8 +188,8 @@ pub async fn agent(
             let rerank = state.config.rerank_enabled;
             let top_k = state.config.context_top_k;
 
-            let standalone = rewrite_query(foundry, &history, &req.question).await;
-            let queries = expand_queries(foundry, &state.config, &standalone).await;
+            let (standalone, queries) =
+                prepare_queries(foundry, &state.config, &history, &req.question).await;
             let passages =
                 retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k)
                     .await?;
