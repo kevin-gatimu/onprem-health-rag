@@ -1,0 +1,164 @@
+# On-Prem RAG server — REST Client scratchpad (VS Code "REST Client" extension).
+#
+# Usage:
+#   1. Run "POST /auth/login" first (it's tagged `@name login`).
+#   2. Every protected request reuses its JWT via {{login.response.body.$.token}},
+#      so you don't paste tokens by hand — just keep the login response in the session.
+#   3. Click "Send Request" above any request below.
+#
+# All routes except /auth/login and /health require `Authorization: Bearer <jwt>`.
+# SSE routes (/generate, /ingest/.../stream, /chat) stream events in the response pane.
+
+@host = http://localhost:8000
+@username = admin
+@password = password
+
+### ── Health ───────────────────────────────────────────────────────────────
+# Public. `documentdb` flips to "down" if the DB ping fails.
+GET {{host}}/health
+
+### ── Auth ─────────────────────────────────────────────────────────────────
+# Log in. Tagged `login` so later requests can read {{login.response.body.$.token}}.
+# @name login
+POST {{host}}/auth/login
+Content-Type: application/json
+
+{
+  "username": "{{username}}",
+  "password": "{{password}}"
+}
+
+### Current identity (proves the token guard works).
+GET {{host}}/auth/me
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Create a user (admin only). role is optional: "admin" | "user" (defaults to user).
+POST {{host}}/auth/users
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "username": "analyst",
+  "password": "change-me",
+  "role": "user"
+}
+
+### ── Foundry Local / hardware ─────────────────────────────────────────────
+# Execution providers + current chat model.
+GET {{host}}/hardware
+Authorization: Bearer {{login.response.body.$.token}}
+
+### List catalog models (cached/loaded flags).
+GET {{host}}/models
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Download (if needed), load, and select a chat model. Admin only.
+# Accepts an alias (e.g. "qwen2.5-7b") or a full variant id (pins the execution provider).
+POST {{host}}/models/select
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "model": "qwen2.5-7b-instruct-openvino-gpu:2"
+}
+
+### Stream a raw completion (SSE: token* → done | error). Sanity-checks the chat model.
+POST {{host}}/generate
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "prompt": "In one sentence, what is retrieval-augmented generation?"
+}
+
+### ── Sources ──────────────────────────────────────────────────────────────
+# List saved sources (any authenticated user).
+GET {{host}}/sources
+Authorization: Bearer {{login.response.body.$.token}}
+
+### Test a connection without saving (admin only). kind: "postgres" | "mysql" | "mssql".
+# port is optional (defaults to the engine's standard port). Provide `query` OR `table`.
+POST {{host}}/sources/test
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "name": "dev-postgres",
+  "kind": "postgres",
+  "host": "localhost",
+  "port": 5432,
+  "database": "health_records",
+  "username": "health",
+  "password": "health",
+  "table": "patient_encounters"
+}
+
+### Save a source (tests first, then stores with the password encrypted at rest).
+# Admin only. Tagged `create_source` so /ingest can reuse the returned id.
+# @name create_source
+POST {{host}}/sources
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "name": "dev-postgres",
+  "kind": "postgres",
+  "host": "localhost",
+  "port": 5432,
+  "database": "health_records",
+  "username": "health",
+  "password": "health",
+  "table": "patient_encounters"
+}
+
+### ── Ingestion ────────────────────────────────────────────────────────────
+# Start an ingest job (admin only). Reuses the id from the saved source above.
+# `limit` is optional — cap rows for a quick trial. Returns { "job_id": ... }.
+# @name ingest
+POST {{host}}/ingest
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "source_id": "{{create_source.response.body.$.id}}",
+  "limit": null
+}
+
+### Follow ingest progress (SSE: progress* → done | error).
+GET {{host}}/ingest/{{ingest.response.body.$.job_id}}/stream
+Authorization: Bearer {{login.response.body.$.token}}
+
+### ── Live logs ────────────────────────────────────────────────────────────
+# Server tracing events as SSE (event: log, data: LogLine JSON). Any authenticated
+# user; drops a `warn` event if a slow client falls behind. Powers the app's log
+# windows. Without the Authorization header this returns 401.
+GET {{host}}/logs/stream
+Authorization: Bearer {{login.response.body.$.token}}
+
+### ── Retrieval + RAG chat ─────────────────────────────────────────────────
+# Debug view of the pipeline: rewritten query, expansions, ranked/fused/reranked passages.
+# mode ("vector"|"hybrid"), rerank, and top_k are optional per-request overrides.
+POST {{host}}/search
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "query": "Which patient was treated for pneumonia?",
+  "mode": "hybrid",
+  "rerank": true,
+  "top_k": 6
+}
+
+### Grounded, streamed answer with citations (SSE: citations → token* → done | error).
+# `history` carries prior turns for history-aware rewrite; retrieval overrides are optional.
+POST {{host}}/chat
+Authorization: Bearer {{login.response.body.$.token}}
+Content-Type: application/json
+
+{
+  "question": "Which patient was treated for pneumonia, and what was prescribed?",
+  "history": [],
+  "mode": "hybrid",
+  "rerank": true,
+  "top_k": 6
+}

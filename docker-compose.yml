@@ -1,0 +1,70 @@
+# On-Prem Health-Records RAG — local infrastructure
+#
+#   docker compose up -d documentdb            # required: the document database
+#   docker compose --profile dev-sources up -d # optional: a seeded Postgres source DB for testing
+#
+# DocumentDB (documentdb.io) speaks the MongoDB wire protocol on port 10260.
+# Credentials are passed to the entrypoint as --username/--password args.
+# The container reports "Up" before it accepts connections — wait for the log line
+# "=== DocumentDB is ready ===" (see the healthcheck below) before connecting.
+
+services:
+  documentdb:
+    image: ghcr.io/documentdb/documentdb/documentdb-local:latest
+    container_name: rag-documentdb
+    restart: unless-stopped
+    ports:
+      - "${DOCUMENTDB_PORT:-10260}:10260"   # MongoDB-wire gateway
+      # - "9712:9712"                       # internal PostgreSQL (usually not needed)
+    command:
+      - "--username"
+      - "${DOCUMENTDB_USER:-docadmin}"
+      - "--password"
+      - "${DOCUMENTDB_PASSWORD:-ChangeMe_Doc123}"
+    volumes:
+      - documentdb-data:/data
+    healthcheck:
+      # The gateway prints "=== DocumentDB is ready ===" to PID 1's stdout when accepting connections.
+      test: ["CMD-SHELL", "grep -q 'DocumentDB is ready' /proc/1/fd/1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Optional: a sample PostgreSQL "source" database with fake health records,
+  # so ingestion can be exercised end-to-end without a real hospital system.
+  # Loads a normalized synthetic EMR (~25 tables: patients, encounters,
+  # diagnoses, prescriptions, labs, imaging, admissions, billing) from
+  # docker/dev-postgres/init/ (01_schema.sql then 02_seed.sql, in name order).
+  # Enable with:  docker compose --profile dev-sources up -d
+  # Init scripts run only on a fresh data dir. To reload after a change, reset
+  # just this service's volume (do NOT use `down -v`, which also wipes the
+  # DocumentDB volume):
+  #   docker rm -f rag-dev-postgres
+  #   docker volume rm rag_dev-postgres-data
+  #   docker compose --profile dev-sources up -d dev-postgres
+  # ---------------------------------------------------------------------------
+  dev-postgres:
+    image: postgres:17
+    container_name: rag-dev-postgres
+    profiles: ["dev-sources"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DEV_PG_USER:-health}
+      POSTGRES_PASSWORD: ${DEV_PG_PASSWORD:-health}
+      POSTGRES_DB: ${DEV_PG_DB:-health_records}
+    ports:
+      - "${DEV_PG_PORT:-5432}:5432"
+    volumes:
+      - dev-postgres-data:/var/lib/postgresql/data
+      - ./docker/dev-postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DEV_PG_USER:-health} -d ${DEV_PG_DB:-health_records}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  documentdb-data:
+  dev-postgres-data:
