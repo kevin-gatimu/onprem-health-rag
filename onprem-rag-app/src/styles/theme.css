@@ -1,0 +1,155 @@
+@import "tailwindcss";
+
+/* ─── Design tokens ──────────────────────────────────────────────────────────
+   Ported from the Electron reference's _tokens.scss into Tailwind v4's CSS-first
+   @theme. Dark-only. Utility naming (what the token generates):
+     backgrounds  bg-base / bg-surface / bg-elevated
+     text         text-fg / text-fg-muted / text-fg-subtle / text-fg-disabled
+     borders      border-border / border-border-strong
+     accent       *-accent / *-accent-hover / *-accent-subtle / text-accent-fg
+     status       *-success / *-warning / *-danger  (+ their -subtle bg tints)
+   The reference SCSS semantic names map here as:
+     bg-primary→base, bg-secondary→surface, bg-elevated→elevated,
+     text-primary→fg, text-secondary→fg-muted, text-muted→fg-subtle. */
+@theme {
+  /* Surfaces */
+  --color-base: #0f1117;
+  --color-surface: #161b24;
+  --color-elevated: #1e2533;
+  --color-overlay: rgba(12, 15, 20, 0.8);
+
+  /* Borders */
+  --color-border: rgba(61, 79, 107, 0.3);
+  --color-border-strong: rgba(90, 111, 143, 0.5);
+
+  /* Text */
+  --color-fg: #f0f4f8;
+  --color-fg-muted: #8297b5;
+  --color-fg-subtle: #5a6f8f;
+  --color-fg-disabled: #2a3347;
+
+  /* Accent — accent-fg is the near-black text placed on a solid accent fill */
+  --color-accent: #3b82f6;
+  --color-accent-hover: #60a5fa;
+  --color-accent-subtle: rgba(59, 130, 246, 0.12);
+  --color-accent-fg: #0c0f14;
+
+  /* Status */
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-success-subtle: rgba(34, 197, 94, 0.1);
+  --color-warning-subtle: rgba(251, 191, 36, 0.1);
+  --color-danger-subtle: rgba(239, 68, 68, 0.1);
+
+  /* Radii */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+  /* Fonts */
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "Cascadia Code", "Fira Code", "Consolas", monospace;
+
+  /* Mobile-first fixed type scale (replaces the reference's fluid clamp() sizes,
+     which collapse to their floor on a phone). Step sizes up per-screen at md:. */
+  --text-xs: 11px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+
+  /* Sidebar geometry (used by AppShell layout math) */
+  --sidebar-expanded: 240px;
+  --sidebar-collapsed: 60px;
+
+  /* Breakpoints for large desktop / 4K. Tailwind defaults stop at 2xl (1536px);
+     these give handles for wide monitors so content can use the extra width. */
+  --breakpoint-3xl: 120rem; /* 1920px */
+  --breakpoint-4xl: 160rem; /* 2560px */
+}
+
+/* Chart palette lives on :root (NOT in @theme) — AgentChart reads these via
+   getComputedStyle at render time, so they are a runtime dependency. */
+:root {
+  --chart-series-1: #60a5fa;
+  --chart-series-2: #2dd4bf;
+  --chart-series-3: #fbbf24;
+  --chart-series-4: #a78bfa;
+  --chart-series-5: #4ade80;
+  --chart-series-6: #f472b6;
+  --chart-series-7: #38bdf8;
+  --chart-series-8: #fb923c;
+  /* Axis / grid / label vars — read at render time by AgentChart via getComputedStyle */
+  --chart-grid: rgba(90, 111, 143, 0.2);
+  --chart-axis: rgba(130, 151, 181, 0.5);
+  --chart-label: #8297b5;
+  --chart-value: #f0f4f8;
+}
+
+/* ─── Animation keyframes (outside @theme — plain CSS) ──────────────────────
+   ecg-scroll-logo  used by EcgLogo: scrolls the 56-unit ECG path left by one
+                    28-unit cycle so the waveform appears to scroll seamlessly.
+   ecg-scroll-bg    used by LoginBackground: shifts each trace group left by
+                    exactly one CYCLE_W (120 px) so the loop is seamless. */
+@keyframes ecg-scroll-logo {
+  from { transform: translateX(0px);    }
+  to   { transform: translateX(-28px);  }
+}
+
+@keyframes ecg-scroll-bg {
+  from { transform: translateX(0px);    }
+  to   { transform: translateX(-120px); }
+}
+
+/* Base layer — global resets the reference kept in _base.scss */
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-base);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  /* Tailwind v4 resets border-color to currentColor; restore our token default. */
+  *,
+  ::before,
+  ::after {
+    border-color: var(--color-border);
+  }
+
+  /* Thin dark scrollbars to match the reference. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-border-strong);
+    border-radius: var(--radius-full);
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
