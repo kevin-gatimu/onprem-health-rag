@@ -4,3 +4,50 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+argon2 = "0.5.3"
+async-trait = "0.1"
+# Source-DB connectors. sqlx covers Postgres + MySQL; sqlx dropped MSSQL, so
+# SQL Server goes through tiberius (TDS). rustls on both to avoid OpenSSL on Windows.
+# The type features (json/chrono/bigdecimal/uuid) let WS5 decode arbitrary row
+# columns to JSON: Postgres rows come back whole via `to_jsonb`; MySQL/MSSQL cells
+# are decoded per-column by trying these concrete types in turn.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "json", "chrono", "bigdecimal", "uuid"] }
+tiberius = { version = "0.12", default-features = false, features = ["rustls", "tds73", "chrono"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+# Encrypt source-DB credentials at rest (AES-256-GCM; key derived from the server key).
+aes-gcm = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# Anchored regexes for the Tier-0 conversational gate (router). Compiled once via LazyLock.
+regex = "1"
+chrono = { version = "0.4.45", features = ["serde"] }
+dotenvy = "0.15.7"
+# Local embeddings (BGE-M3) + cross-encoder reranking, both via ONNX Runtime. Default
+# ORT path only — the candle-backed `qwen3` feature is intentionally not enabled.
+fastembed = "6"
+# Foundry Local (chat) manager: native engine via libloading + async-openai client.
+# No ort dependency, so no conflict with fastembed. `winml` feature added on Windows below.
+foundry-local-sdk = "1"
+# Re-exported by foundry-local-sdk but ChatCompletionTool (the inner wrapper around
+# FunctionObject) is not re-exported, so we depend on it directly for Phase 3 tool
+# construction. Pin to the same minor as foundry-local-sdk uses (0.33).
+async-openai = { version = "0.33", default-features = false, features = ["chat-completion-types"] }
+futures = "0.3.34"
+jsonwebtoken = "9"
+mongodb = "3.8.1"
+rocket = { version = "0.5.1", features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "registry"] }
+# v7 = time-ordered UUIDs: every UUID we mint is a DocumentDB `_id` (users, sources,
+# jobs), i.e. a database key indexed in Postgres underneath — v7 sorts by creation
+# and keeps inserts local in the B-tree. (v4 random UUIDs would scatter them.)
+uuid = { version = "1.25.0", features = ["v7", "serde"] }
+
+# Windows uses the WinML-backed native engine loader for Foundry Local.
+[target.'cfg(windows)'.dependencies]
+foundry-local-sdk = { version = "1", features = ["winml"] }
