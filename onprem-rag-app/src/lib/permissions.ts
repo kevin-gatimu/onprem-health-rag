@@ -15,7 +15,7 @@ export const ROUTE_PERMISSIONS: Record<Route, Role[]> = {
   "/ingest": ["admin"],
   "/audit": ["admin"],
   "/admin": ["admin"],
-  "/agents": ["admin", "doctor", "analyst"],
+  "/agents": ALL,
   "/analytics": ["admin", "doctor", "analyst"],
   "/alerts": ["admin", "doctor", "analyst"],
   "/data": ALL,

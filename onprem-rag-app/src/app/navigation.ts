@@ -7,7 +7,6 @@ import {
   Database,
   Download,
   FolderOpen,
-  MessageSquare,
   Cpu,
   Boxes,
   BarChart3,
@@ -29,14 +28,13 @@ export interface NavItem {
   section: NavSection;
 }
 
-/** The 13 navigable destinations, in display order, grouped into three sections. */
+/** Navigable destinations, in display order, grouped into three sections. */
 export const NAV_ITEMS: NavItem[] = [
   // Main
   { route: "/", label: "Dashboard", icon: LayoutDashboard, section: "Main" },
   { route: "/connections", label: "Connections", icon: Database, section: "Main" },
   { route: "/ingest", label: "Ingest", icon: Download, section: "Main" },
   { route: "/data", label: "Data Explorer", icon: FolderOpen, section: "Main" },
-  { route: "/chat", label: "AI Chat", icon: MessageSquare, section: "Main" },
   { route: "/agents", label: "AI Agents", icon: Cpu, section: "Main" },
   { route: "/models", label: "Models", icon: Boxes, section: "Main" },
   // Analytics
@@ -56,7 +54,7 @@ export const NAV_SECTIONS: NavSection[] = ["Main", "Analytics", "System"];
  * Routes surfaced in the phone bottom tab bar (the rest live behind "More").
  * Chosen for the primary daily tasks; "More" opens the full NAV_ITEMS sheet.
  */
-export const BOTTOM_BAR_ROUTES: Route[] = ["/", "/data", "/chat", "/agents"];
+export const BOTTOM_BAR_ROUTES: Route[] = ["/", "/data", "/agents"];
 
 /** Look up an item's metadata by route (e.g. to title the current page). */
 export function navItem(route: Route): NavItem | undefined {

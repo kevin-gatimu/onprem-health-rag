@@ -94,24 +94,24 @@ const ROLE_ACTIONS: Record<Role, ActionDef[]> = {
   admin: [
     { icon: <Database size={18} />,     title: 'Connect a database', subtitle: 'MySQL, PostgreSQL, MSSQL',               route: '/connections' },
     { icon: <Download size={18} />,     title: 'Ingest data',        subtitle: 'Analyse schema and start indexing',      route: '/ingest' },
-    { icon: <MessageSquare size={18} />, title: 'Ask the AI',        subtitle: 'Clinical RAG chat — Foundry Local',      route: '/chat' },
+    { icon: <MessageSquare size={18} />, title: 'Ask the AI',        subtitle: 'Clinical RAG chat — Foundry Local',      route: '/agents' },
     { icon: <ShieldCheck size={18} />,  title: 'Manage users',       subtitle: 'Create, edit and assign roles',          route: '/admin' },
   ],
   doctor: [
-    { icon: <MessageSquare size={18} />, title: 'AI Clinical Chat',        subtitle: 'Differential diagnosis powered by Foundry Local', route: '/chat' },
+    { icon: <MessageSquare size={18} />, title: 'AI Clinical Chat',        subtitle: 'Differential diagnosis powered by Foundry Local', route: '/agents' },
     { icon: <FolderOpen size={18} />,    title: 'Browse Patient Records',  subtitle: 'Explore indexed clinical data',                   route: '/data' },
     { icon: <BarChart3 size={18} />,     title: 'Disease Trends',          subtitle: 'Analytics & population health',                   route: '/analytics' },
     { icon: <Bell size={18} />,          title: 'Outbreak Alerts',         subtitle: 'Monitor disease patterns in real time',            route: '/alerts' },
   ],
   nurse: [
-    { icon: <MessageSquare size={18} />, title: 'AI Chat',           subtitle: 'Clinical support & quick reference',     route: '/chat' },
+    { icon: <MessageSquare size={18} />, title: 'AI Agents',         subtitle: 'Clinical support & quick reference',     route: '/agents' },
     { icon: <FolderOpen size={18} />,    title: 'Browse Records',    subtitle: 'View indexed patient data',              route: '/data' },
     // /alerts is admin/doctor/analyst only — canAccess() filters this out for nurse.
     { icon: <Bell size={18} />,          title: 'Outbreak Alerts',   subtitle: 'Monitor active disease alerts',          route: '/alerts' },
   ],
   analyst: [
     { icon: <BarChart3 size={18} />,     title: 'Analytics',         subtitle: 'Disease trends & population health',     route: '/analytics' },
-    { icon: <MessageSquare size={18} />, title: 'AI Chat',           subtitle: 'Data analysis with Foundry Local',       route: '/chat' },
+    { icon: <MessageSquare size={18} />, title: 'AI Agents',         subtitle: 'Data analysis with Foundry Local',       route: '/agents' },
     { icon: <FolderOpen size={18} />,    title: 'Browse Records',    subtitle: 'Explore indexed health data',            route: '/data' },
     { icon: <Bell size={18} />,          title: 'Outbreak Alerts',   subtitle: 'Monitor disease patterns',               route: '/alerts' },
   ],

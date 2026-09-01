@@ -33,6 +33,7 @@ import { Button, Modal } from '../../components/ui';
 import ConversationList from './ConversationList';
 import MessageList from './MessageList';
 import Composer from './Composer';
+import Chat from '../chat';
 
 // ── Kind selector config ─────────────────────────────────────────────────────
 
@@ -134,6 +135,54 @@ export default function Agents() {
     if (kind !== selectedKind) useAgents.getState().setSelectedKind(kind);
   }
 
+  const kindSelector = (
+    <div
+      className="flex-shrink-0 flex items-center gap-1 pb-3 overflow-x-auto"
+      role="tablist"
+      aria-label="Agent type"
+    >
+      {KIND_TABS.map((tab) => (
+        <button
+          key={tab.kind}
+          role="tab"
+          aria-selected={selectedKind === tab.kind}
+          onClick={() => handleKindChange(tab.kind)}
+          className={[
+            'shrink-0 px-3 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap min-h-[44px]',
+            selectedKind === tab.kind
+              ? 'bg-accent-subtle text-fg'
+              : 'text-fg-muted hover:bg-elevated hover:text-fg',
+          ].join(' ')}
+        >
+          {tab.label}
+        </button>
+      ))}
+      {selectedKind !== 'auto' && (
+        <button
+          type="button"
+          onClick={() => setPanelOpen((open) => !open)}
+          className="hidden md:flex ml-auto shrink-0 items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-fg-muted hover:bg-elevated hover:text-fg min-h-[44px]"
+          aria-expanded={panelOpen}
+          aria-controls="agent-data-overview"
+        >
+          <Info size={16} aria-hidden="true" />
+          Data Overview
+        </button>
+      )}
+    </div>
+  );
+
+  if (selectedKind === 'auto') {
+    return (
+      <div className="flex flex-col h-full">
+        {kindSelector}
+        <div className="flex-1 min-h-0">
+          <Chat />
+        </div>
+      </div>
+    );
+  }
+
   // ── Active conversation title for the mobile header ──────────────────────────
   const activeTitle = activeConvId
     ? (conversations.find((c) => c.id === activeConvId)?.title ?? 'Agent Chat')
@@ -144,28 +193,7 @@ export default function Agents() {
     <div className="flex flex-col h-full">
 
       {/* Agent kind selector — horizontal-scroll strip (mobile) / pill tabs (md+) */}
-      <div
-        className="flex-shrink-0 flex items-center gap-1 pb-3 overflow-x-auto"
-        role="tablist"
-        aria-label="Agent type"
-      >
-        {KIND_TABS.map((tab) => (
-          <button
-            key={tab.kind}
-            role="tab"
-            aria-selected={selectedKind === tab.kind}
-            onClick={() => handleKindChange(tab.kind)}
-            className={[
-              'shrink-0 px-3 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap min-h-[44px]',
-              selectedKind === tab.kind
-                ? 'bg-accent-subtle text-fg'
-                : 'text-fg-muted hover:bg-elevated hover:text-fg',
-            ].join(' ')}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
+      {kindSelector}
 
       {/* Mobile top row: drawer button + active title + data overview toggle */}
       <div className="md:hidden flex items-center gap-2 pb-3 flex-shrink-0">
@@ -191,7 +219,7 @@ export default function Agents() {
       </div>
 
       {/* Main layout: single column (mobile) → two column (md+) → three column (xl+) */}
-      <div className="flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] xl:grid-cols-[260px_minmax(0,1fr)_220px] rounded-lg border border-border overflow-hidden">
+      <div className={`flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] ${panelOpen ? 'xl:grid-cols-[260px_minmax(0,1fr)_220px]' : ''} rounded-lg border border-border overflow-hidden`}>
 
         {/* Left rail — desktop only; conversation list */}
         <aside className="hidden md:flex md:flex-col border-r border-border bg-surface">
@@ -237,7 +265,7 @@ export default function Agents() {
         </div>
 
         {/* Context panel — xl+ third column; hidden on smaller screens */}
-        <aside className="hidden xl:flex xl:flex-col border-l border-border bg-surface overflow-y-auto p-3 gap-3">
+        {panelOpen && <aside id="agent-data-overview" className="hidden xl:flex xl:flex-col border-l border-border bg-surface overflow-y-auto p-3 gap-3">
           <h3 className="text-xs font-semibold text-fg-muted uppercase tracking-wide flex items-center gap-1.5 flex-shrink-0">
             <Bot size={12} aria-hidden="true" />
             Data Overview
@@ -276,7 +304,7 @@ export default function Agents() {
               {KIND_BLURBS[selectedKind] ?? ''}
             </p>
           </div>
-        </aside>
+        </aside>}
       </div>
 
       {/* Mobile conversation drawer */}
