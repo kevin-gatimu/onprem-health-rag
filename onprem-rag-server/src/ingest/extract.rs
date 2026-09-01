@@ -191,19 +191,16 @@ impl Extractor {
 
     /// Extract a batch of `(row_pk, text)` pairs with bounded concurrency.
     ///
-    /// Only annotated rows come back; ineligible rows and failures are counted so the
-    /// caller can report both in the job log without inspecting the annotations.
+    /// Only annotated rows come back; ineligible rows and empty model results are omitted.
     /// Takes the rows **by value** rather than by slice on purpose: a future that
     /// borrows from the caller's buffer is generic over that borrow's lifetime, which
     /// makes the whole stream higher-ranked and costs `ingest::run` the `Send` bound
     /// `tokio::spawn` needs. Owning the rows keeps every lifetime concrete.
     pub async fn extract_batch(&self, rows: Vec<(String, String)>) -> ExtractBatch {
-        let total = rows.len();
         let eligible_rows: Vec<(String, String)> = rows
             .into_iter()
             .filter(|(_, text)| eligible(text, self.min_words))
             .collect();
-        let skipped = total - eligible_rows.len();
 
         let jobs = eligible_rows.into_iter().map(|(pk, text)| async move {
             let out = self.extract_one(&text).await;
@@ -215,19 +212,11 @@ impl Extractor {
             .collect()
             .await;
 
-        let mut annotated = Vec::new();
-        let mut empty = 0usize;
-        for (pk, out) in results {
-            match out {
-                Some(e) => annotated.push((pk, e)),
-                None => empty += 1,
-            }
-        }
-        ExtractBatch {
-            annotated,
-            skipped,
-            empty,
-        }
+        let annotated = results
+            .into_iter()
+            .filter_map(|(pk, out)| out.map(|extracted| (pk, extracted)))
+            .collect();
+        ExtractBatch { annotated }
     }
 }
 
@@ -235,10 +224,6 @@ impl Extractor {
 pub struct ExtractBatch {
     /// `(row_pk, annotation)` for every row that produced at least one entity.
     pub annotated: Vec<(String, ExtractedClinical)>,
-    /// Rows that never reached the model (below `extract_min_words`).
-    pub skipped: usize,
-    /// Rows the model saw but returned nothing usable for (no entities, or a failure).
-    pub empty: usize,
 }
 
 #[cfg(test)]

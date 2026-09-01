@@ -523,23 +523,22 @@ pub async fn chat(
                 // Persist the exchange with no passages (there are none to cite).
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        use crate::routes::conversations::persist_assistant_message;
-                        if let Err(e) = trace
+                        trace
                             .time(
                                 Stage::Persist,
-                                persist_assistant_message(
+                                persist_and_compact(
                                     &db,
                                     cid.as_str(),
                                     &uid,
                                     &full_answer,
                                     &[],
                                     None,
+                                    &cfg,
+                                    &foundry_handle,
+                                    "conversational",
                                 ),
                             )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to persist conversational message");
-                        }
+                            .await;
                     }
                 }
             }
@@ -600,23 +599,22 @@ pub async fn chat(
                 yield token_event(&answer);
 
                 if let Some(cid) = &persist_target {
-                    use crate::routes::conversations::persist_assistant_message;
-                    if let Err(e) = trace
+                    trace
                         .time(
                             Stage::Persist,
-                            persist_assistant_message(
+                            persist_and_compact(
                                 &db,
                                 cid.as_str(),
                                 &uid,
                                 &full_answer,
                                 &[],
                                 None,
+                                &cfg,
+                                &foundry_handle,
+                                "direct_structured",
                             ),
                         )
-                        .await
-                    {
-                        tracing::warn!(error = %e, "failed to persist structured assistant message");
-                    }
+                        .await;
                 }
             }
 
@@ -657,23 +655,22 @@ pub async fn chat(
 
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        use crate::routes::conversations::persist_assistant_message;
-                        if let Err(e) = trace
+                        trace
                             .time(
                                 Stage::Persist,
-                                persist_assistant_message(
+                                persist_and_compact(
                                     &db,
                                     cid.as_str(),
                                     &uid,
                                     &full_answer,
                                     &passages_for_persist,
                                     None,
+                                    &cfg,
+                                    &foundry_handle,
+                                    "structured",
                                 ),
                             )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to persist structured assistant message");
-                        }
+                            .await;
                     }
                 }
             }
@@ -760,23 +757,22 @@ pub async fn chat(
                 // "update latest message" lookup is needed.
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        use crate::routes::conversations::persist_assistant_message;
-                        if let Err(e) = trace
+                        trace
                             .time(
                                 Stage::Persist,
-                                persist_assistant_message(
+                                persist_and_compact(
                                     &db,
                                     cid.as_str(),
                                     &uid,
                                     &full_answer,
                                     &passages_for_persist,
                                     verification.as_ref(),
+                                    &cfg,
+                                    &foundry_handle,
+                                    "semantic",
                                 ),
                             )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to persist assistant message");
-                        }
+                            .await;
                     }
                 }
             }
@@ -877,13 +873,14 @@ async fn persist_and_compact(
     uid: &str,
     full_answer: &str,
     passages: &[Passage],
+    verification: Option<&crate::verify::VerifyReport>,
     cfg: &Config,
     foundry_handle: &Option<Arc<FoundryManager>>,
     kind: &str,
 ) {
     use crate::routes::conversations::{clip_message_bytes, persist_assistant_message};
     let content = clip_message_bytes(full_answer, cfg.message_max_bytes);
-    match persist_assistant_message(db, cid, uid, &content, passages, None).await {
+    match persist_assistant_message(db, cid, uid, &content, passages, verification).await {
         Ok(()) => {
             crate::memory::maybe_spawn_compaction(
                 db.clone(),
