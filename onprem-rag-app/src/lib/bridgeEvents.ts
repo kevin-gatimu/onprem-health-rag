@@ -9,8 +9,8 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type ModelEvent, type Passage, type AgentKind, type AggRow, type VerifyReport } from "./bridge";
-import { useStream, createRafBuffer } from "../stores/stream";
+import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow } from "./bridge";
+import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
 import { notifyBackground } from "./notify";
 import { toast } from "../stores/ui";
@@ -136,18 +136,15 @@ export async function initBridgeEvents(): Promise<void> {
   // Registered once at boot; each event carries a run_id so stale-run events are
   // dropped (double-filtered: the push guard + the store's setter guard).
 
-  // Token buffer: coalesces per-token pushes to one store update per rAF frame.
-  const tokenBuffer = createRafBuffer<string>((batch) => {
-    const p = useChat.getState().pending;
-    if (p) useChat.getState().appendAnswer(p.runId, batch);
+  // Each run gets its own frame batch so simultaneous streams cannot mix tokens.
+  const tokenBuffer = createKeyedRafBuffer<string>((runId, batch) => {
+    useChat.getState().appendAnswer(runId, batch);
   });
 
   unlisteners.push(
     await listen<ChatEvent>("chat://token", (ev) => {
       const { run_id, data } = ev.payload;
-      if (run_id === useChat.getState().pending?.runId) {
-        tokenBuffer.push(data);
-      }
+      if (useChat.getState().runs[run_id]) tokenBuffer.push(run_id, data);
     }),
   );
 
@@ -177,6 +174,7 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("chat://error", (ev) => {
       const { run_id, data } = ev.payload;
+      tokenBuffer.flushNow(run_id);
       useChat.getState().setError(run_id, data);
     }),
   );
@@ -184,7 +182,7 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("chat://done", (ev) => {
       const { run_id } = ev.payload;
-      tokenBuffer.flushNow();
+      tokenBuffer.flushNow(run_id);
       useChat.getState().finish(run_id);
     }),
   );
@@ -193,18 +191,15 @@ export async function initBridgeEvents(): Promise<void> {
   // Registered once at boot; each event carries a run_id so stale-run events are
   // dropped (double-filtered: the push guard + the store's setter guard).
 
-  // Token buffer: coalesces per-token pushes to one store update per rAF frame.
-  const agentTokenBuffer = createRafBuffer<string>((batch) => {
-    const p = useAgents.getState().pending;
-    if (p) useAgents.getState().appendAnswer(p.runId, batch);
+  // Keep independent agent streams in separate frame batches.
+  const agentTokenBuffer = createKeyedRafBuffer<string>((runId, batch) => {
+    useAgents.getState().appendAnswer(runId, batch);
   });
 
   unlisteners.push(
     await listen<ChatEvent>("agent://token", (ev) => {
       const { run_id, data } = ev.payload;
-      if (run_id === useAgents.getState().pending?.runId) {
-        agentTokenBuffer.push(data);
-      }
+      if (useAgents.getState().runs[run_id]) agentTokenBuffer.push(run_id, data);
     }),
   );
 
@@ -267,6 +262,7 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("agent://error", (ev) => {
       const { run_id, data } = ev.payload;
+      agentTokenBuffer.flushNow(run_id);
       useAgents.getState().setError(run_id, data);
     }),
   );
@@ -274,7 +270,7 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("agent://done", (ev) => {
       const { run_id } = ev.payload;
-      agentTokenBuffer.flushNow();
+      agentTokenBuffer.flushNow(run_id);
       useAgents.getState().finish(run_id);
     }),
   );

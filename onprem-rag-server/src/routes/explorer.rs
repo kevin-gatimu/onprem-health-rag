@@ -78,7 +78,7 @@ pub async fn list_records(
     // Build the $match: always filter (source_id, table); add a case-insensitive
     // text regex when a query is provided. Verified against DocumentDB — the
     // $regex operator is supported inside $match on this build.
-    let mut match_doc = doc! { "source_id": &source_id, "table": &table };
+    let mut match_doc = doc! { "source_id": &source_id, "table": &table, "active": true };
     if let Some(query) = q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         match_doc.insert("text", doc! { "$regex": query, "$options": "i" });
     }
@@ -292,7 +292,7 @@ pub async fn get_table_info(
     let profile = state
         .db
         .records()
-        .find_one(doc! { "source_id": source_id, "table": table })
+        .find_one(doc! { "source_id": source_id, "table": table, "active": true })
         .await?
         .and_then(|rec| rec.get_document("fields").cloned().ok())
         .map(|fields| {
@@ -313,7 +313,11 @@ pub async fn get_table_info(
                     pii,
                 });
             }
-            TableProfile { columns, pii_columns, selected_columns }
+            TableProfile {
+                columns,
+                pii_columns,
+                selected_columns,
+            }
         });
 
     // --- recent_runs: jobs for this source, newest first, up to 5 ---
@@ -353,9 +357,9 @@ fn recent_run_from_doc(d: &Document) -> RecentRun {
 
     // errors is an i64 count in the current schema; older jobs stored an array of
     // error strings — fall back to its length.
-    let errors = d.get_i64("errors").unwrap_or_else(|_| {
-        d.get_array("errors").map(|a| a.len() as i64).unwrap_or(0)
-    });
+    let errors = d
+        .get_i64("errors")
+        .unwrap_or_else(|_| d.get_array("errors").map(|a| a.len() as i64).unwrap_or(0));
 
     RecentRun {
         id: d.get_str("_id").unwrap_or("").to_string(),

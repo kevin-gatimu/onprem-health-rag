@@ -8,22 +8,25 @@
 //   xl+:             Same as md but with a third context column (220 px) on the right.
 //
 // Agent kinds: auto / health_query / trends / patient_lookup / summarize.
-// Switching kinds resets the active conversation and clears pending state (each
-// kind maintains its own conversation partition on the server).
+// Each kind maintains its own conversation partition and per-kind new-chat draft.
 //
 // Send flow mirrors chat/index.tsx exactly, using the agent() bridge call.
 import { useState, useCallback } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery } from '@tanstack/react-query';
 import { PanelLeftOpen, Layers, Bot, Info } from 'lucide-react';
 import {
   listAgentConversations,
-  createConversation,
   getMessages,
-  agent,
   getStats,
   getIngestHistory,
 } from '../../lib/bridge';
 import type { AgentKind } from '../../lib/bridge';
+import {
+  retryAgentRun,
+  sendQueuedAgentNow,
+  stopAgentRun,
+  submitAgentPrompt,
+} from '../../lib/conversationRuntime';
 import { useAgents } from '../../stores/agents';
 import { toast } from '../../stores/ui';
 import { Button, Modal } from '../../components/ui';
@@ -59,17 +62,24 @@ const KIND_BLURBS: Record<string, string> = {
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function Agents() {
-  const queryClient = useQueryClient();
-
-  // Component-local view state — none needs cross-feature persistence.
-  const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
-  const [selectedKind, setSelectedKind] = useState<AgentKind>('auto');
-
-  // Derived streaming gate: lock UI while a run is in flight.
-  const pending = useAgents((s) => s.pending);
-  const streaming = pending !== null && pending.phase !== 'done';
+  const activeConvId = useAgents((state) => state.activeConversationId);
+  const selectedKind = useAgents((state) => state.selectedKind);
+  const allRuns = useAgents((state) => state.runs);
+  const queues = useAgents((state) => state.queues);
+  const draftKey = `${selectedKind}:${activeConvId ?? '__new__'}`;
+  const draft = useAgents((state) => state.drafts[draftKey] ?? '');
+  const runs = Object.values(allRuns)
+    .filter((run) => run.conversationId === activeConvId)
+    .sort((a, b) => a.startedAt - b.startedAt);
+  const queued = activeConvId ? (queues[activeConvId] ?? []) : [];
+  const busyConversationIds = new Set(
+    Object.values(allRuns)
+      .filter((run) => run.phase !== 'done' && run.phase !== 'stopped')
+      .map((run) => run.conversationId),
+  );
+  const busy = activeConvId !== null && busyConversationIds.has(activeConvId);
 
   // ── Queries ─────────────────────────────────────────────────────────────────
   const { data: conversations = [] } = useQuery({
@@ -100,67 +110,28 @@ export default function Agents() {
 
   const indexedTableCount = ingestHistory.reduce((acc, c) => acc + c.tables.length, 0);
 
-  // ── Send flow ────────────────────────────────────────────────────────────────
-  const handleSend = useCallback(async (text: string) => {
-    const runId = crypto.randomUUID();
+  const handleSend = useCallback((text: string, sendImmediately: boolean) => {
+    void submitAgentPrompt(activeConvId, selectedKind, text, sendImmediately).catch((error) => {
+      toast.error(`Failed to start conversation: ${String(error)}`);
+    });
+  }, [activeConvId, selectedKind]);
 
-    // Ensure we have a conversation to attach messages to.
-    let convId: string;
-    if (activeConvId) {
-      convId = activeConvId;
-    } else {
-      try {
-        const c = await createConversation(undefined, selectedKind);
-        convId = c.id;
-        setActiveConvId(c.id);
-        void queryClient.invalidateQueries({ queryKey: ['agent-conversations', selectedKind] });
-      } catch (e) {
-        toast.error(`Failed to start conversation: ${String(e)}`);
-        return;
-      }
-    }
-
-    // Optimistic: register the run before the bridge invoke so the activity strip
-    // appears immediately and the user bubble is visible during the call.
-    useAgents.getState().startRun(runId, convId, selectedKind, text);
-
-    try {
-      await agent(selectedKind, text, convId, runId);
-      // Await the messages re-fetch BEFORE clearing pending so the optimistic
-      // bubbles are replaced atomically (no duplicate-bubble flash).
-      await queryClient.invalidateQueries({ queryKey: ['messages', convId] });
-      void queryClient.invalidateQueries({ queryKey: ['agent-conversations', selectedKind] });
-      useAgents.getState().clear();
-    } catch (e) {
-      useAgents.getState().setError(runId, String(e));
-    }
-  }, [activeConvId, selectedKind, queryClient]);
-
-  // ── Navigation helpers ───────────────────────────────────────────────────────
   function handleNewChat() {
-    setActiveConvId(null);
-    useAgents.getState().clear();
+    useAgents.getState().setActiveConversation(null);
     setDrawerOpen(false);
   }
 
   function handleSelectConv(id: string) {
-    if (id === activeConvId) return;
-    setActiveConvId(id);
-    useAgents.getState().clear();
+    useAgents.getState().setActiveConversation(id);
     setDrawerOpen(false);
   }
 
   function handleActiveDeleted() {
-    setActiveConvId(null);
-    useAgents.getState().clear();
+    useAgents.getState().setActiveConversation(null);
   }
 
-  // Switching agent kind resets active conversation — each kind is a separate partition.
   function handleKindChange(kind: AgentKind) {
-    if (kind === selectedKind) return;
-    setSelectedKind(kind);
-    setActiveConvId(null);
-    useAgents.getState().clear();
+    if (kind !== selectedKind) useAgents.getState().setSelectedKind(kind);
   }
 
   // ── Active conversation title for the mobile header ──────────────────────────
@@ -184,13 +155,11 @@ export default function Agents() {
             role="tab"
             aria-selected={selectedKind === tab.kind}
             onClick={() => handleKindChange(tab.kind)}
-            disabled={streaming}
             className={[
               'shrink-0 px-3 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap min-h-[44px]',
               selectedKind === tab.kind
                 ? 'bg-accent-subtle text-fg'
                 : 'text-fg-muted hover:bg-elevated hover:text-fg',
-              streaming ? 'opacity-50 cursor-not-allowed' : '',
             ].join(' ')}
           >
             {tab.label}
@@ -205,7 +174,6 @@ export default function Agents() {
           size="sm"
           leftIcon={<PanelLeftOpen size={15} aria-hidden="true" />}
           onClick={() => setDrawerOpen(true)}
-          disabled={streaming}
           className="min-h-[44px]"
         >
           Agents
@@ -236,7 +204,7 @@ export default function Agents() {
               conversations={conversations}
               activeConvId={activeConvId}
               selectedKind={selectedKind}
-              streaming={streaming}
+           busyConversationIds={busyConversationIds}
               onSelect={handleSelectConv}
               onNewChat={handleNewChat}
               onActiveDeleted={handleActiveDeleted}
@@ -248,12 +216,23 @@ export default function Agents() {
         <div className="flex-1 min-h-0 flex flex-col bg-base">
           <MessageList
             persisted={messages}
-            pending={pending}
+            runs={runs}
+            queued={queued}
             activeConvId={activeConvId}
+            onSendQueuedNow={(promptId) => {
+              if (activeConvId) sendQueuedAgentNow(activeConvId, promptId);
+            }}
+            onRemoveQueued={(promptId) => {
+              if (activeConvId) useAgents.getState().removeQueued(activeConvId, promptId);
+            }}
+            onRetry={retryAgentRun}
+            onStop={stopAgentRun}
           />
           <Composer
+            text={draft}
+            onTextChange={(text) => useAgents.getState().setDraft(draftKey, text)}
             onSend={handleSend}
-            streaming={streaming}
+            busy={busy}
           />
         </div>
 
@@ -311,7 +290,7 @@ export default function Agents() {
           conversations={conversations}
           activeConvId={activeConvId}
           selectedKind={selectedKind}
-          streaming={streaming}
+          busyConversationIds={busyConversationIds}
           onSelect={handleSelectConv}
           onNewChat={handleNewChat}
           onActiveDeleted={handleActiveDeleted}

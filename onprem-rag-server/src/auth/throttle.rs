@@ -27,7 +27,9 @@ pub struct LoginThrottle {
 
 impl LoginThrottle {
     pub fn new() -> Self {
-        LoginThrottle { inner: Mutex::new(HashMap::new()) }
+        LoginThrottle {
+            inner: Mutex::new(HashMap::new()),
+        }
     }
 
     /// If the key is currently locked, return the remaining lock duration.
@@ -53,7 +55,11 @@ impl LoginThrottle {
     pub fn record_failure(&self, key: &str) {
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
-        let a = map.entry(key.to_string()).or_insert(Attempt { fails: 0, locked_until: None, last_seen: now });
+        let a = map.entry(key.to_string()).or_insert(Attempt {
+            fails: 0,
+            locked_until: None,
+            last_seen: now,
+        });
         if now.duration_since(a.last_seen) > RESET_AFTER {
             a.fails = 0;
             a.locked_until = None;
@@ -62,7 +68,10 @@ impl LoginThrottle {
         a.last_seen = now;
         if a.fails >= LOCK_THRESHOLD {
             let over = a.fails - LOCK_THRESHOLD; // 0 on first lock
-            let lock = BASE_LOCK.checked_mul(1u32 << over.min(5)).unwrap_or(MAX_LOCK).min(MAX_LOCK);
+            let lock = BASE_LOCK
+                .checked_mul(1u32 << over.min(5))
+                .unwrap_or(MAX_LOCK)
+                .min(MAX_LOCK);
             a.locked_until = Some(now + lock);
         }
     }
@@ -75,5 +84,7 @@ impl LoginThrottle {
 }
 
 impl Default for LoginThrottle {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }

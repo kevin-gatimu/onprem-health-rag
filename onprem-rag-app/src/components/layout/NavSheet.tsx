@@ -9,6 +9,8 @@ import { useEffectiveRole } from "../../hooks/useEffectiveRole";
 import { canAccess } from "../../lib/permissions";
 import { NAV_ITEMS, NAV_SECTIONS } from "../../app/navigation";
 import { logout } from "../../lib/bridge";
+import { resetConversationRuntime } from "../../lib/conversationRuntime";
+import { queryClient } from "../../lib/queryClient";
 import { cn } from "../ui/cn";
 
 export function NavSheet() {
@@ -29,6 +31,8 @@ export function NavSheet() {
     try {
       await logout();
     } finally {
+      resetConversationRuntime();
+      queryClient.clear();
       clearUser();
     }
   }

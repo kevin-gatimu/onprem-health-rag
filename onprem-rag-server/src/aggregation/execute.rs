@@ -29,7 +29,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{Bson, Document, doc};
 use serde::{Deserialize, Serialize};
 
-use super::spec::{BucketUnit, MetricOp, RunAggregation, SortDir, MAX_TOP_N};
+use super::spec::{BucketUnit, MAX_TOP_N, MetricOp, RunAggregation, SortDir};
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::AppResult;
@@ -105,6 +105,7 @@ pub fn build_pipeline(auth: &AuthUser, spec: &RunAggregation) -> Vec<Document> {
     // tables collide (e.g. row_pk="1" appears in both patients and encounters) and
     // the dedup group produces wrong counts.
     let mut match_doc = build_authz_filter(auth);
+    match_doc.insert("active", true);
     match_doc.insert("table", &spec.collection); // physical table scope
     for (k, v) in translate_filter(&spec.filter) {
         match_doc.insert(k, v);
@@ -261,7 +262,11 @@ fn build_group_id(spec: &RunAggregation) -> Bson {
 // ---------------------------------------------------------------------------
 
 fn build_metric_expr(spec: &RunAggregation) -> Bson {
-    let field_path = spec.metric.field.as_ref().map(|f| format!("$doc.fields.{f}"));
+    let field_path = spec
+        .metric
+        .field
+        .as_ref()
+        .map(|f| format!("$doc.fields.{f}"));
 
     match &spec.metric.op {
         MetricOp::Count => doc! { "$sum": 1 }.into(),
@@ -366,10 +371,8 @@ fn bson_to_label(v: Option<&Bson>) -> String {
         Some(Bson::Int32(n)) => n.to_string(),
         Some(Bson::Int64(n)) => n.to_string(),
         Some(Bson::Double(n)) => format!("{n}"),
-        Some(other) => {
-            serde_json::to_string(&other.clone().into_relaxed_extjson())
-                .unwrap_or_else(|_| "(complex)".to_string())
-        }
+        Some(other) => serde_json::to_string(&other.clone().into_relaxed_extjson())
+            .unwrap_or_else(|_| "(complex)".to_string()),
     }
 }
 
@@ -395,11 +398,19 @@ mod tests {
     use crate::auth::{Role, guard::AuthUser};
 
     fn test_user() -> AuthUser {
-        AuthUser { id: "u1".into(), username: "tester".into(), role: Role::Doctor }
+        AuthUser {
+            id: "u1".into(),
+            username: "tester".into(),
+            role: Role::Doctor,
+        }
     }
 
     fn admin_user() -> AuthUser {
-        AuthUser { id: "a1".into(), username: "admin".into(), role: Role::Admin }
+        AuthUser {
+            id: "a1".into(),
+            username: "admin".into(),
+            role: Role::Admin,
+        }
     }
 
     /// "Most common diagnoses" spec — the canonical example from the plan.
@@ -408,9 +419,15 @@ mod tests {
             collection: "encounters".into(),
             filter: serde_json::json!({}),
             group_by: vec!["diagnosis_display".into()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
-            sort: Some(Sort { by: "value".into(), dir: SortDir::Desc }),
+            sort: Some(Sort {
+                by: "value".into(),
+                dir: SortDir::Desc,
+            }),
             top_n: Some(10),
         }
     }
@@ -436,23 +453,36 @@ mod tests {
         let pipeline = build_pipeline(&test_user(), &spec);
 
         // Expect: $match, $group(dedup), $group(agg), $sort, $limit, $project
-        assert!(pipeline.len() >= 5, "pipeline too short: {}", pipeline.len());
+        assert!(
+            pipeline.len() >= 5,
+            "pipeline too short: {}",
+            pipeline.len()
+        );
 
         // Stage 0: $match
         assert!(pipeline[0].contains_key("$match"), "stage 0 must be $match");
 
         // Stage 1: $group with _id: "$row_pk" and doc: {$first: "$$ROOT"}
-        let dedup = pipeline[1].get_document("$group").expect("stage 1 must be $group");
+        let dedup = pipeline[1]
+            .get_document("$group")
+            .expect("stage 1 must be $group");
         assert_eq!(
             dedup.get_str("_id").unwrap_or(""),
             "$row_pk",
             "dedup $group must group on row_pk"
         );
-        let doc_field = dedup.get_document("doc").expect("dedup stage must carry 'doc' field");
-        assert!(doc_field.contains_key("$first"), "dedup doc must use $first");
+        let doc_field = dedup
+            .get_document("doc")
+            .expect("dedup stage must carry 'doc' field");
+        assert!(
+            doc_field.contains_key("$first"),
+            "dedup doc must use $first"
+        );
 
         // Stage 2: $group for the aggregation dimension
-        let agg = pipeline[2].get_document("$group").expect("stage 2 must be $group");
+        let agg = pipeline[2]
+            .get_document("$group")
+            .expect("stage 2 must be $group");
         let id = agg.get("_id").expect("agg $group must have _id");
         let id_str = match id {
             Bson::String(s) => s.as_str(),
@@ -463,8 +493,13 @@ mod tests {
             "group _id must reference doc.fields.diagnosis_display, got {id_str}"
         );
         // The metric must use $sum: 1 for Count
-        let value_expr = agg.get_document("value").expect("agg $group must have 'value'");
-        assert!(value_expr.contains_key("$sum"), "Count metric must use $sum");
+        let value_expr = agg
+            .get_document("value")
+            .expect("agg $group must have 'value'");
+        assert!(
+            value_expr.contains_key("$sum"),
+            "Count metric must use $sum"
+        );
 
         let last = &pipeline[pipeline.len() - 1];
         assert!(last.contains_key("$project"), "last stage must be $project");
@@ -474,8 +509,14 @@ mod tests {
         assert!(has_sort, "pipeline must contain a $sort stage");
         assert!(has_limit, "pipeline must contain a $limit stage");
 
-        let sort_idx = pipeline.iter().position(|s| s.contains_key("$sort")).unwrap();
-        let limit_idx = pipeline.iter().position(|s| s.contains_key("$limit")).unwrap();
+        let sort_idx = pipeline
+            .iter()
+            .position(|s| s.contains_key("$sort"))
+            .unwrap();
+        let limit_idx = pipeline
+            .iter()
+            .position(|s| s.contains_key("$limit"))
+            .unwrap();
         assert!(sort_idx < limit_idx, "$sort must precede $limit");
     }
 
@@ -485,28 +526,38 @@ mod tests {
             collection: "encounters".into(),
             filter: serde_json::json!({ "diagnosis_code": { "$prefix": "E11" } }),
             group_by: vec!["diagnosis_display".into()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: None,
             top_n: Some(5),
         };
         let pipeline = build_pipeline(&test_user(), &spec);
         let match_doc = pipeline[0].get_document("$match").unwrap();
-        let diag_filter = match_doc.get("fields.diagnosis_code")
+        let diag_filter = match_doc
+            .get("fields.diagnosis_code")
             .expect("filter must use fields. prefix");
         let filter_doc = match diag_filter {
             Bson::Document(d) => d,
             _ => panic!("expected document for diagnosis_code filter"),
         };
-        let regex = filter_doc.get_str("$regex").expect("$prefix must translate to $regex");
-        assert!(regex.starts_with("^E11"), "regex must start with ^E11, got {regex}");
+        let regex = filter_doc
+            .get_str("$regex")
+            .expect("$prefix must translate to $regex");
+        assert!(
+            regex.starts_with("^E11"),
+            "regex must start with ^E11, got {regex}"
+        );
     }
 
     #[test]
     fn dedup_stage_is_second() {
         let pipeline = build_pipeline(&admin_user(), &most_common_diagnoses_spec());
         // Stage 0: $match, Stage 1: $group(dedup)
-        let dedup_group = pipeline[1].get_document("$group")
+        let dedup_group = pipeline[1]
+            .get_document("$group")
             .expect("stage index 1 must be $group");
         assert_eq!(
             dedup_group.get_str("_id").unwrap_or(""),
@@ -521,7 +572,10 @@ mod tests {
             collection: "encounters".into(),
             filter: serde_json::json!({}),
             group_by: vec!["clinic".into()],
-            metric: Metric { op: MetricOp::Distinct, field: Some("patient_id".into()) },
+            metric: Metric {
+                op: MetricOp::Distinct,
+                field: Some("patient_id".into()),
+            },
             time_bucket: None,
             sort: None,
             top_n: Some(20),
@@ -543,7 +597,10 @@ mod tests {
         // Stage E: the time-bucket expression must wrap the field in $convert so
         // string-stored dates (Postgres to_jsonb output) are coerced to BSON Date.
         use crate::aggregation::spec::{BucketUnit, TimeBucket};
-        let tb = TimeBucket { field: "encounter_date".into(), unit: BucketUnit::Month };
+        let tb = TimeBucket {
+            field: "encounter_date".into(),
+            unit: BucketUnit::Month,
+        };
         let expr_bson = build_bucket_expr(&tb);
         let expr_json =
             serde_json::to_string(&expr_bson.into_relaxed_extjson()).unwrap_or_default();

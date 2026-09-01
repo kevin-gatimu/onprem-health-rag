@@ -91,6 +91,7 @@ pub fn run() {
             commands::search,
             commands::chat,
             commands::agent,
+            commands::cancel_run,
             commands::start_log_stream,
             commands::list_conversations,
             commands::list_agent_conversations,

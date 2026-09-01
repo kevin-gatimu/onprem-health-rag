@@ -18,6 +18,14 @@ use crate::error::AppResult;
 const VECTOR_INDEX: &str = "records_contentVector_cosmos";
 const TEXT_INDEX: &str = "records_text";
 
+pub async fn required_indexes_ready(db: &DocumentDb) -> AppResult<bool> {
+    let names = db.records().list_index_names().await?;
+    Ok(
+        names.iter().any(|name| name == VECTOR_INDEX)
+            && names.iter().any(|name| name == TEXT_INDEX),
+    )
+}
+
 /// IVF list count for the vector index. IVF (rather than HNSW) is the broadly
 /// available default on this engine; `numLists` ~ sqrt(#rows) is a reasonable start
 /// for small/medium corpora.
@@ -48,7 +56,11 @@ async fn ensure_vector_index(db: &DocumentDb, dims: usize) -> AppResult<()> {
         } ]
     };
     db.db.run_command(command).await?;
-    tracing::info!(index = VECTOR_INDEX, dims, "ensured cosmosSearch vector index");
+    tracing::info!(
+        index = VECTOR_INDEX,
+        dims,
+        "ensured cosmosSearch vector index"
+    );
     Ok(())
 }
 
@@ -77,6 +89,7 @@ async fn ensure_text_index(db: &DocumentDb) -> AppResult<()> {
 pub struct Hit {
     pub id: String,
     pub source_id: String,
+    pub table: String,
     pub row_pk: String,
     pub chunk_index: i32,
     pub text: String,
@@ -86,7 +99,7 @@ pub struct Hit {
 /// Fields both search sides project, plus the meta score under `score`.
 fn projection(score_meta: &str) -> Document {
     doc! {
-        "text": 1, "fields": 1, "source_id": 1, "row_pk": 1, "chunk_index": 1,
+        "text": 1, "fields": 1, "source_id": 1, "table": 1, "row_pk": 1, "chunk_index": 1,
         "score": { "$meta": score_meta },
     }
 }
@@ -96,6 +109,7 @@ fn hit_from_doc(d: &Document) -> Option<Hit> {
     Some(Hit {
         id: d.get_str("_id").ok()?.to_string(),
         source_id: d.get_str("source_id").unwrap_or_default().to_string(),
+        table: d.get_str("table").unwrap_or_default().to_string(),
         row_pk: d.get_str("row_pk").unwrap_or_default().to_string(),
         chunk_index: d.get_i32("chunk_index").unwrap_or(0),
         text: d.get_str("text").unwrap_or_default().to_string(),
@@ -109,9 +123,14 @@ pub async fn vector_search(db: &DocumentDb, query_vector: Vec<f32>, k: i64) -> A
     if query_vector.is_empty() {
         return Ok(Vec::new());
     }
-    let vector: Vec<Bson> = query_vector.into_iter().map(|v| Bson::Double(v as f64)).collect();
+    let vector: Vec<Bson> = query_vector
+        .into_iter()
+        .map(|v| Bson::Double(v as f64))
+        .collect();
     let pipeline = vec![
-        doc! { "$search": { "cosmosSearch": { "vector": vector, "path": "contentVector", "k": k } } },
+        doc! { "$search": { "cosmosSearch": { "vector": vector, "path": "contentVector", "k": k.saturating_mul(2) } } },
+        doc! { "$match": { "active": true } },
+        doc! { "$limit": k },
         doc! { "$project": projection("searchScore") },
     ];
     let mut cursor = db.records().aggregate(pipeline).await?;
@@ -132,7 +151,7 @@ pub async fn text_search(db: &DocumentDb, query: &str, limit: i64) -> AppResult<
     }
     let mut cursor = db
         .records()
-        .find(doc! { "$text": { "$search": query } })
+        .find(doc! { "$text": { "$search": query }, "active": true })
         .projection(projection("textScore"))
         .sort(doc! { "score": { "$meta": "textScore" } })
         .limit(limit)

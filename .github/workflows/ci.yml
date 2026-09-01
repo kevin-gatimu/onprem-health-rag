@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  server:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: onprem-rag-server
+      - name: Check server
+        working-directory: onprem-rag-server
+        run: cargo check --bin onprem-server
+      - name: Test server
+        working-directory: onprem-rag-server
+        run: cargo test --bin onprem-server
+
+  app:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - name: Install dependencies
+        working-directory: onprem-rag-app
+        run: pnpm install --frozen-lockfile
+      - name: Type-check
+        working-directory: onprem-rag-app
+        run: pnpm exec tsc --noEmit
+      - name: Build frontend
+        working-directory: onprem-rag-app
+        run: pnpm build
+      - name: Validate deterministic evaluation fixtures
+        run: node eval/run.mjs --validate-only

@@ -11,8 +11,9 @@ use tiberius::{AuthMethod, Client, Config, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-use super::{ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
-            make_row_filtered};
+use super::{
+    ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err, make_row_filtered,
+};
 use crate::error::AppResult;
 
 pub struct MssqlConnector {
@@ -29,7 +30,10 @@ impl MssqlConnector {
         config.host(&self.spec.host);
         config.port(self.spec.port);
         config.database(&self.spec.database);
-        config.authentication(AuthMethod::sql_server(&self.spec.username, &self.spec.password));
+        config.authentication(AuthMethod::sql_server(
+            &self.spec.username,
+            &self.spec.password,
+        ));
         // Accept self-signed certs — on-prem SQL Server instances commonly use them.
         config.trust_cert();
         config
@@ -40,7 +44,8 @@ impl MssqlConnector {
         let tcp = TcpStream::connect(config.get_addr())
             .await
             .map_err(|e| conn_err("SQL Server TCP connect failed", e))?;
-        tcp.set_nodelay(true).map_err(|e| conn_err("SQL Server socket setup failed", e))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| conn_err("SQL Server socket setup failed", e))?;
         Client::connect(config, tcp.compat_write())
             .await
             .map_err(|e| conn_err("SQL Server connection failed", e))
@@ -192,16 +197,24 @@ impl SourceConnector for MssqlConnector {
                 Some(c) => c.to_string(),
                 None => continue,
             };
-            let dtype = row.try_get::<&str, _>(2).ok().flatten().unwrap_or("").to_string();
+            let dtype = row
+                .try_get::<&str, _>(2)
+                .ok()
+                .flatten()
+                .unwrap_or("")
+                .to_string();
             let nullable = row.try_get::<&str, _>(3).ok().flatten().unwrap_or("NO");
-            table_columns.entry(table.clone()).or_default().push(ColumnSchema {
-                is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
-                is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
-                nullable: nullable.eq_ignore_ascii_case("YES"),
-                name: col,
-                type_: dtype,
-                likely_pii: false,
-            });
+            table_columns
+                .entry(table.clone())
+                .or_default()
+                .push(ColumnSchema {
+                    is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
+                    is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    name: col,
+                    type_: dtype,
+                    likely_pii: false,
+                });
         }
 
         // Assemble in the order from the table-list query so the response is stable.
@@ -210,8 +223,11 @@ impl SourceConnector for MssqlConnector {
             .map(|name| {
                 let row_count = row_estimates.get(&name).copied().unwrap_or(0);
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns, fk_edges }
+                TableSchema {
+                    name,
+                    row_count,
+                    columns,
+                }
             })
             .collect();
         Ok(schemas)
@@ -235,40 +251,44 @@ impl SourceConnector for MssqlConnector {
         Ok(n)
     }
 
-    async fn fetch_table(
+    async fn fetch_table_page(
         &self,
         table: &str,
         excluded: &[String],
-        limit: Option<i64>,
+        order_by: Option<&str>,
+        offset: i64,
+        page_size: i64,
     ) -> AppResult<Vec<FetchedRow>> {
         let mut client = self.new_client().await?;
-        // Bracket-quote the identifier. SQL Server uses TOP for row capping.
-        let top = limit.map(|n| format!("TOP {n} ")).unwrap_or_default();
-        let sql = format!("SELECT {top}* FROM [{table}]");
+        let order = order_by
+            .map(|column| format!("[{column}]"))
+            .unwrap_or_else(|| "(SELECT NULL)".to_string());
+        let sql = format!(
+            "SELECT * FROM [{table}] ORDER BY {order} OFFSET {offset} ROWS FETCH NEXT {page_size} ROWS ONLY"
+        );
 
         let rows: Vec<Row> = client
             .simple_query(sql)
             .await
-            .map_err(|e| conn_err(&format!("SQL Server fetch_table({table}) failed"), e))?
+            .map_err(|e| conn_err(&format!("SQL Server fetch_table_page({table}) failed"), e))?
             .into_first_result()
             .await
-            .map_err(|e| conn_err(&format!("SQL Server fetch_table({table}) failed"), e))?;
+            .map_err(|e| conn_err(&format!("SQL Server fetch_table_page({table}) failed"), e))?;
 
         let out = rows
             .iter()
             .enumerate()
             .map(|(i, row)| {
                 let mut fields = Map::new();
-                let names: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
+                let names: Vec<String> =
+                    row.columns().iter().map(|c| c.name().to_string()).collect();
                 for (col, name) in names.into_iter().enumerate() {
-                    // Skip excluded columns entirely — they must not reach the FetchedRow.
                     if excluded.iter().any(|e| e == &name) {
                         continue;
                     }
                     fields.insert(name, cell_to_json(row, col));
                 }
-                // make_row_filtered handles any residual exclusions (e.g. name variants).
-                make_row_filtered(fields, excluded, i)
+                make_row_filtered(fields, excluded, offset as usize + i)
             })
             .collect();
         Ok(out)
@@ -372,4 +392,3 @@ fn cell_to_json(row: &Row, i: usize) -> Value {
     }
     Value::Null
 }
-

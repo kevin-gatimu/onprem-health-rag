@@ -42,7 +42,9 @@ impl DocumentDb {
 
     /// Best-effort round-trip to verify the server is reachable.
     pub async fn ping(&self) -> AppResult<()> {
-        self.db.run_command(mongodb::bson::doc! { "ping": 1 }).await?;
+        self.db
+            .run_command(mongodb::bson::doc! { "ping": 1 })
+            .await?;
         Ok(())
     }
 
@@ -89,6 +91,82 @@ impl DocumentDb {
 
 }
 
+/// Backfill generation markers for records created before versioned ingestion.
+/// Idempotent and safe to run at every startup.
+pub async fn ensure_records_indexes(db: &DocumentDb) -> AppResult<()> {
+    db.db
+        .run_command(mongodb::bson::doc! {
+            "createIndexes": RECORDS,
+            "indexes": [
+                {
+                    "name": "records_source_table_active_row",
+                    "key": {
+                        "source_id": 1,
+                        "table": 1,
+                        "active": 1,
+                        "row_pk": 1,
+                        "chunk_index": 1
+                    }
+                },
+                {
+                    "name": "records_source_table_active_generation",
+                    "key": {
+                        "source_id": 1,
+                        "table": 1,
+                        "active": 1,
+                        "ingest_generation": 1
+                    }
+                }
+            ]
+        })
+        .await?;
+    Ok(())
+}
+
+pub async fn ensure_ingest_generations(db: &DocumentDb) -> AppResult<()> {
+    db.records()
+        .update_many(
+            mongodb::bson::doc! { "active": { "$exists": false } },
+            mongodb::bson::doc! { "$set": { "active": true, "ingest_generation": "legacy" } },
+        )
+        .await?;
+    db.indexed_tables()
+        .update_many(
+            mongodb::bson::doc! { "active_generation": { "$exists": false }, "status": "indexed" },
+            mongodb::bson::doc! { "$set": { "active_generation": "legacy", "refresh_status": "idle" } },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Mark work interrupted by a previous process exit as resumable failure.
+/// Active and staged generations are retained; retry cleanup remains generation-safe.
+pub async fn recover_abandoned_ingestions(db: &DocumentDb) -> AppResult<()> {
+    let now = mongodb::bson::DateTime::now();
+
+    db.indexed_tables()
+        .update_many(
+            mongodb::bson::doc! { "refresh_status": "indexing" },
+            mongodb::bson::doc! { "$set": {
+                "refresh_status": "idle",
+                "recovered_at": now,
+            } },
+        )
+        .await?;
+    db.jobs()
+        .update_many(
+            mongodb::bson::doc! { "status": "running" },
+            mongodb::bson::doc! { "$set": {
+                "status": "failed",
+                "finished_at": now,
+                "recovery_error": "server restarted before ingestion completed",
+            }, "$inc": { "errors": 1i64 } },
+        )
+        .await?;
+
+    Ok(())
+}
+
 /// Ensure the chat collections have the indexes they need. Call once at boot
 /// (best-effort — a failure is logged but non-fatal).
 pub async fn ensure_chat_indexes(db: &DocumentDb) -> AppResult<()> {
@@ -127,6 +205,9 @@ pub async fn ensure_user_indexes(db: &DocumentDb) -> AppResult<()> {
         }]
     };
     db.db.run_command(command).await?;
-    tracing::info!(index = "users_email_unique", "ensured unique email index on users");
+    tracing::info!(
+        index = "users_email_unique",
+        "ensured unique email index on users"
+    );
     Ok(())
 }

@@ -18,7 +18,7 @@ use rocket::serde::json::Json;
 use rocket::{State, post};
 use serde::{Deserialize, Serialize};
 
-use super::{ChatTurn, build_prompt, prepare_queries, rewrite_query, SYSTEM_PROMPT};
+use super::{ChatTurn, SYSTEM_PROMPT, apply_context_budget, build_prompt, prepare_queries};
 use crate::answer::{Structured, run_structured};
 use crate::auth::guard::AuthUser;
 use crate::config::{Config, RetrievalMode};
@@ -28,6 +28,7 @@ use crate::foundry::{FoundryManager, GuardedChatStream};
 use crate::memory::{load_working_memory, WorkingMemory};
 use crate::retrieval::{self, Passage};
 use crate::state::AppState;
+use crate::telemetry::{RequestTrace, Stage};
 
 /// Shared retrieval knobs accepted by both endpoints.
 #[derive(Debug, Deserialize)]
@@ -42,7 +43,13 @@ pub struct RetrievalOpts {
 
 /// Resolve per-request opts against config defaults into concrete values.
 fn resolve(state: &AppState, opts: &RetrievalOpts) -> (RetrievalMode, bool, usize) {
-    let mode = match opts.mode.as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+    let mode = match opts
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
         Some("vector") => RetrievalMode::Vector,
         Some("hybrid") => RetrievalMode::Hybrid,
         _ => state.config.retrieval_mode,
@@ -50,6 +57,64 @@ fn resolve(state: &AppState, opts: &RetrievalOpts) -> (RetrievalMode, bool, usiz
     let rerank = opts.rerank.unwrap_or(state.config.rerank_enabled);
     let top_k = opts.top_k.unwrap_or(state.config.context_top_k);
     (mode, rerank, top_k)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RouteRequest {
+    pub question: String,
+    #[serde(default)]
+    pub has_history: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteResponse {
+    pub route: &'static str,
+    pub intent: Option<crate::aggregation::intent::QueryIntent>,
+    pub tier: u8,
+    pub cached: bool,
+    pub backend: Option<&'static str>,
+}
+
+/// `POST /route` — classify a question without executing retrieval or generation.
+/// Used by the local deterministic evaluation runner and protected by normal auth.
+#[post("/route", data = "<body>")]
+pub async fn route(
+    state: &State<AppState>,
+    _user: AuthUser,
+    body: Json<RouteRequest>,
+) -> AppResult<Json<RouteResponse>> {
+    let _generation_permit = state.admission.generation().await?;
+    let foundry = state.foundry().ok();
+    let decision = crate::router::route(
+        &body.question,
+        body.has_history,
+        &state.config,
+        foundry,
+        &state.router_cache,
+    )
+    .await;
+
+    let (intent, backend) = match &decision.class {
+        crate::router::RouteClass::Structured { intent, backend } => (
+            Some(*intent),
+            Some(match backend {
+                crate::router::StructuredBackend::DocDb => "doc_db",
+                crate::router::StructuredBackend::SourceSql => "source_sql",
+            }),
+        ),
+        crate::router::RouteClass::Hybrid { cohort_intent } => (Some(*cohort_intent), None),
+        crate::router::RouteClass::Conversational | crate::router::RouteClass::Semantic => {
+            (None, None)
+        }
+    };
+
+    Ok(Json(RouteResponse {
+        route: decision.route_label(),
+        intent,
+        tier: decision.tier,
+        cached: decision.cached,
+        backend,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -79,15 +144,37 @@ pub async fn search(
     _user: AuthUser,
     body: Json<SearchRequest>,
 ) -> AppResult<Json<SearchResponse>> {
+    let trace = RequestTrace::new("search");
+    trace.set_route("search", None, None);
     let (mode, rerank, top_k) = resolve(state, &body.opts);
     let foundry = state.foundry()?;
+    let generation_permit = state.admission.generation().await?;
 
-    let (standalone, queries) =
-        prepare_queries(foundry, &state.config, &body.history, &body.query).await;
-    let passages =
-        retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k).await?;
+    let (standalone, queries) = trace
+        .time(
+            Stage::RewriteExpand,
+            prepare_queries(foundry, &state.config, &body.history, &body.query),
+        )
+        .await;
+    drop(generation_permit);
+    let _retrieval_permit = state.admission.retrieval().await?;
+    let passages = retrieval::retrieve_observed(
+        &state.db,
+        &state.config,
+        &queries,
+        mode,
+        rerank,
+        top_k,
+        &trace,
+    )
+    .await?;
 
-    Ok(Json(SearchResponse { query: standalone, queries, passages }))
+    trace.finish("ok", None);
+    Ok(Json(SearchResponse {
+        query: standalone,
+        queries,
+        passages,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,9 +200,7 @@ pub struct ChatRequest {
 enum ChatData {
     /// Conversational (Tier 0): greeting / thanks / identity / out-of-domain.
     /// One cheap streamed reply, no retrieval and no citations.
-    Conversational {
-        reply_stream: GuardedChatStream,
-    },
+    Conversational { reply_stream: ChatCompletionStream },
     /// Structured query (Aggregation, Trend, or Enumeration): narrate the exact
     /// DB rows; no semantic retrieval. The `citations_json` is either an empty
     /// array (aggregate path) or a synthesized list of row passages (list path).
@@ -152,21 +237,28 @@ pub async fn chat(
     user: AuthUser,
     body: Json<ChatRequest>,
 ) -> AppResult<EventStream![]> {
+    let trace = RequestTrace::new("chat");
     let (mode, rerank, top_k) = resolve(state, &body.opts);
     let foundry = state.foundry()?;
+    let generation_permit = state.admission.generation().await?;
 
     // Conversation persistence (pre-stream, so errors stay clean HTTP errors).
     // When conversation_id is absent, fall back to body.history (stateless path).
-    let memory: WorkingMemory;
-    if let Some(cid) = body.conversation_id.as_deref() {
-        use crate::routes::conversations::{clip_message_bytes, persist_user_message, verify_owned};
-        verify_owned(&state.db, cid, &user.id).await?;
-        memory = load_working_memory(&state.db, cid, &state.config).await;
-        let content = clip_message_bytes(&body.question, state.config.message_max_bytes);
-        persist_user_message(&state.db, cid, &user.id, &content).await?;
-    } else {
-        memory = WorkingMemory::from_turns(body.history.clone());
-    }
+    let history: Vec<ChatTurn> = trace
+        .time(Stage::History, async {
+            if let Some(cid) = body.conversation_id.as_deref() {
+                use crate::routes::conversations::{
+                    load_history, persist_user_message, verify_owned,
+                };
+                verify_owned(&state.db, cid, &user.id).await?;
+                let history = load_history(&state.db, cid, &user.id, 10).await;
+                persist_user_message(&state.db, cid, &user.id, &body.question).await?;
+                Ok::<Vec<ChatTurn>, crate::error::AppError>(history)
+            } else {
+                Ok::<Vec<ChatTurn>, crate::error::AppError>(body.history.clone())
+            }
+        })
+        .await?;
 
     // Intent Router v2: Tier 0 conversational gate -> Tier 1 lexical -> Tier 2 model
     // classify, fail-open to semantic. Structured routes (Aggregation/Trend/Enumeration)
@@ -174,15 +266,24 @@ pub async fn chat(
     // everything else (including hybrid, until its Phase-C executor lands) is semantic.
     // Any structured failure falls back silently to semantic — a correct grounded answer
     // beats an error. See plans/17-intent-router-v2.md.
-    let has_history = !memory.is_empty();
-    let decision = crate::router::route(
-        &body.question,
-        has_history,
-        &state.config,
-        Some(foundry),
-        &state.router_cache,
-    )
-    .await;
+    let has_history = !history.is_empty();
+    let decision = trace
+        .time(
+            Stage::Route,
+            crate::router::route(
+                &body.question,
+                has_history,
+                &state.config,
+                Some(foundry),
+                &state.router_cache,
+            ),
+        )
+        .await;
+    trace.set_route(
+        decision.route_label(),
+        Some(decision.tier),
+        Some(decision.cached),
+    );
     let routed_json = decision.to_sse_json();
 
     let chat_data: ChatData = match &decision.class {
@@ -193,11 +294,14 @@ pub async fn chat(
             spec.tools = false;
             spec.temperature = 0.4;
             spec.max_tokens = Some(160);
-            let reply_stream = foundry
-                .generate_stream_with(
-                    &spec,
-                    crate::router::CONVERSATIONAL_SYSTEM_PROMPT,
-                    &body.question,
+            let reply_stream = trace
+                .time(
+                    Stage::Generate,
+                    foundry.generate_stream_with(
+                        &spec,
+                        crate::router::CONVERSATIONAL_SYSTEM_PROMPT,
+                        &body.question,
+                    ),
                 )
                 .await?;
             ChatData::Conversational { reply_stream }
@@ -227,28 +331,46 @@ pub async fn chat(
         crate::router::RouteClass::Structured { intent, .. } => {
             let intent = *intent;
             let catalog = state.catalog(); // Arc<Catalog>
-            // Rewrite against working memory so follow-up aggregations ("and for
-            // females?") plan against a complete question, not just the fragment
-            // (plan 22.3). No-op (no model call) when there's no history.
-            let standalone = rewrite_query(foundry, &memory.rewrite_turns(), &body.question).await;
-            match run_structured(&state.db, foundry, &user, state, &catalog, intent, &standalone).await {
+            match run_structured(
+                &state.db,
+                foundry,
+                &user,
+                state,
+                &catalog,
+                intent,
+                &body.question,
+                &trace,
+            )
+            .await
+            {
                 Ok(structured) => {
                     // Flatten the Structured enum into the simpler ChatData shape.
                     // The /chat SSE contract is citations then token* then done —
                     // we never emit spec/rows/pipeline events here (those are agents-only).
-                    let (citations_json, narration_stream) = match structured {
-                        Structured::Aggregate { narration_stream } => {
+                    let (citations_json, narration_stream, passages_for_persist) = match structured
+                    {
+                        Structured::Aggregate {
+                            narration_stream, ..
+                        } => {
                             // No passages to cite for aggregations; the numbers are the source.
-                            ("[]".to_string(), narration_stream)
+                            ("[]".to_string(), narration_stream, Vec::new())
                         }
-                        Structured::List { citations_json, narration_stream } => {
-                            (citations_json, narration_stream)
+                        Structured::List {
+                            citations_json,
+                            narration_stream,
+                            ..
+                        } => {
+                            let passages = serde_json::from_str(&citations_json).unwrap_or_else(|error| {
+                                tracing::warn!(%error, "failed to decode list citations for persistence");
+                                Vec::new()
+                            });
+                            (citations_json, narration_stream, passages)
                         }
                     };
                     ChatData::Structured {
                         citations_json,
                         narration_stream,
-                        passages_for_persist: vec![],
+                        passages_for_persist,
                     }
                 }
                 Err(e) => {
@@ -257,8 +379,17 @@ pub async fn chat(
                         error = %e,
                         "run_structured failed; falling back to semantic retrieval"
                     );
-                    build_semantic_chat_data(foundry, state, &memory, &body.question, mode, rerank, top_k)
-                        .await?
+                    build_semantic_chat_data(
+                        foundry,
+                        state,
+                        &history,
+                        &body.question,
+                        mode,
+                        rerank,
+                        top_k,
+                        &trace,
+                    )
+                    .await?
                 }
             }
         }
@@ -268,11 +399,31 @@ pub async fn chat(
             // records. Until that executor lands, answer hybrids semantically — the
             // grounded path already handles "summarise records matching X" acceptably.
             tracing::debug!("hybrid route answered semantically (Phase C executor pending)");
-            build_semantic_chat_data(foundry, state, &memory, &body.question, mode, rerank, top_k).await?
+            build_semantic_chat_data(
+                foundry,
+                state,
+                &history,
+                &body.question,
+                mode,
+                rerank,
+                top_k,
+                &trace,
+            )
+            .await?
         }
 
         crate::router::RouteClass::Semantic => {
-            build_semantic_chat_data(foundry, state, &memory, &body.question, mode, rerank, top_k).await?
+            build_semantic_chat_data(
+                foundry,
+                state,
+                &history,
+                &body.question,
+                mode,
+                rerank,
+                top_k,
+                &trace,
+            )
+            .await?
         }
     };
 
@@ -289,12 +440,15 @@ pub async fn chat(
     Ok(EventStream! {
         use futures::StreamExt;
 
+        let _generation_permit = generation_permit;
+
         // Announce the routing decision first so the UI can show the active path.
         // Non-breaking: existing clients ignore unknown SSE event names.
         yield Event::data(routed_json).event("routed");
 
         let mut full_answer = String::new();
         let mut had_error = false;
+        let _generation = trace.stage_guard(Stage::Generate);
 
         match chat_data {
             ChatData::Conversational { mut reply_stream } => {
@@ -311,6 +465,7 @@ pub async fn chat(
                             {
                                 let visible = think.push(&token);
                                 if !visible.is_empty() {
+                                    trace.record_output(&visible);
                                     full_answer.push_str(&visible);
                                     yield token_event(&visible);
                                 }
@@ -326,6 +481,7 @@ pub async fn chat(
                 if !had_error {
                     let tail = think.finish();
                     if !tail.is_empty() {
+                        trace.record_output(&tail);
                         full_answer.push_str(&tail);
                         yield token_event(&tail);
                     }
@@ -334,10 +490,22 @@ pub async fn chat(
                 // Persist the exchange with no passages (there are none to cite).
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        persist_and_compact(
-                            &db, cid, &uid, &full_answer, &[], &cfg, &foundry_handle, "conversational",
-                        )
-                        .await;
+                        use crate::routes::conversations::persist_assistant_message;
+                        if let Err(e) = trace
+                            .time(
+                                Stage::Persist,
+                                persist_assistant_message(
+                                    &db,
+                                    cid.as_str(),
+                                    &uid,
+                                    &full_answer,
+                                    &[],
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to persist conversational message");
+                        }
                     }
                 }
             }
@@ -355,6 +523,7 @@ pub async fn chat(
                             {
                                 let visible = think.push(&token);
                                 if !visible.is_empty() {
+                                    trace.record_output(&visible);
                                     full_answer.push_str(&visible);
                                     yield token_event(&visible);
                                 }
@@ -370,6 +539,7 @@ pub async fn chat(
                 if !had_error {
                     let tail = think.finish();
                     if !tail.is_empty() {
+                        trace.record_output(&tail);
                         full_answer.push_str(&tail);
                         yield token_event(&tail);
                     }
@@ -377,10 +547,22 @@ pub async fn chat(
 
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        persist_and_compact(
-                            &db, cid, &uid, &full_answer, &passages_for_persist, &cfg, &foundry_handle, "structured",
-                        )
-                        .await;
+                        use crate::routes::conversations::persist_assistant_message;
+                        if let Err(e) = trace
+                            .time(
+                                Stage::Persist,
+                                persist_assistant_message(
+                                    &db,
+                                    cid.as_str(),
+                                    &uid,
+                                    &full_answer,
+                                    &passages_for_persist,
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to persist structured assistant message");
+                        }
                     }
                 }
             }
@@ -392,6 +574,7 @@ pub async fn chat(
                 match stream {
                     None => {
                         let msg = "I don't have relevant records to answer that question.";
+                        trace.record_output(msg);
                         full_answer.push_str(msg);
                         yield token_event(msg);
                     }
@@ -405,6 +588,7 @@ pub async fn chat(
                                     {
                                         let visible = think.push(&token);
                                         if !visible.is_empty() {
+                                            trace.record_output(&visible);
                                             full_answer.push_str(&visible);
                                             yield token_event(&visible);
                                         }
@@ -420,6 +604,7 @@ pub async fn chat(
                         if !had_error {
                             let tail = think.finish();
                             if !tail.is_empty() {
+                                trace.record_output(&tail);
                                 full_answer.push_str(&tail);
                                 yield token_event(&tail);
                             }
@@ -431,10 +616,22 @@ pub async fn chat(
                 // A persistence failure must not crash the stream — log and continue.
                 if let Some(cid) = &persist_target {
                     if !had_error {
-                        persist_and_compact(
-                            &db, cid, &uid, &full_answer, &passages_for_persist, &cfg, &foundry_handle, "semantic",
-                        )
-                        .await;
+                        use crate::routes::conversations::persist_assistant_message;
+                        if let Err(e) = trace
+                            .time(
+                                Stage::Persist,
+                                persist_assistant_message(
+                                    &db,
+                                    cid.as_str(),
+                                    &uid,
+                                    &full_answer,
+                                    &passages_for_persist,
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to persist assistant message");
+                        }
                     }
                 }
 
@@ -473,6 +670,12 @@ pub async fn chat(
             }
         }
 
+        drop(_generation);
+        if had_error {
+            trace.finish("stream_error", Some("generation"));
+        } else {
+            trace.finish("ok", None);
+        }
         yield Event::data("").event("done");
     })
 }
@@ -488,17 +691,42 @@ async fn build_semantic_chat_data(
     mode: RetrievalMode,
     rerank: bool,
     top_k: usize,
+    trace: &RequestTrace,
 ) -> AppResult<ChatData> {
-    let (standalone, queries) =
-        prepare_queries(foundry, &state.config, &memory.rewrite_turns(), question).await;
-    let passages =
-        retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k).await?;
+    let (standalone, queries) = trace
+        .time(
+            Stage::RewriteExpand,
+            prepare_queries(foundry, &state.config, history, question),
+        )
+        .await;
+    let _retrieval_permit = state.admission.retrieval().await?;
+    let passages = retrieval::retrieve_observed(
+        &state.db,
+        &state.config,
+        &queries,
+        mode,
+        rerank,
+        top_k,
+        trace,
+    )
+    .await?;
 
     // Anti-hallucination gate: refuse when there's nothing relevant, or (if a floor
     // is configured) when the best passage scores below it. PHI — better to decline.
-    let refuse = passages.is_empty()
-        || state.config.score_gate.is_some_and(|floor| passages[0].score < floor);
+    let refuse = trace.time_sync(Stage::Gate, || {
+        passages.is_empty()
+            || state
+                .config
+                .score_gate
+                .is_some_and(|floor| passages[0].score < floor)
+    });
+    trace.set_gated(refuse);
 
+    let passages = apply_context_budget(
+        passages,
+        state.config.context_total_tokens,
+        state.config.context_per_row_tokens,
+    );
     let citations = serde_json::to_string(&passages).unwrap_or_else(|_| "[]".to_string());
 
     // Open the generation stream only when we intend to answer; opening here (not in
@@ -506,11 +734,22 @@ async fn build_semantic_chat_data(
     let stream = if refuse {
         None
     } else {
-        let prompt = build_prompt(&passages, &standalone, memory);
-        Some(foundry.generate_stream(SYSTEM_PROMPT, &prompt).await?)
+        let prompt = trace.time_sync(Stage::Prompt, || build_prompt(&passages, &standalone));
+        Some(
+            trace
+                .time(
+                    Stage::Generate,
+                    foundry.generate_stream(SYSTEM_PROMPT, &prompt),
+                )
+                .await?,
+        )
     };
     let passages_for_persist = passages;
-    Ok(ChatData::Semantic { citations, stream, passages_for_persist })
+    Ok(ChatData::Semantic {
+        citations,
+        stream,
+        passages_for_persist,
+    })
 }
 
 /// Clip, persist, and (on success) trigger a write-behind compaction check.
