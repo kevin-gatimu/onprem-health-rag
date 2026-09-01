@@ -1,6 +1,6 @@
 // Conversation list used in both the desktop rail and the mobile drawer.
 // New-chat, select, rename (inline pencil), and delete (window.confirm + cascade).
-// All actions are disabled while a run is streaming.
+// Navigation remains available while responses stream.
 import { useState } from 'react';
 import { Plus, Pencil, Trash2, Check, X } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
@@ -12,7 +12,7 @@ import { truncateTitle, fmtWhen } from './utils';
 interface ConversationListProps {
   conversations: Conversation[];
   activeConvId: string | null;
-  streaming: boolean;
+  busyConversationIds: Set<string>;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   /** Called when the currently-active conversation is deleted, so the parent can clear state. */
@@ -24,7 +24,7 @@ interface ConversationListProps {
 export default function ConversationList({
   conversations,
   activeConvId,
-  streaming,
+  busyConversationIds,
   onSelect,
   onNewChat,
   onActiveDeleted,
@@ -71,7 +71,6 @@ export default function ConversationList({
           onNewChat();
           onClose?.();
         }}
-        disabled={streaming}
         className="min-h-[44px] mb-1"
       >
         New Chat
@@ -124,13 +123,11 @@ export default function ConversationList({
                   conv.id === activeConvId
                     ? 'bg-accent-subtle text-fg'
                     : 'text-fg hover:bg-elevated',
-                  streaming && 'pointer-events-none opacity-60',
                 )}
                 onClick={() => {
                   onSelect(conv.id);
                   onClose?.();
                 }}
-                disabled={streaming}
               >
                 <div className="flex items-center justify-between w-full gap-1">
                   <span className="font-medium truncate flex-1 min-w-0">
@@ -144,16 +141,20 @@ export default function ConversationList({
                   >
                     <button
                       onClick={(e) => { e.stopPropagation(); startRename(conv); }}
-                      className="p-1 text-fg-muted hover:text-fg min-h-[32px] min-w-[32px] flex items-center justify-center"
+                      disabled={busyConversationIds.has(conv.id)}
+                      className="p-1 text-fg-muted hover:text-fg min-h-[32px] min-w-[32px] flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
                       aria-label="Rename conversation"
+                      title={busyConversationIds.has(conv.id) ? 'Wait for active responses before renaming' : undefined}
                       tabIndex={-1}
                     >
                       <Pencil size={12} aria-hidden="true" />
                     </button>
                     <button
                       onClick={(e) => { e.stopPropagation(); void handleDelete(conv); }}
-                      className="p-1 text-fg-muted hover:text-danger min-h-[32px] min-w-[32px] flex items-center justify-center"
+                      disabled={busyConversationIds.has(conv.id)}
+                      className="p-1 text-fg-muted hover:text-danger min-h-[32px] min-w-[32px] flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed"
                       aria-label="Delete conversation"
+                      title={busyConversationIds.has(conv.id) ? 'Wait for active responses before deleting' : undefined}
                       tabIndex={-1}
                     >
                       <Trash2 size={12} aria-hidden="true" />

@@ -35,11 +35,24 @@ impl<'r> FromRequest<'r> for AuthUser {
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         let header = match req.headers().get_one("Authorization") {
             Some(h) => h,
-            None => return Outcome::Error((rocket::http::Status::Unauthorized, AppError::Unauthorized)),
+            None => {
+                return Outcome::Error((
+                    rocket::http::Status::Unauthorized,
+                    AppError::Unauthorized,
+                ));
+            }
         };
-        let token = match header.strip_prefix("Bearer ").or_else(|| header.strip_prefix("bearer ")) {
+        let token = match header
+            .strip_prefix("Bearer ")
+            .or_else(|| header.strip_prefix("bearer "))
+        {
             Some(t) => t.trim(),
-            None => return Outcome::Error((rocket::http::Status::Unauthorized, AppError::Unauthorized)),
+            None => {
+                return Outcome::Error((
+                    rocket::http::Status::Unauthorized,
+                    AppError::Unauthorized,
+                ));
+            }
         };
 
         let state = match req.rocket().state::<AppState>() {
@@ -55,7 +68,10 @@ impl<'r> FromRequest<'r> for AuthUser {
         let claims = match jwt::verify(&state.config, token) {
             Ok(c) => c,
             Err(_) => {
-                return Outcome::Error((rocket::http::Status::Unauthorized, AppError::Unauthorized));
+                return Outcome::Error((
+                    rocket::http::Status::Unauthorized,
+                    AppError::Unauthorized,
+                ));
             }
         };
 

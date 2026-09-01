@@ -1,0 +1,13 @@
+{"id":"greeting","question":"Hello there","route_expected":"conversational","intent_expected":null}
+{"id":"thanks","question":"Thank you!","route_expected":"conversational","intent_expected":null}
+{"id":"identity","question":"What can you do?","route_expected":"conversational","intent_expected":null}
+{"id":"count","question":"How many patients have diabetes?","route_expected":"structured","intent_expected":"aggregation"}
+{"id":"trend","question":"Show the trend of malaria cases per month","route_expected":"structured","intent_expected":"trend"}
+{"id":"tier2-semantic","question":"Review recent clinical notes for patient SYN-P0001","route_expected":"semantic","intent_expected":null,"tier_expected":2}
+{"id":"enumeration","question":"List all patients","route_expected":"structured","intent_expected":"enumeration"}
+{"id":"distribution","question":"Show the distribution of patients by blood type","route_expected":"structured","intent_expected":"aggregation"}
+{"id":"ranking","question":"Show the top diagnoses by count","route_expected":"structured","intent_expected":"aggregation"}
+{"id":"lookup","question":"Find patient SYN-P0001","route_expected":"semantic","intent_expected":null}
+{"id":"narrative","question":"Explain what hypertension means","route_expected":"semantic","intent_expected":null}
+{"id":"patient-history","question":"Show the patient history for SYN-P0002","route_expected":"semantic","intent_expected":null}
+{"id":"clinical-greeting-guard","question":"Hey how many patients have diabetes?","route_expected":"structured","intent_expected":"aggregation"}

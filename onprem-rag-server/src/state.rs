@@ -1,6 +1,7 @@
 //! Shared application state, managed by Rocket and injected into routes via `&State<AppState>`.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::aggregation::catalog::Catalog;
@@ -35,6 +36,12 @@ pub struct AppState {
     /// Tier-2 intent-route decision cache (bounded LRU + metrics). Cleared on every
     /// `set_catalog` — a schema change can flip a structured/semantic decision.
     pub router_cache: crate::router::RouterCache,
+    /// Process-local bounds for expensive inference, retrieval, and ingestion work.
+    pub admission: crate::admission::AdmissionControl,
+    /// Process-local notifications for live ingestion progress; snapshots remain durable in MongoDB.
+    pub ingest_progress: crate::ingest::IngestProgressHub,
+    /// 0 warming, 1 ready, 2 disabled, 3 failed.
+    warmup_state: Arc<AtomicU8>,
 }
 
 impl AppState {
@@ -46,6 +53,8 @@ impl AppState {
         initial_catalog: Catalog,
     ) -> Self {
         let router_cache = crate::router::RouterCache::new(config.router.router_cache_size);
+        let admission = crate::admission::AdmissionControl::new(&config);
+        let warmup_state = Arc::new(AtomicU8::new(if config.warmup_enabled { 0 } else { 2 }));
         AppState {
             config,
             db,
@@ -54,19 +63,42 @@ impl AppState {
             login_throttle: crate::auth::throttle::LoginThrottle::new(),
             catalog: Arc::new(RwLock::new(Arc::new(initial_catalog))),
             router_cache,
+            admission,
+            ingest_progress: crate::ingest::IngestProgressHub::default(),
+            warmup_state,
+        }
+    }
+
+    pub fn foundry_available(&self) -> bool {
+        self.foundry.is_some()
+    }
+
+    pub fn warmup_handle(&self) -> Arc<AtomicU8> {
+        self.warmup_state.clone()
+    }
+
+    pub fn warmup_status(&self) -> &'static str {
+        match self.warmup_state.load(Ordering::Relaxed) {
+            0 => "warming",
+            1 => "ready",
+            2 => "disabled",
+            _ => "failed",
         }
     }
 
     /// Access the Foundry manager, or a clean 503 if it is not available.
     pub fn foundry(&self) -> AppResult<&FoundryManager> {
-        self.foundry
-            .as_ref()
-            .ok_or_else(|| AppError::Unavailable("Foundry Local is not available on the server".into()))
+        self.foundry.as_ref().ok_or_else(|| {
+            AppError::Unavailable("Foundry Local is not available on the server".into())
+        })
     }
 
     /// The persisted override variant for a role key, if one is set.
     pub fn router_override(&self, role: &str) -> Option<String> {
-        self.router_overrides.read().ok().and_then(|m| m.get(role).cloned())
+        self.router_overrides
+            .read()
+            .ok()
+            .and_then(|m| m.get(role).cloned())
     }
 
     /// Update the in-memory override cache after a successful DB write (or clear it).
@@ -86,7 +118,10 @@ impl AppState {
     /// `ModelSpec` for a kind, with any persisted per-role override applied over the
     /// `ONPREM_MODEL_*` env default. This is what routed callers (`/agents/<kind>`)
     /// should use instead of `ModelSpec::for_kind` directly.
-    pub fn spec_for(&self, kind: crate::foundry::router::AgentKind) -> crate::foundry::router::ModelSpec {
+    pub fn spec_for(
+        &self,
+        kind: crate::foundry::router::AgentKind,
+    ) -> crate::foundry::router::ModelSpec {
         let mut spec = crate::foundry::router::ModelSpec::for_kind(kind, &self.config);
         if let Some(v) = self.router_override(crate::foundry::router::override_key(kind)) {
             spec.alias = v;

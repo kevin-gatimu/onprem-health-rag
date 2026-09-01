@@ -110,7 +110,10 @@ pub async fn generate(
     // (the SSE body itself can't carry a status code).
     let mut stream = state
         .foundry()?
-        .generate_stream("You are a helpful assistant. Answer concisely.", &body.prompt)
+        .generate_stream(
+            "You are a helpful assistant. Answer concisely.",
+            &body.prompt,
+        )
         .await?;
 
     Ok(EventStream! {
@@ -360,7 +363,8 @@ pub async fn model_roles(
                 .cloned()
                 .collect();
             matching.sort_by(|a, b| {
-                (device_rank(&a.id, &device_pref), &a.id).cmp(&(device_rank(&b.id, &device_pref), &b.id))
+                (device_rank(&a.id, &device_pref), &a.id)
+                    .cmp(&(device_rank(&b.id, &device_pref), &b.id))
             });
             ordered.extend(matching);
         }
@@ -421,8 +425,13 @@ pub async fn set_router(
     body: Json<SetRouterReq>,
 ) -> AppResult<Json<serde_json::Value>> {
     user.require_admin()?;
-    crate::settings::set_router_override(&state.db, &body.role, body.variant_id.as_deref(), &user.username)
-        .await?;
+    crate::settings::set_router_override(
+        &state.db,
+        &body.role,
+        body.variant_id.as_deref(),
+        &user.username,
+    )
+    .await?;
     state.set_router_override_cache(&body.role, body.variant_id.clone());
     if body.role == "chat" {
         if let (Ok(f), Some(v)) = (state.foundry(), body.variant_id.as_ref()) {
@@ -541,7 +550,10 @@ pub async fn setup_status(state: &State<AppState>, _user: AuthUser) -> Json<Setu
     // GPU from OS-level detection so this field is meaningful even when Foundry is down.
     let devices = super::hardware::detect();
     let gpu_dev = devices.iter().find(|d| d.kind == "GPU");
-    let gpu = GpuInfo { has_gpu: gpu_dev.is_some(), gpu_name: gpu_dev.map(|d| d.name.clone()) };
+    let gpu = GpuInfo {
+        has_gpu: gpu_dev.is_some(),
+        gpu_name: gpu_dev.map(|d| d.name.clone()),
+    };
 
     let foundry_ready = state.foundry().is_ok();
 
@@ -556,8 +568,16 @@ pub async fn setup_status(state: &State<AppState>, _user: AuthUser) -> Json<Setu
         // The native core has no port/URL; report the literal in-process marker.
         foundry_endpoint = "in-process (native SDK)".to_string();
         if let Ok(models) = f.list_models().await {
-            loaded_models = models.iter().filter(|m| m.loaded).map(|m| m.id.clone()).collect();
-            cached_models = models.iter().filter(|m| m.cached).map(|m| m.id.clone()).collect();
+            loaded_models = models
+                .iter()
+                .filter(|m| m.loaded)
+                .map(|m| m.id.clone())
+                .collect();
+            cached_models = models
+                .iter()
+                .filter(|m| m.cached)
+                .map(|m| m.id.clone())
+                .collect();
         }
         if let Ok(hw) = f.hardware() {
             execution_providers = hw.execution_providers;

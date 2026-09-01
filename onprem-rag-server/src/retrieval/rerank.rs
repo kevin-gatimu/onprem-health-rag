@@ -26,7 +26,10 @@ fn resolve_model(name: &str) -> RerankerModel {
         }
         "bge-reranker-base" | "bgererankerbase" => RerankerModel::BGERerankerBase,
         other => {
-            tracing::warn!(model = other, "unknown reranker model; falling back to bge-reranker-v2-m3");
+            tracing::warn!(
+                model = other,
+                "unknown reranker model; falling back to bge-reranker-v2-m3"
+            );
             RerankerModel::BGERerankerV2M3
         }
     }
@@ -46,7 +49,9 @@ fn get_or_init(model: RerankerModel) -> AppResult<&'static Mutex<TextRerank>> {
     if let Some(r) = RERANKER.get() {
         return Ok(r);
     }
-    let _guard = INIT_LOCK.lock().map_err(|_| AppError::Internal("reranker init lock poisoned".into()))?;
+    let _guard = INIT_LOCK
+        .lock()
+        .map_err(|_| AppError::Internal("reranker init lock poisoned".into()))?;
     if let Some(r) = RERANKER.get() {
         return Ok(r);
     }
@@ -54,13 +59,19 @@ fn get_or_init(model: RerankerModel) -> AppResult<&'static Mutex<TextRerank>> {
     let tr = TextRerank::try_new(RerankInitOptions::new(model).with_show_download_progress(true))
         .map_err(|e| AppError::Internal(format!("failed to load reranker model: {e}")))?;
     let _ = RERANKER.set(Mutex::new(tr));
-    RERANKER.get().ok_or_else(|| AppError::Internal("reranker disappeared after init".into()))
+    RERANKER
+        .get()
+        .ok_or_else(|| AppError::Internal("reranker disappeared after init".into()))
 }
 
 /// Rerank `documents` against `query`. Returns `(original_index, score)` pairs sorted
 /// by score descending. Higher score = more relevant; scores are model-specific
 /// (not normalised), so use them for ordering, not as absolute confidences.
-pub async fn rerank(config: &Config, query: String, documents: Vec<String>) -> AppResult<Vec<(usize, f32)>> {
+pub async fn rerank(
+    config: &Config,
+    query: String,
+    documents: Vec<String>,
+) -> AppResult<Vec<(usize, f32)>> {
     if documents.is_empty() {
         return Ok(Vec::new());
     }
@@ -68,13 +79,18 @@ pub async fn rerank(config: &Config, query: String, documents: Vec<String>) -> A
 
     let mut scored = tokio::task::spawn_blocking(move || -> AppResult<Vec<(usize, f32)>> {
         let lock = get_or_init(model)?;
-        let mut tr = lock.lock().map_err(|_| AppError::Internal("reranker lock poisoned".into()))?;
+        let mut tr = lock
+            .lock()
+            .map_err(|_| AppError::Internal("reranker lock poisoned".into()))?;
         let docs: Vec<&str> = documents.iter().map(String::as_str).collect();
         // return_documents=false: we only need indices + scores (we keep the Hits).
         let results = tr
             .rerank(query.as_str(), docs, false, None)
             .map_err(|e| AppError::Internal(format!("rerank failed: {e}")))?;
-        Ok(results.into_iter().map(|r| (r.index, sigmoid(r.score))).collect())
+        Ok(results
+            .into_iter()
+            .map(|r| (r.index, sigmoid(r.score)))
+            .collect())
     })
     .await
     .map_err(|e| AppError::Internal(format!("rerank task panicked: {e}")))??;

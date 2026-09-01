@@ -17,13 +17,13 @@ use async_openai::types::chat::ChatCompletionTool;
 use foundry_local_sdk::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, ChatCompletionStream,
-    ChatCompletionTools, ChatResponseFormat, ChatToolChoice, FoundryLocalConfig,
-    FoundryLocalError, FoundryLocalManager, FunctionObject, Model,
+    ChatCompletionTools, ChatResponseFormat, ChatToolChoice, FoundryLocalConfig, FoundryLocalError,
+    FoundryLocalManager, FunctionObject, Model,
 };
 use serde::Serialize;
 
-use crate::aggregation::spec::RunList;
 use crate::aggregation::RunAggregation;
+use crate::aggregation::spec::RunList;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use crate::router::RouteToolOutput;
@@ -74,7 +74,12 @@ impl ExecutionProvider {
 
     fn new(name: String, registered: bool) -> Self {
         let (device_kind, label) = Self::classify(&name);
-        Self { name, registered, device_kind: device_kind.to_string(), label }
+        Self {
+            name,
+            registered,
+            device_kind: device_kind.to_string(),
+            label,
+        }
     }
 }
 
@@ -178,7 +183,9 @@ impl FoundryManager {
                 providers = ?eps.iter().map(|e| &e.name).collect::<Vec<_>>(),
                 "Foundry Local ready; execution providers discovered"
             ),
-            Err(e) => tracing::warn!(error = %e, "Foundry Local: could not discover execution providers"),
+            Err(e) => {
+                tracing::warn!(error = %e, "Foundry Local: could not discover execution providers")
+            }
         }
         Ok(Self {
             manager,
@@ -192,13 +199,19 @@ impl FoundryManager {
 
     /// The chat model the server will generate with.
     pub fn current_model(&self) -> String {
-        self.current_chat_model.lock().expect("chat-model lock poisoned").clone()
+        self.current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned")
+            .clone()
     }
 
     /// Directly set the current chat model id without downloading/loading — used when
     /// persisting a "chat" role override that was already loaded via `spawn_pull`.
     pub fn set_current_model(&self, id: String) {
-        *self.current_chat_model.lock().expect("chat-model lock poisoned") = id;
+        *self
+            .current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned") = id;
     }
 
     /// Download (if needed) and register all execution providers available for this
@@ -207,7 +220,11 @@ impl FoundryManager {
     /// but scoped to our core (the Foundry CLI service is a separate instance).
     pub async fn register_eps(&self) -> AppResult<EpRegistration> {
         tracing::info!("registering Foundry execution providers (downloading plugins if needed)…");
-        let r = self.manager.download_and_register_eps(None).await.map_err(map_err)?;
+        let r = self
+            .manager
+            .download_and_register_eps(None)
+            .await
+            .map_err(map_err)?;
         if r.failed_eps.is_empty() {
             tracing::info!(registered = ?r.registered_eps, "execution providers registered");
         } else {
@@ -231,7 +248,9 @@ impl FoundryManager {
                 Ok(r) if r.failed_eps.is_empty() => {
                     tracing::info!(registered = ?r.registered_eps, "startup: execution providers registered");
                 }
-                Ok(r) => tracing::warn!(registered = ?r.registered_eps, failed = ?r.failed_eps, "startup: some execution providers failed to register"),
+                Ok(r) => {
+                    tracing::warn!(registered = ?r.registered_eps, failed = ?r.failed_eps, "startup: some execution providers failed to register")
+                }
                 Err(e) => tracing::warn!(error = %e, "startup: EP registration failed"),
             }
         });
@@ -297,7 +316,9 @@ impl FoundryManager {
         let mut out: Vec<VariantInfo> = Vec::new();
         let mut seen_ids = HashSet::new();
         for alias in &deduped_aliases {
-            let Ok(model) = catalog.get_model(alias).await else { continue };
+            let Ok(model) = catalog.get_model(alias).await else {
+                continue;
+            };
             for v in model.variants() {
                 let id = v.id().to_string();
                 if !seen_ids.insert(id.clone()) {
@@ -320,7 +341,12 @@ impl FoundryManager {
     /// back over `tx`. Runs detached (`tokio::spawn`) so the SSE route can start
     /// yielding events immediately. Only `&'static` / owned values cross the spawn
     /// boundary — no `&self` or borrowed `Arc<Model>` from the caller.
-    pub fn spawn_pull(&self, variant_id: String, load: bool, tx: tokio::sync::mpsc::UnboundedSender<PullMsg>) {
+    pub fn spawn_pull(
+        &self,
+        variant_id: String,
+        load: bool,
+        tx: tokio::sync::mpsc::UnboundedSender<PullMsg>,
+    ) {
         let manager = self.manager; // &'static, Copy
         tokio::spawn(async move {
             let model = match manager.catalog().get_model_variant(&variant_id).await {
@@ -374,7 +400,10 @@ impl FoundryManager {
     /// `variants_for` reports the variant as not downloaded.
     pub async fn delete_model(&self, variant_id: &str) -> AppResult<()> {
         let catalog = self.manager.catalog();
-        let model = catalog.get_model_variant(variant_id).await.map_err(map_err)?;
+        let model = catalog
+            .get_model_variant(variant_id)
+            .await
+            .map_err(map_err)?;
 
         if model.is_loaded().await.unwrap_or(false) {
             if let Err(e) = model.unload().await {
@@ -399,7 +428,10 @@ impl FoundryManager {
     /// — matching how `delete_model` treats unload failures as non-fatal.
     pub async fn unload_model(&self, variant_id: &str) -> AppResult<()> {
         let catalog = self.manager.catalog();
-        let model = catalog.get_model_variant(variant_id).await.map_err(map_err)?;
+        let model = catalog
+            .get_model_variant(variant_id)
+            .await
+            .map_err(map_err)?;
 
         if model.is_loaded().await.unwrap_or(false) {
             if let Err(e) = model.unload().await {
@@ -447,7 +479,10 @@ impl FoundryManager {
         let model = self.resolve(name).await?;
         ensure_loaded(&model).await?;
         let id = model.id().to_string();
-        *self.current_chat_model.lock().expect("chat-model lock poisoned") = id.clone();
+        *self
+            .current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned") = id.clone();
         tracing::info!(model = %id, "chat model selected and loaded");
         Ok(id)
     }
@@ -523,7 +558,10 @@ impl FoundryManager {
 
         if is_gpu {
             let victim = {
-                let mut lru = self.lru_residents.lock().expect("lru-residents lock poisoned");
+                let mut lru = self
+                    .lru_residents
+                    .lock()
+                    .expect("lru-residents lock poisoned");
                 // Remove existing entry so we can re-insert at MRU position regardless
                 // of whether the model is already loaded (this also updates recency).
                 lru.retain(|x| x != &id);
@@ -599,15 +637,28 @@ impl FoundryManager {
 
         let msgs = build_messages(system, user, spec.thinking);
         let client = {
-            let c = model.create_chat_client().temperature(spec.temperature as f64);
-            if let Some(mt) = spec.max_tokens { c.max_tokens(mt) } else { c }
+            let c = model
+                .create_chat_client()
+                .temperature(spec.temperature as f64);
+            if let Some(mt) = spec.max_tokens {
+                c.max_tokens(mt)
+            } else {
+                c
+            }
         };
         // Phase-3 tool seam: when the spec declares tools (HealthQuery, Trends,
         // PatientLookup, Extract, Verify, MultiHop), expose the run_aggregation tool
         // so the model can invoke structured data operations mid-stream.
-        let tools = if spec.tools { Some(vec![run_aggregation_tool()]) } else { None };
+        let tools = if spec.tools {
+            Some(vec![run_aggregation_tool()])
+        } else {
+            None
+        };
         let tools_ref: Option<&[ChatCompletionTools]> = tools.as_deref();
-        client.complete_streaming_chat(&msgs, tools_ref).await.map_err(map_err)
+        client
+            .complete_streaming_chat(&msgs, tools_ref)
+            .await
+            .map_err(map_err)
     }
 
     /// Non-streaming completion against a fully-resolved `ModelSpec`. Drains
@@ -635,7 +686,11 @@ impl FoundryManager {
     /// Open a streaming chat completion against the current model with a system + user
     /// message pair. Backward-compatible wrapper over `generate_stream_with` using a
     /// default GPU spec — callers in `rag/routes.rs` are unchanged.
-    pub async fn generate_stream(&self, system: &str, user: &str) -> AppResult<ChatCompletionStream> {
+    pub async fn generate_stream(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<ChatCompletionStream> {
         let spec = ModelSpec {
             alias: self.current_model(),
             thinking: false,
@@ -898,11 +953,7 @@ impl FoundryManager {
     /// emit a `classify_route` tool call and returns the parsed
     /// [`RouteToolOutput`]. The caller (`router::route`) maps it to a concrete
     /// route and falls open to semantic on any error.
-    pub async fn plan_route(
-        &self,
-        spec: &ModelSpec,
-        question: &str,
-    ) -> AppResult<RouteToolOutput> {
+    pub async fn plan_route(&self, spec: &ModelSpec, question: &str) -> AppResult<RouteToolOutput> {
         let system = "You are the routing classifier for an on-premises health-records \
                       question-answering assistant. Given the user's latest message, call \
                       the classify_route tool with exactly one route. Prefer 'structured' \
@@ -1004,7 +1055,10 @@ impl FoundryManager {
             .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
             .response_format(ChatResponseFormat::JsonSchema(schema_str.clone()));
 
-        let resp = client.complete_chat(&msgs, Some(&[tool.clone()])).await.map_err(map_err)?;
+        let resp = client
+            .complete_chat(&msgs, Some(&[tool.clone()]))
+            .await
+            .map_err(map_err)?;
 
         match try_parse_tool::<T>(&resp) {
             Ok(result) => return Ok(result),
@@ -1021,8 +1075,10 @@ impl FoundryManager {
                     .temperature(0.0)
                     .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
                     .response_format(ChatResponseFormat::JsonSchema(schema_str));
-                let resp2 =
-                    client2.complete_chat(&msgs2, Some(&[tool])).await.map_err(map_err)?;
+                let resp2 = client2
+                    .complete_chat(&msgs2, Some(&[tool]))
+                    .await
+                    .map_err(map_err)?;
                 try_parse_tool::<T>(&resp2).map_err(|e| {
                     AppError::BadRequest(format!(
                         "{tool_name} planner could not produce a valid spec after retry: {e}"
@@ -1038,7 +1094,10 @@ impl FoundryManager {
 fn try_parse_tool<T: serde::de::DeserializeOwned>(
     resp: &foundry_local_sdk::CreateChatCompletionResponse,
 ) -> Result<T, String> {
-    let first = resp.choices.first().ok_or_else(|| "model returned no choices".to_string())?;
+    let first = resp
+        .choices
+        .first()
+        .ok_or_else(|| "model returned no choices".to_string())?;
 
     // 1. Try tool_calls
     if let Some(tcs) = &first.message.tool_calls {
@@ -1050,7 +1109,7 @@ fn try_parse_tool<T: serde::de::DeserializeOwned>(
                         return Err(format!(
                             "tool_call arguments parse failed: {e}; raw={}",
                             &call.function.arguments
-                        ))
+                        ));
                     }
                 }
             }

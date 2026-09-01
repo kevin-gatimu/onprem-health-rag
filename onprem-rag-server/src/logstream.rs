@@ -54,7 +54,10 @@ pub struct LogHub {
 impl LogHub {
     fn new() -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAP);
-        LogHub { tx, ring: Mutex::new(VecDeque::with_capacity(RING_CAP)) }
+        LogHub {
+            tx,
+            ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+        }
     }
 
     /// Record a line: append to the ring (evicting the oldest past `RING_CAP`),

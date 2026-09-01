@@ -13,13 +13,13 @@
 
 use chrono::{DateTime, Utc};
 use futures::TryStreamExt;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use rocket::serde::json::Json;
-use rocket::{get, State};
+use rocket::{State, get};
 use serde::Serialize;
 
 use crate::auth::guard::AuthUser;
-use crate::documentdb::{JOBS, RECORDS, SOURCES};
+use crate::documentdb::{INDEXED_TABLES, JOBS, SOURCES};
 use crate::error::AppResult;
 use crate::state::AppState;
 
@@ -42,27 +42,42 @@ pub async fn stats(state: &State<AppState>, _user: AuthUser) -> AppResult<Json<S
     let db = &state.db;
 
     // Saved connections — a plain count.
-    let active_connections = db.collection::<Document>(SOURCES).count_documents(doc! {}).await? as i64;
+    let active_connections = db
+        .collection::<Document>(SOURCES)
+        .count_documents(doc! {})
+        .await? as i64;
 
-    // Distinct rows: records are one-chunk-per-doc, so collapse by (source, row) first.
-    let total_records = count_aggregate(
-        db.collection::<Document>(RECORDS),
-        vec![
-            doc! { "$group": { "_id": { "s": "$source_id", "r": "$row_pk" } } },
-            doc! { "$count": "n" },
-        ],
-    )
-    .await?;
-
-    // Distinct ingested sources ≈ tables indexed.
-    let total_tables = count_aggregate(
-        db.collection::<Document>(RECORDS),
-        vec![
-            doc! { "$group": { "_id": "$source_id" } },
-            doc! { "$count": "n" },
-        ],
-    )
-    .await?;
+    // Ingestion cutover materializes per-table row counts, so dashboard reads stay
+    // bounded by table count rather than scanning the chunk collection.
+    let summary: Vec<Document> = db
+        .collection::<Document>(INDEXED_TABLES)
+        .aggregate(vec![
+            doc! { "$match": { "status": "indexed" } },
+            doc! { "$group": {
+                "_id": mongodb::bson::Bson::Null,
+                "total_records": { "$sum": "$row_count" },
+                "total_tables": { "$sum": 1 },
+            } },
+        ])
+        .await?
+        .try_collect()
+        .await?;
+    let total_records = summary
+        .first()
+        .and_then(|doc| {
+            doc.get_i64("total_records")
+                .ok()
+                .or_else(|| doc.get_i32("total_records").ok().map(i64::from))
+        })
+        .unwrap_or(0);
+    let total_tables = summary
+        .first()
+        .and_then(|doc| {
+            doc.get_i64("total_tables")
+                .ok()
+                .or_else(|| doc.get_i32("total_tables").ok().map(i64::from))
+        })
+        .unwrap_or(0);
 
     // Most recent successful ingest. Status vocabulary is now "completed" or "partial"
     // (was "done" before Stage 4). Match both so old jobs still appear in the stat.
@@ -80,7 +95,11 @@ pub async fn stats(state: &State<AppState>, _user: AuthUser) -> AppResult<Json<S
     // Outbreak alerts have no server-side source yet (stub in the reference too).
     let pending_alerts = 0;
 
-    let llm_status = if state.foundry().is_ok() { "running" } else { "stopped" };
+    let llm_status = if state.foundry().is_ok() {
+        "running"
+    } else {
+        "stopped"
+    };
 
     Ok(Json(StatsResponse {
         total_records,
@@ -90,17 +109,4 @@ pub async fn stats(state: &State<AppState>, _user: AuthUser) -> AppResult<Json<S
         pending_alerts,
         llm_status: llm_status.to_string(),
     }))
-}
-
-/// Run a `$count`-terminated aggregation and read back the count, defaulting to 0
-/// when the pipeline yields nothing (empty collection → no `$count` document).
-async fn count_aggregate(
-    coll: mongodb::Collection<Document>,
-    pipeline: Vec<Document>,
-) -> AppResult<i64> {
-    let docs: Vec<Document> = coll.aggregate(pipeline).await?.try_collect().await?;
-    Ok(docs
-        .first()
-        .and_then(|d| d.get_i32("n").ok().map(|n| n as i64).or_else(|| d.get_i64("n").ok()))
-        .unwrap_or(0))
 }

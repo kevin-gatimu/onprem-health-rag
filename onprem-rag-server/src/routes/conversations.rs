@@ -96,7 +96,7 @@ pub async fn list_conversations(
         .db
         .chat_conversations()
         .find(doc! { "user_id": &user.id, "agent_kind": { "$exists": false } })
-        .sort(doc! { "updated_at": -1 })
+        .sort(doc! { "updated_at": -1, "_id": -1 })
         .await?
         .try_collect()
         .await?;
@@ -117,7 +117,7 @@ pub async fn list_agent_conversations(
         .db
         .chat_conversations()
         .find(doc! { "user_id": &user.id, "agent_kind": kind })
-        .sort(doc! { "updated_at": -1 })
+        .sort(doc! { "updated_at": -1, "_id": -1 })
         .await?
         .try_collect()
         .await?;
@@ -234,7 +234,11 @@ pub async fn delete_conversation(
     }
 
     // Cascade: delete all messages belonging to this conversation.
-    state.db.chat_messages().delete_many(doc! { "conversation_id": id }).await?;
+    state
+        .db
+        .chat_messages()
+        .delete_many(doc! { "conversation_id": id })
+        .await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -261,7 +265,7 @@ pub async fn list_messages(
         .db
         .chat_messages()
         .find(doc! { "conversation_id": id })
-        .sort(doc! { "created_at": 1 })
+        .sort(doc! { "created_at": 1, "_id": 1 })
         .await?
         .try_collect()
         .await?;
@@ -319,7 +323,7 @@ pub(crate) async fn load_history(
     let docs: Vec<Document> = match db
         .chat_messages()
         .find(doc! { "conversation_id": conversation_id })
-        .sort(doc! { "created_at": -1 })
+        .sort(doc! { "created_at": -1, "_id": -1 })
         .limit(limit)
         .await
     {
@@ -374,7 +378,9 @@ pub(crate) async fn persist_user_message(
     } else {
         doc! { "$set": { "updated_at": now } }
     };
-    db.chat_conversations().update_one(doc! { "_id": oid }, update).await?;
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, update)
+        .await?;
 
     Ok(())
 }
@@ -392,8 +398,7 @@ pub(crate) async fn persist_assistant_message(
 
     // Serialize citations as a compact JSON string — avoids BSON round-trip issues
     // with serde_json::Value and keeps the schema simple.
-    let citations_json =
-        serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
+    let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
 
     let now = BsonDateTime::now();
     db.chat_messages()
@@ -450,8 +455,7 @@ pub(crate) async fn persist_agent_assistant_message(
         msg_doc.insert("structured_json", sj);
     } else {
         // Semantic path: store citations (may be an empty array for the refuse path).
-        let citations_json =
-            serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
+        let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
         msg_doc.insert("citations_json", citations_json);
     }
 
@@ -506,7 +510,10 @@ fn read_dt_field(d: &Document, key: &str) -> String {
 /// Build a `ConversationOut` from a raw BSON document.
 fn conv_doc_to_out(d: &Document) -> ConversationOut {
     ConversationOut {
-        id: d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default(),
+        id: d
+            .get_object_id("_id")
+            .map(|o| o.to_hex())
+            .unwrap_or_default(),
         title: d.get_str("title").unwrap_or("").to_string(),
         agent_kind: d.get_str("agent_kind").ok().map(str::to_string),
         created_at: read_dt_field(d, "created_at"),
@@ -531,7 +538,10 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
     let agent_kind = d.get_str("agent_kind").ok().map(str::to_string);
 
     MessageOut {
-        id: d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default(),
+        id: d
+            .get_object_id("_id")
+            .map(|o| o.to_hex())
+            .unwrap_or_default(),
         role: d.get_str("role").unwrap_or("").to_string(),
         content: d.get_str("content").unwrap_or("").to_string(),
         citations,

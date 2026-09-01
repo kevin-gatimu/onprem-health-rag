@@ -855,6 +855,10 @@ export function chat(
   return authedInvoke<void>("chat", { question, history, opts, conversationId, runId });
 }
 
+export function cancelRun(runId: string): Promise<boolean> {
+  return authedInvoke<boolean>('cancel_run', { runId });
+}
+
 // --- Live log stream: server `tracing` events surfaced in the app ---
 
 /** One server log event. `target` is the Rust module path (e.g. `onprem_server::embed`), which the UI filters on. */

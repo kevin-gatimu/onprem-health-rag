@@ -43,7 +43,9 @@ impl CredentialCipher {
         hasher.update(secret.as_bytes());
         let key_bytes = hasher.finalize();
         let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
-        CredentialCipher { cipher: Aes256Gcm::new(key) }
+        CredentialCipher {
+            cipher: Aes256Gcm::new(key),
+        }
     }
 
     /// Encrypt a plaintext secret, returning `base64(nonce ‖ ciphertext)`.
