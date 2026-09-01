@@ -9,7 +9,7 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow } from "./bridge";
+import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type VerifyReport } from "./bridge";
 import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
 import { notifyBackground } from "./notify";
@@ -156,6 +156,40 @@ export async function initBridgeEvents(): Promise<void> {
         useChat.getState().setCitations(run_id, passages);
       } catch {
         /* ignore malformed citations payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://sql", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const metadata = JSON.parse(data) as { source_id: string; sql: string };
+        useChat.getState().setSqlMetadata(run_id, metadata.source_id, metadata.sql);
+      } catch {
+        /* ignore malformed SQL metadata */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://columns", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSqlColumns(run_id, JSON.parse(data) as string[]);
+      } catch {
+        /* ignore malformed SQL columns */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://rows", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSqlRows(run_id, JSON.parse(data) as unknown[][]);
+      } catch {
+        /* ignore malformed SQL rows */
       }
     }),
   );

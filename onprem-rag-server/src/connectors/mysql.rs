@@ -13,7 +13,8 @@ use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::{Column, Row, ValueRef};
 
 use super::{
-    ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err, make_row_filtered,
+    ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
+    make_row_filtered,
 };
 use crate::error::AppResult;
 
@@ -152,10 +153,12 @@ impl SourceConnector for MysqlConnector {
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
                 TableSchema {
                     name,
                     row_count,
                     columns,
+                    fk_edges,
                 }
             })
             .collect();
@@ -252,8 +255,11 @@ impl SourceConnector for MysqlConnector {
             return Ok((vec![], vec![]));
         }
 
-        let columns: Vec<String> =
-            rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+        let columns: Vec<String> = rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         let mut result_rows = Vec::with_capacity(rows.len());
         for row in &rows {
             let values = (0..columns.len()).map(|i| cell_to_json(row, i)).collect();

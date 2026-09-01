@@ -14,8 +14,14 @@ pub const JOBS: &str = "jobs";
 pub const SETTINGS: &str = "settings";
 /// Append-only security audit log (login, logout, admin actions, etc.).
 pub const AUDIT_LOG: &str = "audit_log";
-/// nl2sql: one doc per (source_id, table) with embedded schema card + cardVector.
+/// nl2sql: versioned table cards with embedded schema text + cardVector.
 pub const SCHEMA_CATALOG: &str = "schema_catalog";
+/// One active schema-catalog version and refresh status per source.
+pub const SCHEMA_CATALOG_STATE: &str = "schema_catalog_state";
+/// Bounded operational history of metadata checks and refreshes.
+pub const SCHEMA_CATALOG_HISTORY: &str = "schema_catalog_history";
+/// Admin-curated aliases and undeclared relationships, independent of generations.
+pub const SCHEMA_METADATA_OVERRIDES: &str = "schema_metadata_overrides";
 /// Per-table ingestion state: one doc per `{source_id}:{table}`, tracking status,
 /// row/vector counts, and timestamps. Read by `GET /ingest/history`.
 pub const INDEXED_TABLES: &str = "indexed_tables";
@@ -89,6 +95,17 @@ impl DocumentDb {
         self.collection(SCHEMA_CATALOG)
     }
 
+    pub fn schema_catalog_state(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG_STATE)
+    }
+
+    pub fn schema_catalog_history(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG_HISTORY)
+    }
+
+    pub fn schema_metadata_overrides(&self) -> Collection<Document> {
+        self.collection(SCHEMA_METADATA_OVERRIDES)
+    }
 }
 
 /// Backfill generation markers for records created before versioned ingestion.

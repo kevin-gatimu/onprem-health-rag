@@ -64,7 +64,7 @@ pub enum VerifyStatus {
 }
 
 /// What `/chat` streams in its `verify` event.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyReport {
     pub status: VerifyStatus,
     /// Per-claim detail, in the order the verifier returned them. Empty when skipped.
@@ -129,7 +129,13 @@ impl VerifyReport {
         } else {
             VerifyStatus::Partial
         };
-        VerifyReport { status, claims, unsupported, reason: None, citation_overflow: Vec::new() }
+        VerifyReport {
+            status,
+            claims,
+            unsupported,
+            reason: None,
+            citation_overflow: Vec::new(),
+        }
     }
 
     /// Attach the deterministic citation-marker check to this report.
@@ -230,13 +236,20 @@ mod tests {
     use super::*;
 
     fn claim(text: &str, supported: bool, passages: Vec<usize>) -> ClaimCheck {
-        ClaimCheck { claim: text.into(), supported, passages }
+        ClaimCheck {
+            claim: text.into(),
+            supported,
+            passages,
+        }
     }
 
     #[test]
     fn all_supported_is_supported() {
         let r = VerifyReport::from_claims(
-            vec![claim("on metformin", true, vec![1]), claim("HbA1c 7.2", true, vec![2])],
+            vec![
+                claim("on metformin", true, vec![1]),
+                claim("HbA1c 7.2", true, vec![2]),
+            ],
             3,
         );
         assert_eq!(r.status, VerifyStatus::Supported);
@@ -247,7 +260,10 @@ mod tests {
     #[test]
     fn mixed_verdicts_are_partial() {
         let r = VerifyReport::from_claims(
-            vec![claim("on metformin", true, vec![1]), claim("penicillin allergy", false, vec![])],
+            vec![
+                claim("on metformin", true, vec![1]),
+                claim("penicillin allergy", false, vec![]),
+            ],
             3,
         );
         assert_eq!(r.status, VerifyStatus::Partial);
@@ -272,7 +288,10 @@ mod tests {
     #[test]
     fn blank_claims_are_dropped() {
         let r = VerifyReport::from_claims(
-            vec![claim("   ", true, vec![1]), claim("on metformin", true, vec![1])],
+            vec![
+                claim("   ", true, vec![1]),
+                claim("on metformin", true, vec![1]),
+            ],
             2,
         );
         assert_eq!(r.claims.len(), 1);
@@ -307,7 +326,10 @@ mod tests {
     fn clean_report_omits_reason() {
         let r = VerifyReport::from_claims(vec![claim("on metformin", true, vec![1])], 1);
         let json = serde_json::to_string(&r).unwrap();
-        assert!(!json.contains("reason"), "reason must be absent on a real verdict");
+        assert!(
+            !json.contains("reason"),
+            "reason must be absent on a real verdict"
+        );
     }
 
     #[test]
@@ -315,12 +337,17 @@ mod tests {
         let p = |t: &str| Passage {
             id: "i".into(),
             source_id: "s".into(),
+            table: "t".into(),
             row_pk: "r".into(),
             chunk_index: 0,
             text: t.into(),
             fields: serde_json::Value::Null,
             score: 1.0,
             reranked: false,
+            vector_rank: None,
+            text_rank: None,
+            fused_score: 1.0,
+            rerank_score: None,
         };
         let msg = build_user("answer text", &[p("first"), p("second")], 100);
         assert!(msg.contains("[1] first"));
@@ -333,12 +360,17 @@ mod tests {
         let p = Passage {
             id: "i".into(),
             source_id: "s".into(),
+            table: "t".into(),
             row_pk: "r".into(),
             chunk_index: 0,
             text: "abcdefghij".into(),
             fields: serde_json::Value::Null,
             score: 1.0,
             reranked: false,
+            vector_rank: None,
+            text_rank: None,
+            fused_score: 1.0,
+            rerank_score: None,
         };
         let msg = build_user("a", std::slice::from_ref(&p), 4);
         assert!(msg.contains("[1] abcd"));

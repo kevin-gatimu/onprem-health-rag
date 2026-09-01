@@ -10,6 +10,7 @@ import Markdown from '../../components/Markdown';
 import Citations from './Citations';
 import ActivityStrip from './ActivityStrip';
 import VerifyBadge from './VerifyBadge';
+import SqlResultTable from './SqlResultTable';
 
 type MessageBubbleProps =
   | { kind: 'persisted'; message: StoredMessage }
@@ -61,6 +62,8 @@ export default function MessageBubble(props: MessageBubbleProps) {
       : props.pending.citations;
 
   const pendingRun = props.kind === 'optimistic-assistant' ? props.pending : null;
+  const sqlResult = props.kind === 'persisted' ? props.message.sql_result : pendingRun?.sqlResult;
+  const verification = props.kind === 'persisted' ? props.message.verify : pendingRun?.verify;
   const isDone = props.kind === 'persisted'
     || props.pending.phase === 'done'
     || props.pending.phase === 'stopped';
@@ -92,6 +95,8 @@ export default function MessageBubble(props: MessageBubbleProps) {
         </div>
       )}
 
+      {sqlResult && <SqlResultTable result={sqlResult} />}
+
       {/* Copy button (appears once there is content) */}
       {content && (
         <button
@@ -106,10 +111,8 @@ export default function MessageBubble(props: MessageBubbleProps) {
         </button>
       )}
 
-      {/* Faithfulness verdict (plan 25). Live-run only: the report rides on the
-          pending run, not on the persisted message, so it disappears once the
-          conversation is refetched from the DB. */}
-      {pendingRun?.verify && <VerifyBadge report={pendingRun.verify} />}
+      {/* Faithfulness verdict (plan 25), retained after the message is persisted. */}
+      {verification && <VerifyBadge report={verification} />}
 
       {/* Citations */}
       {citations.length > 0 && <Citations citations={citations} />}

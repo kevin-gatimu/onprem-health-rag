@@ -1,5 +1,5 @@
 // Renders persisted messages, concurrent optimistic runs, and queued follow-ups.
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { MessageSquare, RotateCcw, Square, X, Zap } from 'lucide-react';
 import type { StoredMessage } from '../../lib/bridge';
 import type { PendingRun, QueuedChatPrompt } from '../../stores/chat';
@@ -29,7 +29,14 @@ export default function MessageList({
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
   const previousConversationId = useRef(activeConvId);
-  const hasContent = persisted.length > 0 || runs.length > 0 || queued.length > 0;
+  const visible = useMemo(() => {
+    const last = persisted[persisted.length - 1];
+    if (last?.role === 'user' && runs.some((run) => run.user === last.content)) {
+      return persisted.slice(0, -1);
+    }
+    return persisted;
+  }, [persisted, runs]);
+  const hasContent = visible.length > 0 || runs.length > 0 || queued.length > 0;
 
   useEffect(() => {
     if (previousConversationId.current !== activeConvId) {

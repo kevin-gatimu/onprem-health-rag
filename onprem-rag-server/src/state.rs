@@ -90,7 +90,7 @@ impl AppState {
 
     /// Access the Foundry manager, or a clean 503 if it is not available.
     pub fn foundry(&self) -> AppResult<&FoundryManager> {
-        self.foundry.as_ref().ok_or_else(|| {
+        self.foundry.as_deref().ok_or_else(|| {
             AppError::Unavailable("Foundry Local is not available on the server".into())
         })
     }

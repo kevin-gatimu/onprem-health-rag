@@ -17,7 +17,7 @@ use async_openai::types::chat::ChatCompletionTool;
 use foundry_local_sdk::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, ChatCompletionStream,
-    ChatCompletionTools, ChatResponseFormat, ChatToolChoice, FoundryLocalConfig, FoundryLocalError,
+    ChatCompletionTools, ChatToolChoice, FoundryLocalConfig, FoundryLocalError,
     FoundryLocalManager, FunctionObject, Model,
 };
 use serde::Serialize;
@@ -320,6 +320,22 @@ impl FoundryManager {
             registered: r.registered_eps,
             failed: r.failed_eps,
         })
+    }
+
+    /// Load a cached routed model during startup so execution-provider graph setup is
+    /// paid before the first request. Startup never downloads a missing model.
+    pub async fn warm_cached_model(&self, spec: &ModelSpec) -> AppResult<bool> {
+        let model = self.resolve_variant(&spec.alias, &spec.device_pref).await?;
+        if !model.is_cached().await.map_err(map_err)? {
+            tracing::info!(
+                model = model.id(),
+                "startup: SQL model is not cached; skipping preload"
+            );
+            return Ok(false);
+        }
+        self.ensure_loaded_lru(&model).await?;
+        tracing::info!(model = model.id(), "startup: SQL model loaded");
+        Ok(true)
     }
 
     /// Fire-and-forget EP registration at startup so accelerators come online without a
@@ -787,10 +803,12 @@ impl FoundryManager {
             None
         };
         let tools_ref: Option<&[ChatCompletionTools]> = tools.as_deref();
-        client
+        let busy = BusyGuard::new(model.id().to_string());
+        let inner = client
             .complete_streaming_chat(&msgs, tools_ref)
             .await
-            .map_err(map_err)
+            .map_err(map_err)?;
+        Ok(GuardedChatStream { inner, _busy: busy })
     }
 
     /// Non-streaming completion against a fully-resolved `ModelSpec`. Drains
@@ -818,11 +836,7 @@ impl FoundryManager {
     /// Open a streaming chat completion against the current model with a system + user
     /// message pair. Backward-compatible wrapper over `generate_stream_with` using a
     /// default GPU spec — callers in `rag/routes.rs` are unchanged.
-    pub async fn generate_stream(
-        &self,
-        system: &str,
-        user: &str,
-    ) -> AppResult<ChatCompletionStream> {
+    pub async fn generate_stream(&self, system: &str, user: &str) -> AppResult<GuardedChatStream> {
         let spec = ModelSpec {
             alias: self.current_model(),
             thinking: false,
@@ -1005,51 +1019,6 @@ pub fn run_list_schema() -> serde_json::Value {
                 "type": "integer",
                 "minimum": 0,
                 "description": "Rows to skip for pagination (default 0)"
-            }
-        }
-    })
-}
-
-/// Build the `emit_sql` tool descriptor for the NL-to-SQL generation step.
-///
-/// Forces phi-4-mini to return a typed SQL + metadata object rather than free text,
-/// so the pipeline can extract the SELECT statement without string parsing.
-pub fn emit_sql_tool() -> ChatCompletionTools {
-    ChatCompletionTools::Function(ChatCompletionTool {
-        function: FunctionObject {
-            name: "emit_sql".to_string(),
-            description: Some(
-                "Emit a single read-only SELECT statement that answers the user's question \
-                 using the provided schema. Include the referenced table names and a brief \
-                 explanation of what the query does."
-                    .to_string(),
-            ),
-            parameters: Some(emit_sql_schema()),
-            strict: Some(true),
-        },
-    })
-}
-
-/// JSON Schema for `EmitSqlOutput` — used as the tool parameter schema and as the
-/// `response_format: JsonSchema(…)` constraint in `plan_sql`.
-pub fn emit_sql_schema() -> serde_json::Value {
-    serde_json::json!({
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-        "required": ["sql"],
-        "properties": {
-            "sql": {
-                "type": "string",
-                "description": "A single read-only SELECT statement answering the question."
-            },
-            "tables": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Table names referenced by the SQL."
-            },
-            "explanation": {
-                "type": "string",
-                "description": "One sentence describing what the query does."
             }
         }
     })
@@ -1271,24 +1240,19 @@ impl FoundryManager {
         .await
     }
 
-    /// Generate SQL for a natural-language question: ask the model to call `emit_sql`
-    /// with a SELECT statement for the given dialect and schema cards. The caller MUST
-    /// run `nl2sql::validate::validate_sql` on the returned spec before execution.
+    /// Generate one SQL statement without constrained decoding. Some local ONNX
+    /// variants cannot compile the `emit_sql` grammar, so the caller MUST enforce
+    /// safety with `nl2sql::validate::validate_sql` before execution.
     pub async fn plan_sql(
         &self,
         spec: &ModelSpec,
         system: &str,
         user: &str,
     ) -> AppResult<EmitSqlOutput> {
-        self.plan_tool::<EmitSqlOutput>(
-            spec,
-            system,
-            user,
-            "emit_sql",
-            emit_sql_tool(),
-            emit_sql_schema(),
-        )
-        .await
+        let raw = self.complete_with(spec, system, user).await?;
+        Ok(EmitSqlOutput {
+            sql: extract_sql_statement(&raw)?,
+        })
     }
 
     /// Plan a list-records query: ask the model to emit a `RunList` tool call,
@@ -1394,46 +1358,51 @@ impl FoundryManager {
         let schema_str = schema.to_string();
         let msgs = build_messages(system, user, spec.thinking);
 
-        // Forced tool call + a JSON-schema response format describing the *arguments*
-        // are two grammars over the same output, and on some backends they are
-        // intersected rather than layered. ORT-GenAI then has to satisfy the tool-call
-        // envelope (`{name, arguments}`) and the bare argument object at once, which is
-        // impossible, and fails the whole request with:
-        //
-        //   Error creating grammar: Unsatisfiable schema: required item is unsatisfiable
-        //
-        // Observed on the NPU phi-4-mini classify call while the GPU qwen path (which
-        // tolerates the pair) kept working. The schema is the more expendable of the
-        // two — `try_parse_tool` already accepts a plain JSON content response — so on
-        // a grammar failure we retry immediately with `tool_choice` alone.
-        let with_schema = model
+        // A forced tool and a bare response schema describe incompatible envelopes on
+        // ORT-GenAI, so never combine them. Some models also reject permissive tool
+        // properties such as aggregation filters; in that case validation lets us
+        // safely fall back to unconstrained JSON content.
+        let tool_client = model
             .create_chat_client()
             .temperature(spec.temperature as f64)
-            .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
-            .response_format(ChatResponseFormat::JsonSchema(schema_str.clone()));
-
-        let resp = client
+            .tool_choice(ChatToolChoice::Function(tool_name.to_string()));
+        let resp = match tool_client
             .complete_chat(&msgs, Some(&[tool.clone()]))
             .await
-            .map_err(map_err)?;
+        {
+            Ok(response) => response,
+            Err(error) if is_grammar_error(&error) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %error,
+                    "backend rejected tool grammar; retrying as validated JSON content"
+                );
+                let fallback = format!(
+                    "{user}\n\nReturn ONLY the JSON object for `{tool_name}`. No markdown or explanation.\nJSON schema: {schema_str}"
+                );
+                let fallback_msgs = build_messages(system, &fallback, spec.thinking);
+                model
+                    .create_chat_client()
+                    .temperature(0.0)
+                    .complete_chat(&fallback_msgs, None)
+                    .await
+                    .map_err(map_err)?
+            }
+            Err(error) => return Err(map_err(error)),
+        };
 
         match try_parse_tool::<T>(&resp) {
             Ok(result) => return Ok(result),
             Err(parse_err) => {
                 tracing::warn!(tool = tool_name, error = %parse_err, "plan_tool: first parse failed; reprompting");
                 let reprompt = format!(
-                    "{user}\n\n[IMPORTANT: Your previous response could not be parsed. \
-                     Return ONLY valid JSON matching the {tool_name} schema. \
-                     Do not include any explanation or markdown — just the raw JSON object.]"
+                    "{user}\n\nYour previous response could not be parsed. Return ONLY a valid JSON object for `{tool_name}`. No markdown or explanation.\nJSON schema: {schema_str}"
                 );
                 let msgs2 = build_messages(system, &reprompt, spec.thinking);
-                let client2 = model
+                let resp2 = model
                     .create_chat_client()
                     .temperature(0.0)
-                    .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
-                    .response_format(ChatResponseFormat::JsonSchema(schema_str));
-                let resp2 = client2
-                    .complete_chat(&msgs2, Some(&[tool]))
+                    .complete_chat(&msgs2, None)
                     .await
                     .map_err(map_err)?;
                 try_parse_tool::<T>(&resp2).map_err(|e| {
@@ -1488,6 +1457,58 @@ fn try_parse_tool<T: serde::de::DeserializeOwned>(
 
     serde_json::from_str::<T>(json_str)
         .map_err(|e| format!("content parse failed: {e}; raw={json_str}"))
+}
+
+fn extract_sql_statement(raw: &str) -> AppResult<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(
+            "SQL planner returned an empty response".into(),
+        ));
+    }
+
+    let sql = if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        let opening = lines.next().unwrap_or_default();
+        let language = opening.trim_start_matches("```").trim();
+        if !language.is_empty() && !language.eq_ignore_ascii_case("sql") {
+            return Err(AppError::BadRequest(
+                "SQL planner returned an unsupported code block".into(),
+            ));
+        }
+
+        let mut body = Vec::new();
+        let mut closed = false;
+        for line in lines {
+            if line.trim() == "```" {
+                closed = true;
+                continue;
+            }
+            if closed && !line.trim().is_empty() {
+                return Err(AppError::BadRequest(
+                    "SQL planner returned text outside the SQL block".into(),
+                ));
+            }
+            if !closed {
+                body.push(line);
+            }
+        }
+        if !closed {
+            return Err(AppError::BadRequest(
+                "SQL planner returned an unterminated SQL block".into(),
+            ));
+        }
+        body.join("\n").trim().to_string()
+    } else {
+        trimmed.to_string()
+    };
+
+    if sql.is_empty() {
+        return Err(AppError::BadRequest(
+            "SQL planner returned an empty statement".into(),
+        ));
+    }
+    Ok(sql)
 }
 
 /// Build the system + user messages for a chat completion, applying the Qwen3 soft
@@ -1575,4 +1596,26 @@ async fn heal_and_load(
         "recovered: model re-downloaded and loaded"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod sql_response_tests {
+    use super::extract_sql_statement;
+
+    #[test]
+    fn accepts_plain_sql() {
+        let sql = extract_sql_statement(" SELECT COUNT(*) FROM patients; ").unwrap();
+        assert_eq!(sql, "SELECT COUNT(*) FROM patients;");
+    }
+
+    #[test]
+    fn accepts_fenced_sql() {
+        let sql = extract_sql_statement("```sql\nSELECT id FROM patients\nLIMIT 5;\n```").unwrap();
+        assert_eq!(sql, "SELECT id FROM patients\nLIMIT 5;");
+    }
+
+    #[test]
+    fn rejects_commentary_outside_fence() {
+        assert!(extract_sql_statement("```sql\nSELECT 1;\n```\nDone").is_err());
+    }
 }

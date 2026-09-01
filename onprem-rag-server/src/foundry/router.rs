@@ -182,16 +182,15 @@ impl ModelSpec {
                 device_pref: vec![Device::Npu, Device::Cpu],
                 max_tokens: None,
             },
-            // SQL generation is a short structured output (one SELECT statement).
-            // phi-4-mini on the NPU keeps the iGPU free; 512 tokens is enough for
-            // any reasonable single-query response.
+            // SQL is emitted directly rather than through constrained tool grammar,
+            // which is unsupported by some local ONNX model variants.
             AgentKind::TextToSql => ModelSpec {
                 alias: r.sql_model.clone(),
                 thinking: false,
-                temperature: 0.1,
-                tools: true,
+                temperature: 0.0,
+                tools: false,
                 device_pref: vec![Device::Npu, Device::Cpu],
-                max_tokens: Some(512),
+                max_tokens: Some(256),
             },
         }
     }

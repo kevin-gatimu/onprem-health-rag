@@ -12,7 +12,8 @@ use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
 use super::{
-    ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err, make_row_filtered,
+    ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
+    make_row_filtered,
 };
 use crate::error::AppResult;
 
@@ -173,8 +174,18 @@ impl SourceConnector for MssqlConnector {
             if let (Ok(Some(t)), Ok(Some(c))) =
                 (row.try_get::<&str, _>(0), row.try_get::<&str, _>(1))
             {
-                let ref_t = row.try_get::<&str, _>(2).ok().flatten().unwrap_or("").to_string();
-                let ref_c = row.try_get::<&str, _>(3).ok().flatten().unwrap_or("").to_string();
+                let ref_t = row
+                    .try_get::<&str, _>(2)
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_string();
+                let ref_c = row
+                    .try_get::<&str, _>(3)
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+                    .to_string();
                 fk_set.insert((t.to_string(), c.to_string()));
                 if !ref_t.is_empty() {
                     fk_edges_map.entry(t.to_string()).or_default().push(FkEdge {
@@ -223,10 +234,12 @@ impl SourceConnector for MssqlConnector {
             .map(|name| {
                 let row_count = row_estimates.get(&name).copied().unwrap_or(0);
                 let columns = table_columns.remove(&name).unwrap_or_default();
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
                 TableSchema {
                     name,
                     row_count,
                     columns,
+                    fk_edges,
                 }
             })
             .collect();
@@ -300,8 +313,8 @@ impl SourceConnector for MssqlConnector {
         max_rows: i64,
         timeout_secs: u64,
     ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
-        use tokio::time::{Duration, timeout};
         use crate::error::AppError;
+        use tokio::time::{Duration, timeout};
 
         // tiberius has no per-query timeout; wrap query+fetch in a Tokio timeout.
         // The sql already carries TOP {max_rows} injected by validate_sql, but that
@@ -322,16 +335,19 @@ impl SourceConnector for MssqlConnector {
                 .map_err(|e| conn_err("SQL Server run_select result failed", e))
         })
         .await
-        .map_err(|_| AppError::BadRequest(format!(
-            "SQL Server query timed out after {timeout_secs}s"
-        )))??;
+        .map_err(|_| {
+            AppError::BadRequest(format!("SQL Server query timed out after {timeout_secs}s"))
+        })??;
 
         if rows.is_empty() {
             return Ok((vec![], vec![]));
         }
 
-        let columns: Vec<String> =
-            rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+        let columns: Vec<String> = rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
         let mut result_rows = Vec::with_capacity(rows.len());
         for row in &rows {
             let values: Vec<serde_json::Value> =

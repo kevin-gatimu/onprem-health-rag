@@ -17,13 +17,17 @@ mod error;
 mod foundry;
 mod ingest;
 mod logstream;
+mod memory;
+mod nl2sql;
 mod rag;
 mod retrieval;
 mod router;
 mod routes;
 mod settings;
 mod state;
+mod system;
 mod telemetry;
+mod verify;
 
 use config::Config;
 use documentdb::DocumentDb;
@@ -97,6 +101,10 @@ async fn rocket() -> _ {
             if let Err(e) = documentdb::ensure_records_indexes(&db).await {
                 tracing::warn!(error = %e, "records index creation failed (non-fatal)");
             }
+            if let Err(e) = nl2sql::catalog::ensure_nl2sql_indexes(&db, config.embedding_dims).await
+            {
+                tracing::warn!(error = %e, "schema metadata index creation failed (non-fatal)");
+            }
             if let Err(e) = documentdb::ensure_ingest_generations(&db).await {
                 tracing::warn!(error = %e, "ingestion generation backfill failed (non-fatal)");
             }
@@ -128,49 +136,71 @@ async fn rocket() -> _ {
         }
     };
 
-    // Register execution providers into the in-process core in the background.
-    if let Some(f) = &foundry {
-        f.spawn_startup_registration();
-    }
-
     let app_state = AppState::new(
         config.clone(),
-        db,
+        db.clone(),
         foundry,
         router_overrides,
         initial_catalog,
     );
 
-    // Warm start: prime the fastembed embedder and reranker in the background so
-    // the first real request does not pay the ONNX model-load latency (~1–3 s).
+    // Warm models in the background. Foundry EP registration must finish before
+    // loading the SQL model or the first request can pay the NPU graph setup cost.
     if config.warmup_enabled {
         let wc = config.clone();
         let warmup_state = app_state.warmup_handle();
+        let foundry = app_state.foundry_handle();
+        let sql_spec = app_state.spec_for(crate::foundry::router::AgentKind::TextToSql);
+        let warm_sql = config.router.text2sql_enabled;
         tokio::spawn(async move {
-            let embed_ok = crate::embed::embed_query(&wc, "warmup")
+            let local_models = async {
+                let embed_ok = crate::embed::embed_query(&wc, "warmup")
+                    .await
+                    .inspect(|_| tracing::info!("warmup: embedder ready"))
+                    .inspect_err(|e| tracing::warn!(error = %e, "warmup: embedder init failed"))
+                    .is_ok();
+                let rerank_ok = crate::retrieval::rerank::rerank(
+                    &wc,
+                    "warmup".to_string(),
+                    vec!["warmup".to_string()],
+                )
                 .await
-                .inspect(|_| tracing::info!("warmup: embedder ready"))
-                .inspect_err(|e| tracing::warn!(error = %e, "warmup: embedder init failed"))
+                .inspect(|_| tracing::info!("warmup: reranker ready"))
+                .inspect_err(|e| tracing::warn!(error = %e, "warmup: reranker init failed"))
                 .is_ok();
-            let rerank_ok = crate::retrieval::rerank::rerank(
-                &wc,
-                "warmup".to_string(),
-                vec!["warmup".to_string()],
-            )
-            .await
-            .inspect(|_| tracing::info!("warmup: reranker ready"))
-            .inspect_err(|e| tracing::warn!(error = %e, "warmup: reranker init failed"))
-            .is_ok();
+                embed_ok && rerank_ok
+            };
+            let sql_model = async {
+                let Some(foundry) = foundry else {
+                    return true;
+                };
+                if let Err(error) = foundry.register_eps().await {
+                    tracing::warn!(%error, "startup: execution-provider registration failed");
+                    return false;
+                }
+                if !warm_sql {
+                    return true;
+                }
+                foundry
+                    .warm_cached_model(&sql_spec)
+                    .await
+                    .inspect_err(|error| tracing::warn!(%error, "warmup: SQL model preload failed"))
+                    .is_ok()
+            };
+            let (local_ok, sql_ok) = tokio::join!(local_models, sql_model);
             warmup_state.store(
-                if embed_ok && rerank_ok { 1 } else { 3 },
+                if local_ok && sql_ok { 1 } else { 3 },
                 std::sync::atomic::Ordering::Relaxed,
             );
         });
+    } else if let Some(foundry) = app_state.foundry_handle() {
+        foundry.spawn_startup_registration();
     }
 
     // Conversation retention sweep (plan 22.7): boot-time + daily, no-op when
     // ONPREM_CONVERSATION_RETENTION_DAYS=0 (default: keep forever).
     memory::spawn_retention_sweep(db.clone(), config.clone());
+    nl2sql::catalog::spawn_schema_poller(db.clone(), config.clone());
 
     // Bind address/port come from our config rather than Rocket.toml.
     let figment = rocket::Config::figment()
@@ -256,7 +286,17 @@ async fn rocket() -> _ {
         )
         .mount(
             "/",
-            rocket::routes![rag::routes::route, rag::routes::search, rag::routes::chat,],
+            rocket::routes![
+                rag::routes::route,
+                rag::routes::search,
+                rag::routes::chat,
+                nl2sql::routes::nl_query,
+                nl2sql::routes::catalog_status,
+                nl2sql::routes::catalog_refresh,
+                nl2sql::routes::catalog_history,
+                nl2sql::routes::catalog_overrides,
+                nl2sql::routes::save_catalog_overrides,
+            ],
         )
         .mount(
             "/",

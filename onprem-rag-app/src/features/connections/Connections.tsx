@@ -11,6 +11,7 @@ import { Button, EmptyState } from '../../components/ui';
 import { PageContainer } from '../../components/layout/PageContainer';
 import ConnectionCard from './ConnectionCard';
 import ConnectionFormModal from './ConnectionFormModal';
+import SchemaMetadataModal from './SchemaMetadataModal';
 
 export default function Connections() {
   const queryClient = useQueryClient();
@@ -22,6 +23,7 @@ export default function Connections() {
   // Modal state: open flag + the source being edited (null = new connection).
   const [modalOpen, setModalOpen]       = useState(false);
   const [editingSource, setEditingSource] = useState<SourceInfo | null>(null);
+  const [metadataSource, setMetadataSource] = useState<SourceInfo | null>(null);
 
   const { data: sources, isLoading } = useQuery({
     queryKey: ['sources'],
@@ -139,6 +141,7 @@ export default function Connections() {
               onTest={() => testMutation.mutate(source.id)}
               onEdit={() => openEdit(source)}
               onDelete={() => handleDelete(source)}
+              onManageMetadata={() => setMetadataSource(source)}
             />
           ))}
         </div>
@@ -150,6 +153,10 @@ export default function Connections() {
         onClose={() => setModalOpen(false)}
         editing={editingSource}
         onSaved={handleSaved}
+      />
+      <SchemaMetadataModal
+        source={metadataSource}
+        onClose={() => setMetadataSource(null)}
       />
 
     </div>

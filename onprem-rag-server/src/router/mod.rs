@@ -70,7 +70,10 @@ pub enum RouteClass {
     /// backend preference will be reintroduced when plan 18 Phase D (text-to-SQL
     /// backend selection) actually lands — no point carrying that distinction
     /// before anything produces or reads a second value for it.
-    Structured { intent: QueryIntent },
+    Structured {
+        intent: QueryIntent,
+        backend: StructuredBackend,
+    },
     /// Explain / summarise / describe — hybrid retrieval + grounded generation.
     Semantic,
     /// Structured filter + semantic synthesis ("summarise notes of patients with
@@ -83,9 +86,7 @@ pub enum RouteClass {
 pub enum StructuredBackend {
     /// DocumentDB aggregation over ingested records — always available.
     DocDb,
-    /// Text-to-SQL against a live registered source. Phase D (plan 18); never
-    /// produced until the catalog probe and feature flag land.
-    #[allow(dead_code)]
+    /// Text-to-SQL against the most relevant registered live source.
     SourceSql,
 }
 
@@ -132,9 +133,21 @@ impl RouteDecision {
             .intent()
             .and_then(|i| serde_json::to_value(i).ok())
             .unwrap_or(serde_json::Value::Null);
+        let backend = match &self.class {
+            RouteClass::Structured {
+                backend: StructuredBackend::SourceSql,
+                ..
+            } => Some("source_sql"),
+            RouteClass::Structured {
+                backend: StructuredBackend::DocDb,
+                ..
+            } => Some("document_db"),
+            _ => None,
+        };
         serde_json::json!({
             "route": self.route_label(),
             "intent": intent,
+            "backend": backend,
             "tier": self.tier,
             "cached": self.cached,
         })
@@ -163,6 +176,8 @@ pub struct RouteToolOutput {
     pub route: String,
     #[serde(default)]
     pub intent: Option<String>,
+    #[serde(default)]
+    pub entities: Option<RouteEntities>,
 }
 
 // ---------------------------------------------------------------------------
@@ -283,7 +298,12 @@ pub async fn route(
     if has_history && conversational::is_conversation_meta(question) {
         cache.metrics.tier0.fetch_add(1, Ordering::Relaxed);
         return finish(
-            RouteDecision { class: RouteClass::ConversationMeta, tier: 0, cached: false },
+            RouteDecision {
+                class: RouteClass::ConversationMeta,
+                tier: 0,
+                cached: false,
+                entities: None,
+            },
             question,
             has_history,
         );
@@ -325,7 +345,7 @@ pub async fn route(
             cache.metrics.tier1.fetch_add(1, Ordering::Relaxed);
             finish(
                 RouteDecision {
-                    class: class_from_intent(intent),
+                    class: class_from_intent(intent, config),
                     tier: 1,
                     cached: false,
                     entities: None,
@@ -382,7 +402,7 @@ async fn tier2(
         }
     };
 
-    let class = class_from_model(&out)?;
+    let class = class_from_model(&out, config)?;
     let decision = RouteDecision {
         class,
         tier: 2,
@@ -396,12 +416,16 @@ async fn tier2(
 
 /// Map a lexical [`QueryIntent`] to a route class. Only Aggregation/Trend/
 /// Enumeration have a structured executor today; everything else is semantic.
-fn class_from_intent(intent: QueryIntent) -> RouteClass {
+fn class_from_intent(intent: QueryIntent, config: &Config) -> RouteClass {
     match intent {
         QueryIntent::Aggregation | QueryIntent::Trend | QueryIntent::Enumeration => {
             RouteClass::Structured {
                 intent,
-                backend: StructuredBackend::DocDb,
+                backend: if config.router.text2sql_enabled {
+                    StructuredBackend::SourceSql
+                } else {
+                    StructuredBackend::DocDb
+                },
             }
         }
         QueryIntent::Lookup | QueryIntent::Narrative | QueryIntent::MultiHop => {
@@ -412,15 +436,18 @@ fn class_from_intent(intent: QueryIntent) -> RouteClass {
 
 /// Map the Tier-2 model output to a route class. Lenient: an unrecognised
 /// `route` label yields `None` so the caller falls open to semantic.
-fn class_from_model(out: &RouteToolOutput) -> Option<RouteClass> {
+fn class_from_model(out: &RouteToolOutput, config: &Config) -> Option<RouteClass> {
     let intent = out.intent.as_deref().and_then(parse_intent);
     match out.route.trim().to_ascii_lowercase().as_str() {
         "conversational" => Some(RouteClass::Conversational),
         "semantic" => Some(RouteClass::Semantic),
         "structured" => Some(RouteClass::Structured {
-            // Default an unspecified structured intent to Aggregation — the most
-            // common analytical shape; validate/execute will still guard it.
             intent: intent.unwrap_or(QueryIntent::Aggregation),
+            backend: if config.router.text2sql_enabled {
+                StructuredBackend::SourceSql
+            } else {
+                StructuredBackend::DocDb
+            },
         }),
         "hybrid" => Some(RouteClass::Hybrid {
             cohort_intent: intent.unwrap_or(QueryIntent::Aggregation),
@@ -448,7 +475,7 @@ fn parse_intent(s: &str) -> Option<QueryIntent> {
 /// via the shared `intent_to_kind`.
 pub fn class_to_agent_kind(class: &RouteClass) -> AgentKind {
     match class {
-        RouteClass::Structured { intent } => crate::answer::intent_to_kind(*intent),
+        RouteClass::Structured { intent, .. } => crate::answer::intent_to_kind(*intent),
         RouteClass::Conversational
         | RouteClass::ConversationMeta
         | RouteClass::Semantic
@@ -522,60 +549,100 @@ mod tests {
         // tier2() is what flips `cached` on the returned copy; verify the field is settable.
     }
 
+    #[tokio::test]
+    async fn common_count_and_list_questions_route_to_live_sql() {
+        let mut config = Config::from_env();
+        config.router.text2sql_enabled = true;
+        let cache = RouterCache::new(8);
+        for question in ["how many patients do we have?", "list 5 patients"] {
+            let decision = route(question, false, &config, None, &cache).await;
+            assert!(
+                matches!(
+                    decision.class,
+                    RouteClass::Structured {
+                        backend: StructuredBackend::SourceSql,
+                        ..
+                    }
+                ),
+                "unexpected route for {question}: {:?}",
+                decision.class
+            );
+        }
+    }
+
     #[test]
-    fn structural_intents_map_to_structured_docdb() {
+    fn structural_intents_use_configured_backend() {
+        let mut config = Config::from_env();
+        config.router.text2sql_enabled = false;
         for intent in [
             QueryIntent::Aggregation,
             QueryIntent::Trend,
             QueryIntent::Enumeration,
         ] {
-            match class_from_intent(intent) {
-                RouteClass::Structured { intent: got } => assert_eq!(got, intent),
-                other => panic!("expected structured, got {other:?}"),
-            }
+            assert_eq!(
+                class_from_intent(intent, &config),
+                RouteClass::Structured {
+                    intent,
+                    backend: StructuredBackend::DocDb,
+                }
+            );
         }
+        config.router.text2sql_enabled = true;
         assert_eq!(
-            class_from_intent(QueryIntent::Narrative),
+            class_from_intent(QueryIntent::Aggregation, &config),
+            RouteClass::Structured {
+                intent: QueryIntent::Aggregation,
+                backend: StructuredBackend::SourceSql,
+            }
+        );
+        assert_eq!(
+            class_from_intent(QueryIntent::Narrative, &config),
             RouteClass::Semantic
         );
-        assert_eq!(class_from_intent(QueryIntent::Lookup), RouteClass::Semantic);
+        assert_eq!(
+            class_from_intent(QueryIntent::Lookup, &config),
+            RouteClass::Semantic
+        );
     }
 
     #[test]
     fn model_output_maps_leniently() {
+        let mut config = Config::from_env();
+        config.router.text2sql_enabled = false;
         let mk = |route: &str, intent: Option<&str>| RouteToolOutput {
             route: route.to_string(),
             intent: intent.map(str::to_string),
+            entities: None,
         };
         assert_eq!(
-            class_from_model(&mk("conversational", None)),
+            class_from_model(&mk("conversational", None), &config),
             Some(RouteClass::Conversational)
         );
         assert_eq!(
-            class_from_model(&mk("SEMANTIC", None)),
+            class_from_model(&mk("SEMANTIC", None), &config),
             Some(RouteClass::Semantic)
         );
         assert_eq!(
-            class_from_model(&mk("structured", Some("trend"))),
+            class_from_model(&mk("structured", Some("trend")), &config),
             Some(RouteClass::Structured {
                 intent: QueryIntent::Trend,
                 backend: StructuredBackend::DocDb
             })
         );
         assert_eq!(
-            class_from_model(&mk("structured", None)),
+            class_from_model(&mk("structured", None), &config),
             Some(RouteClass::Structured {
                 intent: QueryIntent::Aggregation,
                 backend: StructuredBackend::DocDb
             })
         );
         assert_eq!(
-            class_from_model(&mk("hybrid", Some("enumeration"))),
+            class_from_model(&mk("hybrid", Some("enumeration")), &config),
             Some(RouteClass::Hybrid {
                 cohort_intent: QueryIntent::Enumeration
             })
         );
-        assert_eq!(class_from_model(&mk("gibberish", None)), None);
+        assert_eq!(class_from_model(&mk("gibberish", None), &config), None);
     }
 
     #[tokio::test]
@@ -601,6 +668,7 @@ mod tests {
             },
             tier: 2,
             cached: true,
+            entities: None,
         };
         let v: serde_json::Value = serde_json::from_str(&d.to_sse_json()).unwrap();
         assert_eq!(v["route"], "structured");

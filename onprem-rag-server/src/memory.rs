@@ -30,7 +30,10 @@ const MAX_COMPACTION_BATCH: i64 = 200;
 /// they imply (everything since `summary_upto`, or the whole conversation when
 /// there's no summary yet). Shared by `load_working_memory` and
 /// `compact_if_needed` — both need the same two reads.
-fn summary_state(conv: &Document, conversation_id: &str) -> (Option<String>, Option<ObjectId>, Document) {
+fn summary_state(
+    conv: &Document,
+    conversation_id: &str,
+) -> (Option<String>, Option<ObjectId>, Document) {
     let summary = conv.get_str("summary").ok().map(str::to_string);
     let summary_upto = conv.get_object_id("summary_upto").ok();
     let mut filter = doc! { "conversation_id": conversation_id };
@@ -52,7 +55,10 @@ impl WorkingMemory {
     /// Build a memory with no summary — the stateless (`conversation_id`-less)
     /// path, where the caller supplies its own history directly.
     pub fn from_turns(tail: Vec<ChatTurn>) -> Self {
-        WorkingMemory { summary: None, tail }
+        WorkingMemory {
+            summary: None,
+            tail,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -78,7 +84,11 @@ impl WorkingMemory {
 /// the caller (`routes::conversations::verify_owned`). Best-effort: any DB error
 /// yields an empty `WorkingMemory` — the turn still proceeds, just without
 /// continuity, matching the old `load_history`'s fail-open behaviour.
-pub async fn load_working_memory(db: &DocumentDb, conversation_id: &str, config: &Config) -> WorkingMemory {
+pub async fn load_working_memory(
+    db: &DocumentDb,
+    conversation_id: &str,
+    config: &Config,
+) -> WorkingMemory {
     let Ok(oid) = parse_oid(conversation_id) else {
         return WorkingMemory::default();
     };
@@ -105,7 +115,8 @@ pub async fn load_working_memory(db: &DocumentDb, conversation_id: &str, config:
     let mut tail: Vec<ChatTurn> = Vec::new();
     let mut words_used = 0usize;
     for d in &docs {
-        let (Some(role), Some(content)) = (d.get_str("role").ok(), d.get_str("content").ok()) else {
+        let (Some(role), Some(content)) = (d.get_str("role").ok(), d.get_str("content").ok())
+        else {
             continue;
         };
         let (content, words) = if role == "assistant" {
@@ -117,7 +128,10 @@ pub async fn load_working_memory(db: &DocumentDb, conversation_id: &str, config:
             break;
         }
         words_used += words;
-        tail.push(ChatTurn { role: role.to_string(), content });
+        tail.push(ChatTurn {
+            role: role.to_string(),
+            content,
+        });
     }
     tail.reverse();
 
@@ -132,7 +146,10 @@ fn clip_words(text: &str, max_words: usize) -> (String, usize) {
     if words.len() <= max_words {
         (text.to_string(), words.len())
     } else {
-        (format!("{}\u{2026}", words[..max_words].join(" ")), max_words)
+        (
+            format!("{}\u{2026}", words[..max_words].join(" ")),
+            max_words,
+        )
     }
 }
 
@@ -166,7 +183,11 @@ async fn compact_if_needed(
     conversation_id: &str,
 ) -> AppResult<()> {
     let oid = parse_oid(conversation_id)?;
-    let conv = db.chat_conversations().find_one(doc! { "_id": oid }).await?.ok_or(AppError::NotFound)?;
+    let conv = db
+        .chat_conversations()
+        .find_one(doc! { "_id": oid })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let (prior_summary, summary_upto, filter) = summary_state(&conv, conversation_id);
 
     let overflow: Vec<Document> = db
@@ -179,8 +200,11 @@ async fn compact_if_needed(
         .try_collect()
         .await?;
 
-    let total_words: usize =
-        overflow.iter().filter_map(|d| d.get_str("content").ok()).map(|c| c.split_whitespace().count()).sum();
+    let total_words: usize = overflow
+        .iter()
+        .filter_map(|d| d.get_str("content").ok())
+        .map(|c| c.split_whitespace().count())
+        .sum();
     let over_turns = overflow.len() as i64 > config.compact_after_turns;
     let over_words = total_words > 2400;
     let keep_tail = config.history_tail_max_turns.max(0) as usize;
@@ -229,7 +253,10 @@ async fn compact_if_needed(
         None => doc! { "_id": oid, "summary_upto": { "$exists": false } },
     };
     db.chat_conversations()
-        .update_one(cas_filter, doc! { "$set": { "summary": new_summary, "summary_upto": new_summary_upto } })
+        .update_one(
+            cas_filter,
+            doc! { "$set": { "summary": new_summary, "summary_upto": new_summary_upto } },
+        )
         .await?;
     Ok(())
 }
@@ -270,14 +297,24 @@ async fn run_retention_sweep(db: &DocumentDb, config: &Config) {
     if stale.is_empty() {
         return;
     }
-    let ids: Vec<String> = stale.iter().filter_map(|d| d.get_object_id("_id").ok().map(|o| o.to_hex())).collect();
+    let ids: Vec<String> = stale
+        .iter()
+        .filter_map(|d| d.get_object_id("_id").ok().map(|o| o.to_hex()))
+        .collect();
 
-    if let Err(e) = db.chat_messages().delete_many(doc! { "conversation_id": { "$in": &ids } }).await {
+    if let Err(e) = db
+        .chat_messages()
+        .delete_many(doc! { "conversation_id": { "$in": &ids } })
+        .await
+    {
         tracing::warn!(error = %e, "retention sweep: message delete failed");
         return;
     }
     match db.chat_conversations().delete_many(filter).await {
-        Ok(r) => tracing::info!(deleted = r.deleted_count, "retention sweep: removed stale conversations"),
+        Ok(r) => tracing::info!(
+            deleted = r.deleted_count,
+            "retention sweep: removed stale conversations"
+        ),
         Err(e) => tracing::warn!(error = %e, "retention sweep: conversation delete failed"),
     }
 }

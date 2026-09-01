@@ -192,6 +192,7 @@ pub async fn start_ingest(
     let db = state.db.clone();
     let config = state.config.clone();
     let progress_hub = state.ingest_progress.clone();
+    let foundry = state.foundry_handle();
     let source_id = req.source_id.clone();
     let job = job_id.clone();
     let tables = req.tables.clone();
@@ -208,6 +209,7 @@ pub async fn start_ingest(
             excluded,
             limit,
             None,
+            foundry,
         )
         .await
     });
@@ -308,6 +310,7 @@ pub async fn resume_ingest(
     let db = state.db.clone();
     let config = state.config.clone();
     let progress_hub = state.ingest_progress.clone();
+    let foundry = state.foundry_handle();
     let job_id = job.to_string();
     let response_job_id = job_id.clone();
     tokio::spawn(async move {
@@ -322,6 +325,7 @@ pub async fn resume_ingest(
             excluded,
             limit,
             Some(checkpoint),
+            foundry,
         )
         .await
     });

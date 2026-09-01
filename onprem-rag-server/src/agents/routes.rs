@@ -33,8 +33,11 @@ use crate::aggregation::validate;
 use crate::answer::{NARRATION_SYSTEM_PROMPT, build_agg_planner_system, build_narration_user};
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::foundry::router::AgentKind;
-use crate::rag::{SYSTEM_PROMPT, apply_context_budget, build_prompt, prepare_queries};
+use crate::foundry::{GuardedChatStream, router::AgentKind};
+use crate::memory::WorkingMemory;
+use crate::rag::{
+    SYSTEM_PROMPT, apply_context_budget, build_prompt, prepare_queries, rewrite_query,
+};
 use crate::retrieval;
 use crate::state::AppState;
 use crate::telemetry::{RequestTrace, Stage};
@@ -145,6 +148,7 @@ pub async fn agent(
             }
         })
         .await?;
+    let memory = WorkingMemory::from_turns(history.clone());
 
     let kind_str: String = serde_json::to_value(resolved_kind)
         .ok()
@@ -236,10 +240,11 @@ pub async fn agent(
             let rerank = state.config.rerank_enabled;
             let top_k = state.config.context_top_k;
 
+            let rewrite_turns = memory.rewrite_turns();
             let (standalone, queries) = trace
                 .time(
                     Stage::RewriteExpand,
-                    prepare_queries(foundry, &state.config, &history, &req.question),
+                    prepare_queries(foundry, &state.config, &rewrite_turns, &req.question),
                 )
                 .await;
             let _retrieval_permit = state.admission.retrieval().await?;
@@ -276,8 +281,9 @@ pub async fn agent(
             let gen_stream = if refuse {
                 None
             } else {
-                let prompt =
-                    trace.time_sync(Stage::Prompt, || build_prompt(&passages, &standalone));
+                let prompt = trace.time_sync(Stage::Prompt, || {
+                    build_prompt(&passages, &memory, &standalone)
+                });
                 Some(
                     trace
                         .time(

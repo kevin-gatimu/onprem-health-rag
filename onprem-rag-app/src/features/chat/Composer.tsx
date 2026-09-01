@@ -1,17 +1,16 @@
 // Chat composer — stays interactive while responses stream. Enter sends or queues;
 // Ctrl/Cmd+Enter bypasses the queue for the active conversation.
 import { useRef, useCallback } from 'react';
-import { ListPlus, Send, SlidersHorizontal, Zap } from 'lucide-react';
+import { ListPlus, Send, Zap } from 'lucide-react';
 
 interface ComposerProps {
   text: string;
   onTextChange: (text: string) => void;
   onSend: (text: string, sendImmediately: boolean) => void;
   busy: boolean;
-  onOpenSettings: () => void;
 }
 
-export default function Composer({ text, onTextChange, onSend, busy, onOpenSettings }: ComposerProps) {
+export default function Composer({ text, onTextChange, onSend, busy }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const send = useCallback((sendImmediately = false) => {
@@ -52,14 +51,6 @@ export default function Composer({ text, onTextChange, onSend, busy, onOpenSetti
         </p>
       )}
       <div className="flex items-end gap-2 max-w-3xl mx-auto">
-        <button
-          onClick={onOpenSettings}
-          className="flex-shrink-0 flex items-center justify-center w-9 h-9 rounded-md text-fg-muted hover:bg-elevated hover:text-fg transition-colors min-h-[44px]"
-          aria-label="Retrieval settings"
-        >
-          <SlidersHorizontal size={16} aria-hidden="true" />
-        </button>
-
         <textarea
           ref={textareaRef}
           value={text}

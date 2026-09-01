@@ -104,6 +104,7 @@ const TREND_MARKERS: &[&str] = &[
 /// Markers that indicate the user wants to enumerate / list all records.
 /// Checked before AGGREGATION_MARKERS so list requests are not misclassified.
 const ENUMERATION_MARKERS: &[&str] = &[
+    "list ",
     "list all",
     "list every",
     "list the ",
@@ -246,6 +247,10 @@ mod tests {
         );
         assert_eq!(
             classify_lexical("show all records"),
+            Some(QueryIntent::Enumeration)
+        );
+        assert_eq!(
+            classify_lexical("list 5 patients"),
             Some(QueryIntent::Enumeration)
         );
     }
