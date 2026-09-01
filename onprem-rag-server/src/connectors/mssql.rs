@@ -11,7 +11,7 @@ use tiberius::{AuthMethod, Client, Config, Row};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncWriteCompatExt;
 
-use super::{ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err,
+use super::{ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
             make_row_filtered};
 use crate::error::AppResult;
 
@@ -146,15 +146,15 @@ impl SourceConnector for MssqlConnector {
             }
         }
 
-        // 5. Foreign-key columns.
+        // 5. FK columns with referenced table + column (for schema cards).
         let fk_rows: Vec<Row> = client
             .simple_query(
-                "SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME \
-                 FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc \
-                 JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu \
-                   ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME \
-                  AND tc.TABLE_SCHEMA    = kcu.TABLE_SCHEMA \
-                 WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'",
+                "SELECT \
+                   OBJECT_NAME(fk.parent_object_id) AS table_name, \
+                   COL_NAME(fk.parent_object_id, fk.parent_column_id) AS column_name, \
+                   OBJECT_NAME(fk.referenced_object_id) AS ref_table, \
+                   COL_NAME(fk.referenced_object_id, fk.referenced_column_id) AS ref_column \
+                 FROM sys.foreign_key_columns fk",
             )
             .await
             .map_err(|e| conn_err("SQL Server FK query failed", e))?
@@ -163,11 +163,21 @@ impl SourceConnector for MssqlConnector {
             .map_err(|e| conn_err("SQL Server FK query failed", e))?;
 
         let mut fk_set: HashSet<(String, String)> = HashSet::new();
+        let mut fk_edges_map: HashMap<String, Vec<FkEdge>> = HashMap::new();
         for row in &fk_rows {
             if let (Ok(Some(t)), Ok(Some(c))) =
                 (row.try_get::<&str, _>(0), row.try_get::<&str, _>(1))
             {
+                let ref_t = row.try_get::<&str, _>(2).ok().flatten().unwrap_or("").to_string();
+                let ref_c = row.try_get::<&str, _>(3).ok().flatten().unwrap_or("").to_string();
                 fk_set.insert((t.to_string(), c.to_string()));
+                if !ref_t.is_empty() {
+                    fk_edges_map.entry(t.to_string()).or_default().push(FkEdge {
+                        column: c.to_string(),
+                        ref_table: ref_t,
+                        ref_column: ref_c,
+                    });
+                }
             }
         }
 
@@ -200,7 +210,8 @@ impl SourceConnector for MssqlConnector {
             .map(|name| {
                 let row_count = row_estimates.get(&name).copied().unwrap_or(0);
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns }
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
+                TableSchema { name, row_count, columns, fk_edges }
             })
             .collect();
         Ok(schemas)
@@ -261,6 +272,53 @@ impl SourceConnector for MssqlConnector {
             })
             .collect();
         Ok(out)
+    }
+
+    async fn run_select(
+        &self,
+        sql: &str,
+        max_rows: i64,
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+        use tokio::time::{Duration, timeout};
+        use crate::error::AppError;
+
+        // tiberius has no per-query timeout; wrap query+fetch in a Tokio timeout.
+        // The sql already carries TOP {max_rows} injected by validate_sql, but that
+        // only lands on the outer SELECT for a plain query — inject_top() puts it
+        // inside the CTE body for a `WITH ... SELECT` shape, leaving the outer
+        // SELECT unbounded. Mirror postgres/mysql's defense-in-depth: wrap in an
+        // outer TOP regardless of what validate_sql already injected.
+        let owned_sql = format!("SELECT TOP ({max_rows}) * FROM ({sql}) AS _w");
+        let mut client = self.new_client().await?;
+
+        let rows: Vec<Row> = timeout(Duration::from_secs(timeout_secs), async move {
+            client
+                .simple_query(owned_sql.as_str())
+                .await
+                .map_err(|e| conn_err("SQL Server run_select query failed", e))?
+                .into_first_result()
+                .await
+                .map_err(|e| conn_err("SQL Server run_select result failed", e))
+        })
+        .await
+        .map_err(|_| AppError::BadRequest(format!(
+            "SQL Server query timed out after {timeout_secs}s"
+        )))??;
+
+        if rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let columns: Vec<String> =
+            rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let values: Vec<serde_json::Value> =
+                (0..columns.len()).map(|i| cell_to_json(row, i)).collect();
+            result_rows.push(values);
+        }
+        Ok((columns, result_rows))
     }
 }
 

@@ -252,7 +252,7 @@ pub fn validate_list(spec: &RunList, catalog: &Catalog) -> AppResult<RunList> {
     }
 
     // Columns: resolve synonyms and check allow-list. Empty -> fill from catalog.
-    let mut columns: Vec<String> = if spec.columns.is_empty() {
+    let columns: Vec<String> = if spec.columns.is_empty() {
         // Default projection: first few fields from the catalog (alphabetical).
         catalog
             .collections

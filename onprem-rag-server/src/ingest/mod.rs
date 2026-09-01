@@ -10,9 +10,11 @@
 //! Runs as a detached background task (`run`) so a long ingest survives the HTTP
 //! request that started it.
 
+pub mod extract;
 pub mod routes;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use chrono::Utc;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, doc};
@@ -24,6 +26,9 @@ use crate::connectors::{self, connector};
 use crate::documentdb::{DocumentDb, RECORDS, vector};
 use crate::embed;
 use crate::error::AppResult;
+use crate::foundry::FoundryManager;
+use crate::foundry::router::ModelSpec;
+use extract::{ExtractedClinical, Extractor};
 
 /// How many chunks to embed + insert per batch. Keeps peak memory bounded and lets
 /// progress advance smoothly on large sources.
@@ -31,6 +36,11 @@ const BATCH_SIZE: usize = 32;
 
 /// Emit a log line every this many rows so large tables aren't silent.
 const LOG_ROW_INTERVAL: i64 = 2500;
+
+/// Rows handed to the clinical extractor per pass. Extraction runs before chunking,
+/// so without batching a large table would sit silent behind one long annotation
+/// phase; a snapshot after each batch keeps the job log moving.
+const EXTRACT_BATCH: usize = 16;
 
 /// A stored record: one embedded chunk of one source row. `_id` is deterministic
 /// (`{source_id}:{table}:{row_pk}:{chunk_index}`) so re-ingesting the same table
@@ -51,6 +61,12 @@ struct RecordDoc {
     text: String,
     #[serde(rename = "contentVector")]
     content_vector: Vec<f32>,
+    /// Clinical entities the extractor found in this row, coded to ICD-10 / RxNorm /
+    /// LOINC (plan 25). Absent when the extractor is off, the row was too short to be
+    /// worth a model call, or the model found nothing. Purely additive: `text` and
+    /// `content_vector` are identical with or without it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<ExtractedClinical>,
     ingested_at: chrono::DateTime<Utc>,
 }
 
@@ -61,6 +77,9 @@ struct Chunk {
     fields: Value,
     text: String,
     table: String,
+    /// The row's annotation, cloned onto every chunk of that row exactly as `fields`
+    /// is — a query that matches any chunk can then read it without a second lookup.
+    extracted: Option<ExtractedClinical>,
 }
 
 /// One entry in the job log, emitted as part of every progress snapshot.
@@ -86,6 +105,8 @@ struct Snap<'a> {
     success_tables: i64,
     failed_tables: i64,
     db_size_bytes: i64,
+    /// Rows the clinical extractor annotated so far. Always 0 when the extractor is off.
+    extracted_rows: i64,
 }
 
 /// Append a log entry, capping the vec at 500 to bound the jobs doc size.
@@ -139,6 +160,7 @@ async fn write_snap(db: &DocumentDb, job_id: &str, s: &Snap<'_>, log: &[LogEntry
                 "success_tables": s.success_tables,
                 "failed_tables": s.failed_tables,
                 "db_size_bytes": s.db_size_bytes,
+                "extracted_rows": s.extracted_rows,
                 "log":           log_to_bson(log),
             }},
         )
@@ -179,6 +201,7 @@ async fn upsert_indexed_table(
 
 /// Background entry point: run the pipeline and record the outcome on the job doc.
 /// Never panics the task — any error is written back as a failed job.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: DocumentDb,
     config: Config,
@@ -187,8 +210,22 @@ pub async fn run(
     tables: Vec<String>,
     excluded_columns: HashMap<String, Vec<String>>,
     limit: Option<i64>,
+    foundry: Option<Arc<FoundryManager>>,
+    extract_spec: ModelSpec,
 ) {
-    if let Err(e) = execute(&db, &config, &source_id, &job_id, &tables, &excluded_columns, limit).await {
+    let extractor = Extractor::new(&config, foundry, extract_spec);
+    if let Err(e) = execute(
+        &db,
+        &config,
+        &source_id,
+        &job_id,
+        &tables,
+        &excluded_columns,
+        limit,
+        extractor.as_ref(),
+    )
+    .await
+    {
         tracing::error!(job = %job_id, error = %e, "ingestion pipeline failed");
         let mut log = vec![];
         push_log(&mut log, "error", &format!("Job failed: {e}"));
@@ -209,6 +246,7 @@ pub async fn run(
 /// The pipeline proper. Returns an error only for catastrophic failures that prevent
 /// even starting (index creation, source load). Per-table errors are caught, logged,
 /// and continue to the next table.
+#[allow(clippy::too_many_arguments)]
 async fn execute(
     db: &DocumentDb,
     config: &Config,
@@ -217,6 +255,7 @@ async fn execute(
     tables: &[String],
     excluded_columns: &HashMap<String, Vec<String>>,
     limit: Option<i64>,
+    extractor: Option<&Extractor>,
 ) -> AppResult<()> {
     // 1. Ensure vector + full-text indexes exist before writing any records.
     vector::ensure_indexes(db, config.embedding_dims).await?;
@@ -232,9 +271,22 @@ async fn execute(
     let mut processed_rows = 0i64;
     let mut total_rows_est = 0i64;
     let mut db_size_bytes = 0i64;
+    let mut extracted_rows = 0i64;
     let mut log: Vec<LogEntry> = Vec::new();
 
     let records_coll = db.collection::<RecordDoc>(RECORDS);
+
+    if let Some(ex) = extractor {
+        push_log(
+            &mut log,
+            "info",
+            &format!(
+                "Clinical extractor enabled ({}): notes of {}+ words will be annotated with ICD-10 / RxNorm / LOINC codes",
+                ex.alias(),
+                config.router.extract_min_words
+            ),
+        );
+    }
 
     // 3. Per-table loop: each table is an independent unit; one failure continues.
     for (table_idx, table) in tables.iter().enumerate() {
@@ -271,6 +323,7 @@ async fn execute(
                 success_tables,
                 failed_tables,
                 db_size_bytes,
+                extracted_rows,
             },
             &log,
         )
@@ -313,6 +366,65 @@ async fn execute(
             .delete_many(doc! { "source_id": source_id, "table": table })
             .await;
 
+        // Clinical extraction pass (plan 25). Runs on the *whole* row text, before
+        // chunking, so an entity split across a chunk boundary is still seen once and
+        // whole. Annotations are keyed by row_pk and attached to every chunk below.
+        //
+        // Failures here are never fatal: `extract_batch` returns only what it managed
+        // to annotate, so a dead model simply produces an unannotated table.
+        let mut annotations: HashMap<String, ExtractedClinical> = HashMap::new();
+        if let Some(ex) = extractor {
+            let candidates: Vec<(String, String)> =
+                rows.iter().map(|r| (r.pk.clone(), r.text.clone())).collect();
+            let mut skipped = 0usize;
+            let mut empty = 0usize;
+
+            for batch in candidates.chunks(EXTRACT_BATCH) {
+                let out = ex.extract_batch(batch.to_vec()).await;
+                skipped += out.skipped;
+                empty += out.empty;
+                extracted_rows += out.annotated.len() as i64;
+                annotations.extend(out.annotated);
+
+                // Extraction happens before the embed loop, so the row counters below
+                // are still frozen; snapshot anyway so the UI shows the job is alive.
+                let _ = write_snap(
+                    db,
+                    job_id,
+                    &Snap {
+                        status: "running",
+                        table_index,
+                        total_tables,
+                        current_table: table,
+                        table_rows: 0,
+                        table_total,
+                        processed_rows,
+                        total_rows: total_rows_est,
+                        errors: errors_count,
+                        success_tables,
+                        failed_tables,
+                        db_size_bytes,
+                        extracted_rows,
+                    },
+                    &log,
+                )
+                .await;
+            }
+
+            push_log(
+                &mut log,
+                "info",
+                &format!(
+                    "Table {table}: annotated {} rows ({empty} with no entities, {skipped} too short)",
+                    annotations.len()
+                ),
+            );
+            tracing::info!(
+                job = %job_id, table, annotated = annotations.len(), empty, skipped,
+                "clinical extraction complete"
+            );
+        }
+
         // Chunk each row's text into embed-sized passages.
         let mut chunks: Vec<Chunk> = Vec::new();
         for row in rows {
@@ -322,6 +434,7 @@ async fn execute(
                 vec![row.text.clone()]
             };
             let fields = Value::Object(row.fields);
+            let extracted = annotations.get(&row.pk).cloned();
             for (ci, text) in texts.into_iter().enumerate() {
                 if text.trim().is_empty() {
                     continue;
@@ -332,6 +445,7 @@ async fn execute(
                     fields: fields.clone(),
                     text,
                     table: table.clone(),
+                    extracted: extracted.clone(),
                 });
             }
         }
@@ -368,6 +482,7 @@ async fn execute(
                     fields: c.fields.clone(),
                     text: c.text.clone(),
                     content_vector: vector,
+                    extracted: c.extracted.clone(),
                     ingested_at: Utc::now(),
                 })
                 .collect();
@@ -416,6 +531,7 @@ async fn execute(
                     success_tables,
                     failed_tables,
                     db_size_bytes,
+                    extracted_rows,
                 },
                 &log,
             )
@@ -487,6 +603,7 @@ async fn execute(
                 "success_tables": success_tables,
                 "failed_tables": failed_tables,
                 "db_size_bytes": db_size_bytes,
+                "extracted_rows": extracted_rows,
                 "log":           log_to_bson(&log),
                 "finished_at":   BsonDateTime::now(),
             }},

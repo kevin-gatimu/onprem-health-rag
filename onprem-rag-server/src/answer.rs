@@ -6,20 +6,16 @@
 //! The route files own their SSE contracts; this module owns the model and DB
 //! work. Keeping it at the crate root avoids a `rag` -> `agents` import cycle.
 
-use foundry_local_sdk::ChatCompletionStream;
-use serde::de::DeserializeOwned;
-
 use crate::aggregation::catalog::Catalog;
 use crate::aggregation::execute;
 use crate::aggregation::intent::QueryIntent;
 use crate::aggregation::list;
-use crate::aggregation::spec::RunAggregation;
 use crate::aggregation::validate;
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::AppResult;
 use crate::foundry::router::AgentKind;
-use crate::foundry::FoundryManager;
+use crate::foundry::{FoundryManager, GuardedChatStream};
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -27,29 +23,24 @@ use crate::state::AppState;
 // ---------------------------------------------------------------------------
 
 /// Pre-computed structured answer ready to stream from an SSE route.
+///
+/// `/chat`'s SSE contract is `citations -> token* -> done` — no `spec`/`rows`/
+/// `pipeline` provenance events (those are `/agents`-only, which builds its own
+/// versions inline rather than going through `run_structured`). So unlike the
+/// `/agents` path, only what `/chat` actually streams is carried here.
 pub enum Structured {
     /// Aggregation (Count, Group, Trend) answer.
     Aggregate {
-        /// Serialised `RunAggregation` for the provenance `spec` event.
-        spec_json: String,
-        /// Serialised `Vec<AggRow>` for the UI chart/table.
-        rows_json: String,
-        /// Serialised executed pipeline for the provenance `pipeline` event.
-        pipeline_json: String,
         /// Already-opened narration stream (consumed inside the EventStream!).
-        narration_stream: ChatCompletionStream,
+        narration_stream: GuardedChatStream,
     },
     /// Enumeration (list all, who are the …) answer.
     List {
-        /// Serialised `Vec<serde_json::Value>` rows for this page.
-        rows_json: String,
-        /// Total deduped row count (before pagination).
-        total: u64,
         /// Serialised `Vec<Passage>` synthesised from the rows for the
         /// `citations` event.
         citations_json: String,
         /// Already-opened narration stream.
-        narration_stream: ChatCompletionStream,
+        narration_stream: GuardedChatStream,
     },
 }
 
@@ -134,7 +125,6 @@ pub fn build_list_narration_user(
     rows: &[serde_json::Value],
     total: u64,
     offset: u32,
-    limit: u32,
 ) -> String {
     let shown = rows.len() as u64;
     let end = offset as u64 + shown;
@@ -217,25 +207,17 @@ pub async fn run_structured(
             let planner_system = build_agg_planner_system(catalog, intent);
 
             // 1. Plan: model emits a RunAggregation tool call.
-            let planned = foundry.plan_aggregation(&spec, &planner_system, question).await?;
+            let planned = foundry
+                .plan_aggregation(&spec, &planner_system, question)
+                .await?;
 
             // 2. Validate + sanitize against the current catalog.
             let validated = validate::validate(&planned, catalog)?;
 
-            // 3. Execute pipeline against DocumentDB.
-            let (rows, pipeline_docs) = execute::run(db, user, &validated).await?;
-
-            let spec_json =
-                serde_json::to_string(&validated).unwrap_or_else(|_| "{}".to_string());
-            let rows_json =
-                serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
-            let pipeline_json = serde_json::to_string(
-                &pipeline_docs
-                    .iter()
-                    .map(|d| mongodb::bson::Bson::Document(d.clone()).into_relaxed_extjson())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".to_string());
+            // 3. Execute pipeline against DocumentDB. `/chat` doesn't emit a
+            // provenance `pipeline` event (that's `/agents`-only), so the
+            // executed pipeline docs aren't needed here.
+            let (rows, _pipeline_docs) = execute::run(db, user, &validated).await?;
 
             // 4. Open grounded narration stream (no tools — model only summarises).
             let narration_user = build_narration_user(question, &rows);
@@ -245,12 +227,7 @@ pub async fn run_structured(
                 .generate_stream_with(&narration_spec, NARRATION_SYSTEM_PROMPT, &narration_user)
                 .await?;
 
-            Ok(Structured::Aggregate {
-                spec_json,
-                rows_json,
-                pipeline_json,
-                narration_stream,
-            })
+            Ok(Structured::Aggregate { narration_stream })
         }
 
         QueryIntent::Enumeration => {
@@ -264,26 +241,24 @@ pub async fn run_structured(
             let validated = list::validate_list(&planned, catalog)?;
 
             // 3. Execute paginated list query.
-            let (rows, total, _pipeline_docs) =
-                list::run(db, user, &validated).await?;
+            let (rows, total, _pipeline_docs) = list::run(db, user, &validated).await?;
 
             // 4. Synthesise citations from rows so the UI shows them as sources.
             let citations_json = list::rows_to_citations_json(&rows, &validated.collection);
 
             // 5. Open narration stream.
             let offset = validated.offset;
-            let limit = validated.limit.unwrap_or(list::DEFAULT_LIST_LIMIT);
-            let narration_user = build_list_narration_user(question, &rows, total, offset, limit);
+            let narration_user = build_list_narration_user(question, &rows, total, offset);
             let mut narration_spec = state.spec_for(AgentKind::HealthQuery);
             narration_spec.tools = false;
             let narration_stream = foundry
                 .generate_stream_with(&narration_spec, NARRATION_SYSTEM_PROMPT, &narration_user)
                 .await?;
 
-            let rows_json =
-                serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
-
-            Ok(Structured::List { rows_json, total, citations_json, narration_stream })
+            Ok(Structured::List {
+                citations_json,
+                narration_stream,
+            })
         }
 
         // Other intents should not reach run_structured; callers guard this.

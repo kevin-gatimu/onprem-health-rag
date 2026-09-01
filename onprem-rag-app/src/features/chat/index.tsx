@@ -11,7 +11,7 @@
 //   4. On error: setError (rendered inline in the bubble).
 //
 // All controls lock while pending.phase !== 'done' (single in-flight run invariant).
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Layers, PanelLeftOpen } from 'lucide-react';
 import {
@@ -57,7 +57,22 @@ export default function Chat() {
   });
 
   // ── Send flow ────────────────────────────────────────────────────────────────
+  // Synchronous re-entry guard: the `streaming` gate only engages after the async
+  // createConversation resolves, so a fast double-tap (mobile ghost clicks) could
+  // otherwise start two concurrent runs.
+  const sendInFlight = useRef(false);
   const handleSend = useCallback(async (text: string) => {
+    if (sendInFlight.current) return;
+    sendInFlight.current = true;
+    try {
+      await doSend(text);
+    } finally {
+      sendInFlight.current = false;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeConvId, opts, queryClient]);
+
+  async function doSend(text: string) {
     const runId = crypto.randomUUID();
 
     // Ensure we have a conversation to attach messages to.
@@ -91,7 +106,7 @@ export default function Chat() {
     } catch (e) {
       useChat.getState().setError(runId, String(e));
     }
-  }, [activeConvId, opts, queryClient]);
+  }
 
   // ── Navigation helpers ───────────────────────────────────────────────────────
   function handleNewChat() {

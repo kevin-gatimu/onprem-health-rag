@@ -61,9 +61,14 @@ pub struct FieldMeta {
 }
 
 impl FieldMeta {
+    // Only used by `build_hardcoded()` below (the real catalog builder constructs
+    // `FieldMeta` via struct literal directly) — `cfg(test)` so a production build
+    // doesn't carry test-fixture-only constructors.
+    #[cfg(test)]
     pub fn new(name: impl Into<String>, t: FieldType) -> Self {
         FieldMeta { name: name.into(), field_type: t, description: None }
     }
+    #[cfg(test)]
     pub fn with_desc(name: impl Into<String>, t: FieldType, desc: impl Into<String>) -> Self {
         FieldMeta { name: name.into(), field_type: t, description: Some(desc.into()) }
     }
@@ -354,8 +359,9 @@ fn augmentation_layer() -> (HashMap<String, String>, HashMap<String, String>) {
 // Hardcoded catalog (for unit tests and as a known-good fallback reference)
 // ---------------------------------------------------------------------------
 
-/// Build the catalog from the known AKUH EMR schema. Used in unit tests and as
-/// the reference schema. Production code uses `build_from_store` instead.
+/// Build the catalog from the known AKUH EMR schema. Used in unit tests as a
+/// known-good fixture; production code uses `build_from_store` instead.
+#[cfg(test)]
 pub(crate) fn build_hardcoded() -> Catalog {
     let mut collections: HashMap<String, CollectionMeta> = HashMap::new();
 
@@ -368,7 +374,7 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::with_desc("patient_id", FieldType::Id, "Patient identifier"),
                 FieldMeta::with_desc("encounter_id", FieldType::Id, "Clinical encounter identifier"),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility name"),
-                FieldMeta::with_desc("diagnosis_code", FieldType::String, "ICD-10 diagnosis code"),
+                FieldMeta::with_desc("icd10_code", FieldType::String, "ICD-10 diagnosis code"),
                 FieldMeta::with_desc("diagnosis_display", FieldType::String, "Human-readable diagnosis name"),
                 FieldMeta::with_desc("encounter_date", FieldType::Date, "Date of the clinical encounter"),
                 FieldMeta::with_desc("gender", FieldType::String, "Patient gender"),
@@ -423,7 +429,7 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::new("encounter_id", FieldType::Id),
                 FieldMeta::new("patient_id", FieldType::Id),
                 FieldMeta::with_desc("encounter_date", FieldType::Date, "Date of encounter"),
-                FieldMeta::with_desc("diagnosis_code", FieldType::String, "ICD-10 code"),
+                FieldMeta::with_desc("icd10_code", FieldType::String, "ICD-10 code"),
                 FieldMeta::with_desc("diagnosis_display", FieldType::String, "Diagnosis description"),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility"),
             ],

@@ -9,15 +9,28 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow } from "./bridge";
+import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type ModelEvent, type Passage, type AgentKind, type AggRow, type VerifyReport } from "./bridge";
 import { useStream, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
+import { notifyBackground } from "./notify";
 import { toast } from "../stores/ui";
 import { useChat } from "../stores/chat";
 import { useAgents } from "../stores/agents";
+import { useModels } from "../stores/models";
 
 let started = false;
 const unlisteners: UnlistenFn[] = [];
+
+// HMR: without this, editing any module in this import chain re-runs the file and
+// re-registers every listener on top of the old ones — each chat token then lands
+// twice and streamed answers read "HelloHello!! I I'm'm…" until the DB refetch.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    for (const un of unlisteners) un();
+    unlisteners.length = 0;
+    started = false;
+  });
+}
 
 /**
  * Register all bridge listeners and start the always-on server log relay.
@@ -58,8 +71,9 @@ export async function initBridgeEvents(): Promise<void> {
   );
 
   // Kick off the relay. Idempotent server-side (at most one stream per session).
+  // Fails with "not logged in" before auth — AppShell retries on mount (post-login).
   startLogStream().catch(() => {
-    /* server may not be reachable yet; the Connect flow retries */
+    /* retried from AppShell once authenticated */
   });
 
   // Ingest progress events — arrive at ~2/sec, no rAF buffering needed (log array
@@ -82,6 +96,7 @@ export async function initBridgeEvents(): Promise<void> {
         // doesn't stay stuck on "ingesting" forever.
         useIngestion.getState().markComplete();
       }
+      void notifyBackground("Ingestion finished", "The ingestion job has completed.");
     }),
   );
 
@@ -96,6 +111,24 @@ export async function initBridgeEvents(): Promise<void> {
         toast.error(typeof p === "string" ? p : "Ingestion failed");
         useIngestion.getState().markComplete();
       }
+      void notifyBackground("Ingestion failed", "The ingestion job reported an error.");
+    }),
+  );
+
+  // ── Model download listeners (Stage 8) ───────────────────────────────────────
+  // Fan `model://progress|status` into the models store keyed by variant_id so the
+  // progress bar survives navigation. Terminal events (done/error) are handled by
+  // the store's startDownload via the invoke promise — no listeners needed here.
+  unlisteners.push(
+    await listen<ModelEvent>("model://progress", (ev) => {
+      const pct = parseFloat(ev.payload.data);
+      if (!Number.isNaN(pct)) useModels.getState().applyProgress(ev.payload.variant_id, pct);
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ModelEvent>("model://status", (ev) => {
+      useModels.getState().applyStatus(ev.payload.variant_id, ev.payload.data);
     }),
   );
 
@@ -126,6 +159,17 @@ export async function initBridgeEvents(): Promise<void> {
         useChat.getState().setCitations(run_id, passages);
       } catch {
         /* ignore malformed citations payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://verify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setVerify(run_id, JSON.parse(data) as VerifyReport);
+      } catch {
+        /* ignore malformed verify payload — the answer stands unannotated */
       }
     }),
   );

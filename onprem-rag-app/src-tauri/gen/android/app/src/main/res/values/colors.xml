@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="purple_200">#FFBB86FC</color>
+    <color name="purple_500">#FF6200EE</color>
+    <color name="purple_700">#FF3700B3</color>
+    <color name="teal_200">#FF03DAC5</color>
+    <color name="teal_700">#FF018786</color>
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+
+    <!-- Mirrors the CSS token color-base in src/styles/theme.css. MainActivity pads the content
+         view out from under the system bars, so the window background is what shows
+         in the status/navigation bands — it has to match the web UI or the notch
+         area reads as a foreign-coloured strip. -->
+    <color name="app_base">#FF0F1117</color>
+</resources>

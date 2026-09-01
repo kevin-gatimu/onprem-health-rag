@@ -71,6 +71,9 @@ pub struct IngestProgress {
     pub failed_tables: i64,
     /// Cumulative UTF-8 bytes of embedded chunk text — a monotonic proxy for DB growth.
     pub db_size_bytes: i64,
+    /// Rows annotated by the clinical extractor (plan 25). Always 0 when
+    /// `ONPREM_EXTRACT_ENABLED` is false, which is the default.
+    pub extracted_rows: i64,
     /// Full current log; server-capped at 500 entries. Client replaces wholesale each event.
     pub log: Vec<LogEntry>,
 }
@@ -91,6 +94,7 @@ fn progress_from_doc(job_id: &str, doc: &Document) -> IngestProgress {
         success_tables: doc.get_i64("success_tables").unwrap_or(0),
         failed_tables: doc.get_i64("failed_tables").unwrap_or(0),
         db_size_bytes: doc.get_i64("db_size_bytes").unwrap_or(0),
+        extracted_rows: doc.get_i64("extracted_rows").unwrap_or(0),
         log: extract_log(doc),
     }
 }
@@ -166,6 +170,7 @@ pub async fn start_ingest(
             "success_tables": 0i64,
             "failed_tables": 0i64,
             "db_size_bytes": 0i64,
+            "extracted_rows": 0i64,
             "log":           [],
             "started_at":    BsonDateTime::now(),
             "finished_at":   mongodb::bson::Bson::Null,
@@ -179,7 +184,14 @@ pub async fn start_ingest(
     let job = job_id.clone();
     let tables = req.tables.clone();
     let limit = req.limit;
-    tokio::spawn(async move { run(db, config, source_id, job, tables, excluded, limit).await });
+    // The clinical extractor needs a Foundry handle and the routed Extract spec. Both
+    // are resolved here, on the request, so any persisted per-role override in
+    // `settings` is honoured — the detached task cannot borrow `&AppState`.
+    let foundry = state.foundry_handle();
+    let extract_spec = state.spec_for(crate::foundry::router::AgentKind::Extract);
+    tokio::spawn(async move {
+        run(db, config, source_id, job, tables, excluded, limit, foundry, extract_spec).await
+    });
 
     // req.source_id was only cloned into the spawn, so it remains valid here.
     audit::write_audit(

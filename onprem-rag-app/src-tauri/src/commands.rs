@@ -414,9 +414,11 @@ pub struct ModelSummary {
     pub loaded: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SelectModelResponse {
-    model: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SelectModelResponse {
+    pub model: String,
+    /// True when the server purged + re-downloaded corrupt cached weights en route.
+    pub repaired: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -500,7 +502,7 @@ pub async fn list_models(bridge: State<'_, Bridge>) -> Result<Vec<ModelSummary>,
 
 /// `POST /models/select` — download (if needed), load, and select a chat model. Admin only.
 #[tauri::command]
-pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<String, String> {
+pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<SelectModelResponse, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url("/models/select");
     let resp = bridge
@@ -517,7 +519,7 @@ pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<St
     }
     let body: SelectModelResponse =
         resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
-    Ok(body.model)
+    Ok(body)
 }
 
 /// `PUT /settings/router` — persist (or clear, when `variant_id` is `None`) a role's
@@ -659,6 +661,14 @@ pub async fn generate(
     Ok(())
 }
 
+/// Envelope stamped onto every `model://*` event so the boot-time listeners can
+/// route progress to the right variant's store entry (mirror of `ChatEvent`).
+#[derive(Serialize, Clone)]
+struct ModelEvent {
+    variant_id: String,
+    data: String,
+}
+
 /// `POST /models/pull` — download (with progress) and optionally load a variant.
 /// Consumes the server SSE and re-emits each event to the frontend: progress as
 /// `model://progress`, status transitions as `model://status`, ending with
@@ -690,20 +700,32 @@ pub async fn pull_model(
         let event = event.map_err(|e| format!("stream error: {e}"))?;
         match event.event.as_str() {
             "progress" => {
-                let _ = app.emit("model://progress", event.data);
+                let _ = app.emit(
+                    "model://progress",
+                    ModelEvent { variant_id: variant_id.clone(), data: event.data },
+                );
             }
             "status" => {
-                let _ = app.emit("model://status", event.data);
+                let _ = app.emit(
+                    "model://status",
+                    ModelEvent { variant_id: variant_id.clone(), data: event.data },
+                );
             }
             "error" => {
-                let _ = app.emit("model://error", event.data.clone());
+                let _ = app.emit(
+                    "model://error",
+                    ModelEvent { variant_id: variant_id.clone(), data: event.data.clone() },
+                );
                 return Err(event.data);
             }
             "done" => break,
             _ => {}
         }
     }
-    let _ = app.emit("model://done", ());
+    let _ = app.emit(
+        "model://done",
+        ModelEvent { variant_id: variant_id.clone(), data: String::new() },
+    );
     Ok(())
 }
 
@@ -732,6 +754,29 @@ pub struct ServiceStatus {
     pub detail: Option<String>,
 }
 
+/// One mounted volume on the server host. Mirrors the server's `DiskSpec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskSpec {
+    pub mount: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Server host machine facts. Mirrors the server's `ServerSpecs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSpecs {
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub cpu_model: String,
+    pub logical_cores: usize,
+    pub physical_cores: Option<usize>,
+    pub total_memory_bytes: u64,
+    pub disks: Vec<DiskSpec>,
+    pub accelerators: Vec<String>,
+    pub server_version: String,
+}
+
 /// The single payload backing the Settings page. Degraded-safe: when Foundry is
 /// down the model/EP lists come back empty and `foundry_endpoint` is `""`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,6 +794,8 @@ pub struct SetupStatus {
     pub cached_models: Vec<String>,
     /// Same shape already mirrored for `get_hardware` (empty when Foundry is down).
     pub execution_providers: Vec<ExecutionProvider>,
+    /// Host machine facts (never Foundry-derived, so always populated).
+    pub server_specs: ServerSpecs,
 }
 
 /// `GET /setup-status` — one call powering the Settings page (GPU, active chat
@@ -1004,6 +1051,10 @@ pub struct IngestProgress {
     pub failed_tables: i64,
     /// Cumulative UTF-8 bytes of embedded chunk text.
     pub db_size_bytes: i64,
+    /// Rows annotated by the clinical extractor (plan 25). 0 unless the server has
+    /// ONPREM_EXTRACT_ENABLED=true.
+    #[serde(default)]
+    pub extracted_rows: i64,
     /// Full current log; server-capped at 500. Client replaces wholesale each event.
     pub log: Vec<LogEntry>,
 }
@@ -1796,6 +1847,14 @@ pub async fn chat(
                 let _ = app.emit(
                     "chat://token",
                     ChatEvent { run_id: run_id.clone(), data: decode_token(&event.data) },
+                );
+            }
+            "verify" => {
+                // Post-stream faithfulness report (plan 25): the JSON VerifyReport
+                // {status, claims, unsupported, reason?, citation_overflow?}.
+                let _ = app.emit(
+                    "chat://verify",
+                    ChatEvent { run_id: run_id.clone(), data: event.data },
                 );
             }
             "error" => {

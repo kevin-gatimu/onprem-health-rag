@@ -16,6 +16,7 @@ mod error;
 mod foundry;
 mod ingest;
 mod logstream;
+mod memory;
 mod nl2sql;
 mod rag;
 mod retrieval;
@@ -23,6 +24,8 @@ mod router;
 mod routes;
 mod settings;
 mod state;
+mod system;
+mod verify;
 
 use config::Config;
 use documentdb::DocumentDb;
@@ -36,10 +39,16 @@ async fn rocket() -> _ {
     // Two sinks for one event stream: the usual formatted terminal output, plus a
     // broadcast layer that feeds the app's live log windows (GET /logs/stream). The
     // same EnvFilter gates both, so `RUST_LOG` controls what the app sees too.
+    //
+    // Default is `warn` for everything except our own crate: Rocket's own `info`
+    // level logs a `Matched: (route_name) METHOD /path` line for every single
+    // request plus a full route-listing banner at boot — real signal-to-noise
+    // killers in both the terminal and the app's log viewer. `RUST_LOG` still
+    // overrides this wholesale if you want Rocket's request log back.
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "info,onprem_server=debug".into());
+        .unwrap_or_else(|_| "warn,onprem_server=debug".into());
     tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer())
@@ -50,10 +59,17 @@ async fn rocket() -> _ {
     let issues = config.security_issues();
     if !issues.is_empty() {
         if config.production {
-            for i in &issues { tracing::error!("insecure configuration: {i}"); }
-            panic!("refusing to start in production with insecure configuration ({} issue(s)); see errors above and .env.example", issues.len());
+            for i in &issues {
+                tracing::error!("insecure configuration: {i}");
+            }
+            panic!(
+                "refusing to start in production with insecure configuration ({} issue(s)); see errors above and .env.example",
+                issues.len()
+            );
         } else {
-            for i in &issues { tracing::warn!("insecure configuration (dev): {i}"); }
+            for i in &issues {
+                tracing::warn!("insecure configuration (dev): {i}");
+            }
         }
     }
     tracing::info!(port = config.port, db = %config.documentdb_db, "starting onprem-rag-server");
@@ -81,7 +97,8 @@ async fn rocket() -> _ {
                 tracing::warn!(error = %e, "chat index creation failed (non-fatal)");
             }
             // Create nl2sql schema_catalog indexes (idempotent, best-effort).
-            if let Err(e) = nl2sql::catalog::ensure_nl2sql_indexes(&db, config.embedding_dims).await {
+            if let Err(e) = nl2sql::catalog::ensure_nl2sql_indexes(&db, config.embedding_dims).await
+            {
                 tracing::warn!(error = %e, "nl2sql index creation failed (non-fatal)");
             }
             // Build catalog from ingested data now that the DB is reachable.
@@ -94,7 +111,9 @@ async fn rocket() -> _ {
     };
 
     // Load persisted per-role model routing overrides (best-effort).
-    let router_overrides = settings::load_router_overrides(&db).await.unwrap_or_default();
+    let router_overrides = settings::load_router_overrides(&db)
+        .await
+        .unwrap_or_default();
 
     // Initialise Foundry Local (chat). Non-fatal: if the native engine can't start
     // (e.g. Foundry Local not installed), the server still boots and Foundry routes
@@ -132,16 +151,30 @@ async fn rocket() -> _ {
         });
     }
 
+    // Conversation retention sweep (plan 22.7): boot-time + daily, no-op when
+    // ONPREM_CONVERSATION_RETENTION_DAYS=0 (default: keep forever).
+    memory::spawn_retention_sweep(db.clone(), config.clone());
+
     // Bind address/port come from our config rather than Rocket.toml.
     let figment = rocket::Config::figment()
         .merge(("address", config.bind_address.clone()))
         .merge(("port", config.port));
 
     rocket::custom(figment)
-        .manage(AppState::new(config, db, foundry, router_overrides, initial_catalog))
+        .manage(AppState::new(
+            config,
+            db,
+            foundry,
+            router_overrides,
+            initial_catalog,
+        ))
         .mount(
             "/",
-            rocket::routes![routes::health::health, routes::logs::logs_stream, routes::stats::stats],
+            rocket::routes![
+                routes::health::health,
+                routes::logs::logs_stream,
+                routes::stats::stats
+            ],
         )
         .mount(
             "/",
@@ -209,10 +242,7 @@ async fn rocket() -> _ {
         )
         .mount(
             "/",
-            rocket::routes![
-                rag::routes::search,
-                rag::routes::chat,
-            ],
+            rocket::routes![rag::routes::search, rag::routes::chat,],
         )
         .mount(
             "/",
@@ -228,9 +258,6 @@ async fn rocket() -> _ {
         .mount("/", rocket::routes![agents::routes::agent])
         .mount(
             "/",
-            rocket::routes![
-                nl2sql::routes::nl_query,
-                nl2sql::routes::catalog_refresh,
-            ],
+            rocket::routes![nl2sql::routes::nl_query, nl2sql::routes::catalog_refresh,],
         )
 }

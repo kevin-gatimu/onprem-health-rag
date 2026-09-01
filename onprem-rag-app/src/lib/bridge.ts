@@ -2,7 +2,6 @@
 // the server directly — every call goes through `invoke` into src-tauri, which
 // holds the JWT and performs the actual HTTP request.
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import type { Role, User } from "./types";
 
 /** Sentinel the bridge returns (as a rejected invoke) when the server rejects
@@ -140,9 +139,16 @@ export function listModels(): Promise<ModelSummary[]> {
   return authedInvoke<ModelSummary[]>("list_models");
 }
 
-/** Download (if needed), load, and select a chat model. Returns the resolved variant id. Admin only. */
-export function selectModel(model: string): Promise<string> {
-  return authedInvoke<string>("select_model", { model });
+export interface SelectModelResult {
+  /** Resolved variant id now loaded and selected. */
+  model: string;
+  /** True when the server purged + re-downloaded corrupt cached weights en route. */
+  repaired: boolean;
+}
+
+/** Download (if needed), load, and select a chat model. Admin only. */
+export function selectModel(model: string): Promise<SelectModelResult> {
+  return authedInvoke<SelectModelResult>("select_model", { model });
 }
 
 export interface EpRegistration {
@@ -225,44 +231,23 @@ export function deleteModel(variantId: string): Promise<DeleteModelResult> {
   return authedInvoke<DeleteModelResult>("delete_model", { variantId });
 }
 
-/** Callbacks for the `pullModel` wrapper below. All fields are optional. */
-export interface PullCallbacks {
-  /** Called for each download-progress update, 0..100. */
-  onProgress?: (pct: number) => void;
-  /** Called on each status transition (e.g. `"loading"`, `"loaded"`). */
-  onStatus?: (s: string) => void;
-  /** Called if the server emits an error event. */
-  onError?: (e: string) => void;
-  /** Called when the stream ends normally. */
-  onDone?: () => void;
+/**
+ * Envelope on every `model://*` event (mirror of the bridge's `ModelEvent`) so the
+ * boot-time listeners in bridgeEvents.ts can route progress to the right variant.
+ */
+export interface ModelEvent {
+  variant_id: string;
+  data: string;
 }
 
 /**
- * Download (if needed) and optionally load a model variant, relaying progress via
- * callbacks. Registers all `model://*` listeners **before** invoking so no early
- * event is missed, and unlistens them all when the stream ends (success or error).
+ * Download (if needed) and optionally load a model variant. Progress streams back
+ * as `model://progress|status` events (handled once, at boot, in bridgeEvents.ts →
+ * the models store). Resolves when the stream ends; rejects with the server's
+ * error payload. Drive this via `useModels.startDownload`, not directly.
  */
-export async function pullModel(
-  variantId: string,
-  load: boolean,
-  cb: PullCallbacks,
-): Promise<void> {
-  const unlistenProgress = await listen<string>("model://progress", (ev) => {
-    const pct = parseFloat(ev.payload);
-    if (!Number.isNaN(pct)) cb.onProgress?.(pct);
-  });
-  const unlistenStatus = await listen<string>("model://status", (ev) => cb.onStatus?.(ev.payload));
-  const unlistenError = await listen<string>("model://error", (ev) => cb.onError?.(ev.payload));
-  const unlistenDone = await listen("model://done", () => cb.onDone?.());
-
-  try {
-    await authedInvoke<void>("pull_model", { variantId, load });
-  } finally {
-    unlistenProgress();
-    unlistenStatus();
-    unlistenError();
-    unlistenDone();
-  }
+export function pullModel(variantId: string, load: boolean): Promise<void> {
+  return authedInvoke<void>("pull_model", { variantId, load });
 }
 
 // --- Stage 8: Models + Settings — setup status + per-variant unload ---
@@ -284,6 +269,28 @@ export interface ServiceStatus {
   detail: string | null;
 }
 
+/** One mounted volume on the server host. Mirrors the bridge's `DiskSpec`. */
+export interface DiskSpec {
+  mount: string;
+  total_bytes: number;
+  available_bytes: number;
+}
+
+/** Server host machine facts for the Settings "Server specs" card. Mirrors `ServerSpecs`. */
+export interface ServerSpecs {
+  hostname: string;
+  os: string;
+  arch: string;
+  cpu_model: string;
+  logical_cores: number;
+  physical_cores: number | null;
+  total_memory_bytes: number;
+  disks: DiskSpec[];
+  /** GPU/NPU names, formatted "KIND — name". */
+  accelerators: string[];
+  server_version: string;
+}
+
 /**
  * The single payload backing the Settings page. Mirrors the server's `SetupStatus`
  * (and the bridge's `SetupStatus` struct) — keep all three in sync. Degraded-safe:
@@ -303,6 +310,8 @@ export interface SetupStatus {
   cached_models: string[];
   /** Same shape as `HardwareInfo.execution_providers` (empty when Foundry is down). */
   execution_providers: ExecutionProvider[];
+  /** Host machine facts (never Foundry-derived, so always populated). */
+  server_specs: ServerSpecs;
 }
 
 /** `GET /setup-status` — one call backing the Settings page. Any authenticated user. */
@@ -448,6 +457,8 @@ export interface IngestProgress {
   failed_tables: number;
   /** Cumulative UTF-8 bytes of embedded chunk text. */
   db_size_bytes: number;
+  /** Rows annotated by the clinical extractor (plan 25); 0 when it is disabled. */
+  extracted_rows: number;
   /** Full current log; server-capped at 500. Replace wholesale each event. */
   log: LogEntry[];
 }
@@ -833,6 +844,28 @@ export const deleteConversation = (id: string): Promise<void> =>
 /** `GET /conversations/<id>/messages` — all messages in a conversation, oldest first. */
 export const getMessages = (id: string): Promise<StoredMessage[]> =>
   authedInvoke<StoredMessage[]>("get_messages", { id });
+
+/** One claim the faithfulness verifier lifted out of an answer, with its verdict. */
+export interface ClaimCheck {
+  claim: string;
+  supported: boolean;
+  /** 1-based indices into the citation list. Empty when unsupported. */
+  passages: number[];
+}
+
+/**
+ * Post-stream grounding report (plan 25), delivered as a `chat://verify` event
+ * after the answer has finished streaming. `skipped` means the check did not run
+ * or could not be trusted — never treat it as a pass; `reason` says why.
+ */
+export interface VerifyReport {
+  status: "supported" | "partial" | "unsupported" | "skipped";
+  claims: ClaimCheck[];
+  unsupported: number;
+  reason?: string;
+  /** `[N]` markers in the answer pointing past the end of the citation list. */
+  citation_overflow?: number[];
+}
 
 /**
  * Ask a grounded question. The passages backing the answer arrive first as a

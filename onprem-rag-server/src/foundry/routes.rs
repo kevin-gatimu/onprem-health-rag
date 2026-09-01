@@ -17,7 +17,7 @@ use crate::state::AppState;
 /// model plus its higher-parameter siblings in the Settings dropdown.
 const MODEL_FAMILIES: &[&[&str]] = &[
     &["qwen3-4b", "qwen3-8b", "qwen3-14b"],
-    &["phi-4-mini-instruct", "phi-4"],
+    &["phi-4-mini", "phi-4"],
     &["phi-4-mini-reasoning", "phi-4-reasoning"],
     &["mistral-nemo-12b-instruct"],
 ];
@@ -79,6 +79,8 @@ pub struct SelectModelRequest {
 pub struct SelectModelResponse {
     /// Resolved variant id now loaded and selected.
     pub model: String,
+    /// True when the cached weights were corrupt and were purged + re-downloaded.
+    pub repaired: bool,
 }
 
 /// `POST /models/select` — download (if needed), load, and select a chat model. Admin only.
@@ -89,8 +91,8 @@ pub async fn select_model(
     body: Json<SelectModelRequest>,
 ) -> AppResult<Json<SelectModelResponse>> {
     user.require_admin()?;
-    let model = state.foundry()?.select_model(&body.model).await?;
-    Ok(Json(SelectModelResponse { model }))
+    let (model, repaired) = state.foundry()?.select_model(&body.model).await?;
+    Ok(Json(SelectModelResponse { model, repaired }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,7 +112,10 @@ pub async fn generate(
     // (the SSE body itself can't carry a status code).
     let mut stream = state
         .foundry()?
-        .generate_stream("You are a helpful assistant. Answer concisely.", &body.prompt)
+        .generate_stream(
+            "You are a helpful assistant. Answer concisely.",
+            &body.prompt,
+        )
         .await?;
 
     Ok(EventStream! {
@@ -281,18 +286,27 @@ pub async fn model_roles(
             "active",
         ),
         foundry_role(
+            "classify",
+            "Intent classify",
+            AgentKind::Classify,
+            "Intent router Tier 2: a forced tool call that routes an ambiguous question to \
+             conversational, structured, semantic, or hybrid when the cheap lexical pass can't \
+             decide. Cached per question; runs on the NPU to stay off the chat model's iGPU.",
+            "active",
+        ),
+        foundry_role(
             "extractor",
             "Ingestion extractor",
             AgentKind::Extract,
-            "Pulls structured fields from free-text notes at ingest and maps to ICD-10/LOINC. Runs on the NPU to free the iGPU. (Wired in Phase 4.)",
-            "planned",
+            "Pulls structured fields from free-text notes at ingest and maps them to              ICD-10 / RxNorm / LOINC, stored on each record as `extracted`. Runs on the              NPU to free the iGPU. Off unless ONPREM_EXTRACT_ENABLED=true — it adds a              model call per eligible row.",
+            "active",
         ),
         foundry_role(
             "verifier",
             "Faithfulness verifier",
             AgentKind::Verify,
-            "Safety pass: checks every clinical claim is supported by the retrieved passages. (Wired in Phase 4.)",
-            "planned",
+            "Safety pass: checks every clinical claim in an answer is supported by the              retrieved passages, and reports the unsupported ones. Runs after the answer              has streamed, so it delays only the verdict. Off unless              ONPREM_VERIFY_ENABLED=true.",
+            "active",
         ),
         // fastembed / ONNX Runtime roles — not served by Foundry Local.
         ModelRole {
@@ -360,7 +374,8 @@ pub async fn model_roles(
                 .cloned()
                 .collect();
             matching.sort_by(|a, b| {
-                (device_rank(&a.id, &device_pref), &a.id).cmp(&(device_rank(&b.id, &device_pref), &b.id))
+                (device_rank(&a.id, &device_pref), &a.id)
+                    .cmp(&(device_rank(&b.id, &device_pref), &b.id))
             });
             ordered.extend(matching);
         }
@@ -421,8 +436,13 @@ pub async fn set_router(
     body: Json<SetRouterReq>,
 ) -> AppResult<Json<serde_json::Value>> {
     user.require_admin()?;
-    crate::settings::set_router_override(&state.db, &body.role, body.variant_id.as_deref(), &user.username)
-        .await?;
+    crate::settings::set_router_override(
+        &state.db,
+        &body.role,
+        body.variant_id.as_deref(),
+        &user.username,
+    )
+    .await?;
     state.set_router_override_cache(&body.role, body.variant_id.clone());
     if body.role == "chat" {
         if let (Ok(f), Some(v)) = (state.foundry(), body.variant_id.as_ref()) {
@@ -528,6 +548,8 @@ pub struct SetupStatus {
     pub loaded_models: Vec<String>,
     pub cached_models: Vec<String>,
     pub execution_providers: Vec<ExecutionProvider>,
+    /// Host machine facts (never touches Foundry, so always populated).
+    pub server_specs: crate::system::ServerSpecs,
 }
 
 /// `GET /setup-status` — one snapshot for the Settings page. Any authenticated user.
@@ -541,7 +563,10 @@ pub async fn setup_status(state: &State<AppState>, _user: AuthUser) -> Json<Setu
     // GPU from OS-level detection so this field is meaningful even when Foundry is down.
     let devices = super::hardware::detect();
     let gpu_dev = devices.iter().find(|d| d.kind == "GPU");
-    let gpu = GpuInfo { has_gpu: gpu_dev.is_some(), gpu_name: gpu_dev.map(|d| d.name.clone()) };
+    let gpu = GpuInfo {
+        has_gpu: gpu_dev.is_some(),
+        gpu_name: gpu_dev.map(|d| d.name.clone()),
+    };
 
     let foundry_ready = state.foundry().is_ok();
 
@@ -556,8 +581,16 @@ pub async fn setup_status(state: &State<AppState>, _user: AuthUser) -> Json<Setu
         // The native core has no port/URL; report the literal in-process marker.
         foundry_endpoint = "in-process (native SDK)".to_string();
         if let Ok(models) = f.list_models().await {
-            loaded_models = models.iter().filter(|m| m.loaded).map(|m| m.id.clone()).collect();
-            cached_models = models.iter().filter(|m| m.cached).map(|m| m.id.clone()).collect();
+            loaded_models = models
+                .iter()
+                .filter(|m| m.loaded)
+                .map(|m| m.id.clone())
+                .collect();
+            cached_models = models
+                .iter()
+                .filter(|m| m.cached)
+                .map(|m| m.id.clone())
+                .collect();
         }
         if let Ok(hw) = f.hardware() {
             execution_providers = hw.execution_providers;
@@ -602,5 +635,6 @@ pub async fn setup_status(state: &State<AppState>, _user: AuthUser) -> Json<Setu
         loaded_models,
         cached_models,
         execution_providers,
+        server_specs: crate::system::specs(),
     })
 }

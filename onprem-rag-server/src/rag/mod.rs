@@ -173,12 +173,16 @@ pub const SYSTEM_PROMPT: &str = "You are a clinical records assistant. Answer th
     using ONLY the numbered context passages provided. Cite the passages you use inline as [1], \
     [2], etc. If the context does not contain enough information to answer, say you don't have \
     relevant records and do not speculate. Be concise and precise; never invent patient details, \
-    dosages, dates, or values that are not in the context.";
+    dosages, dates, or values that are not in the context. Conversation summary and recent turns \
+    are context for continuity; RECORDS in the numbered context remain the only citable source.";
 
-/// Build the user-message body: numbered context passages followed by the question.
-/// Passage numbering here is 1-based and matches the citation indices the model emits
-/// and the `citations` the route sends to the client.
-pub fn build_prompt(passages: &[Passage], question: &str) -> String {
+/// Build the user-message body: an optional conversation-memory preamble (22.3 —
+/// so the model can act on "shorten your last answer" or "compare that to his
+/// previous visit", not just resolve pronouns at rewrite time), then numbered
+/// context passages, then the question. Passage numbering is 1-based and matches
+/// the citation indices the model emits and the `citations` the route sends to
+/// the client.
+pub fn build_prompt(passages: &[Passage], question: &str, memory: &crate::memory::WorkingMemory) -> String {
     let mut ctx = String::new();
     for (i, p) in passages.iter().enumerate() {
         ctx.push_str(&format!("[{}] {}\n\n", i + 1, p.text.trim()));
@@ -186,7 +190,22 @@ pub fn build_prompt(passages: &[Passage], question: &str) -> String {
     if ctx.is_empty() {
         ctx.push_str("(no relevant records found)\n\n");
     }
-    format!("Context:\n{ctx}Question: {question}")
+
+    let mut preamble = String::new();
+    if let Some(summary) = &memory.summary {
+        preamble.push_str(&format!("Conversation summary: {summary}\n"));
+    }
+    if !memory.tail.is_empty() {
+        preamble.push_str("Recent turns:\n");
+        for t in &memory.tail {
+            preamble.push_str(&format!("{}: {}\n", t.role, t.content));
+        }
+    }
+    if !preamble.is_empty() {
+        preamble.push('\n');
+    }
+
+    format!("{preamble}Context:\n{ctx}Question: {question}")
 }
 
 /// First non-empty line, trimmed of surrounding quotes/whitespace.

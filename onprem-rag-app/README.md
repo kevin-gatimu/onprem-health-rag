@@ -14,7 +14,8 @@ See the repo root [`CLAUDE.md`](../CLAUDE.md) for the full architecture.
 
 ## Prerequisites
 
-- **Node.js** 18+ and npm.
+- **Node.js** 18+ and **pnpm** (`corepack enable pnpm`, or `npm i -g pnpm`). This workspace is
+  pnpm-based — `pnpm-lock.yaml` is the tracked lockfile and `tauri.conf.json` shells out to `pnpm`.
 - **Rust** (stable) + the Tauri v2 system dependencies for your OS — see the
   [Tauri prerequisites guide](https://tauri.app/start/prerequisites/). On Windows that's the
   **WebView2** runtime (preinstalled on Windows 11) and the **MSVC** build tools.
@@ -38,16 +39,16 @@ You can also change the server URL at runtime from the app's settings.
 
 ```bash
 cd onprem-rag-app
-npm install
-npm run tauri dev
+pnpm install
+pnpm tauri dev
 ```
 
 That launches the native window with hot-reload for the React frontend and rebuilds the Rust
 bridge on change. Log in with the seeded admin (`admin` / `password` by default).
 
-> **Frontend-only in a browser:** `npm run dev` starts just the Vite dev server (no native
+> **Frontend-only in a browser:** `pnpm dev` starts just the Vite dev server (no native
 > shell). Useful for pure UI work, but any `@tauri-apps/api` `invoke` call fails outside the Tauri
-> window — use `npm run tauri dev` whenever you need the bridge (login, server calls, SSE).
+> window — use `pnpm tauri dev` whenever you need the bridge (login, server calls, SSE).
 
 Once logged in:
 
@@ -65,28 +66,30 @@ Once logged in:
 ## 3. Build a release bundle
 
 ```bash
-npm run tauri build              # full native installer/executable (frontend + bridge)
+pnpm tauri build                 # full native installer/executable (frontend + bridge)
 ```
 
 Produces a platform installer/executable under `src-tauri/target/release/`. Frontend-only build
 steps (rarely needed on their own — `tauri build` runs them for you):
 
 ```bash
-npm run build                    # tsc && vite build → static frontend in dist/
-npm run preview                  # serve the built frontend to sanity-check the bundle
+pnpm build                       # tsc && vite build → static frontend in dist/
+pnpm preview                     # serve the built frontend to sanity-check the bundle
 ```
 
-The `npm run tauri` script is the raw Tauri CLI passthrough — handy for diagnostics and assets:
+`pnpm tauri` is the raw Tauri CLI passthrough — handy for diagnostics and assets:
 
 ```bash
-npm run tauri info               # environment + version report (attach this to bug reports)
-npm run tauri icon path/to.png   # regenerate app icons from a source image
+pnpm tauri info                  # environment + version report (attach this to bug reports)
+pnpm tauri icon path/to.png      # regenerate app icons from a source image
 ```
 
 ## Android
 
-The app also builds for Android. `src-tauri/gen/android` is already initialised (the Tauri Android
-scaffold is committed) — **do not** re-run `tauri android init`.
+The app also builds for Android. `src-tauri/gen/android` is already initialised and its **source is
+committed** — the `AndroidManifest.xml`, `network_security_config.xml`, package id, and icons carry
+hand edits the build depends on. The regenerable parts (`build/`, `.gradle/`, `local.properties`,
+signing keys) are gitignored. **Do not** re-run `tauri android init` — it would overwrite those edits.
 
 ### Android prerequisites
 
@@ -139,28 +142,101 @@ emulator -avd <avd-name>          # boot one
 ### 2. Run (development, hot-reload)
 
 ```bash
-npm run tauri android dev         # build, install, and launch on the connected device/emulator
+pnpm tauri android dev            # build, install, and launch on the connected device/emulator
 ```
 
 This bundles the frontend, compiles the Rust bridge for Android, installs the debug APK, and
-hot-reloads the React frontend on change — the mobile equivalent of `npm run tauri dev`.
+hot-reloads the React frontend on change — the mobile equivalent of `pnpm tauri dev`. The debug APK
+is auto-signed with the Android debug keystore, so it installs on any device without extra setup.
 
-### 3. Build a release artifact
+### 3. Build an APK (release)
 
 ```bash
-npm run tauri android build       # produces a signed-if-configured APK + AAB
+pnpm tauri android build          # default: builds both APK + AAB, all ABIs (universal)
+pnpm tauri android build --apk    # APK only (skip the Play-Store AAB) — the common case for
+                                  # sideloading / on-prem distribution
 ```
+
+Useful flags (`pnpm tauri android build --help` for the full list):
+
+| Flag                  | Effect                                                                                                                                        |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--apk` / `--aab` | Build only that format (default builds both).                                                                                                 |
+| `--debug`           | Build the**debug** variant (debug-signed, installs immediately — handy for a quick shareable build before you set up release signing). |
+| `--split-per-abi`   | Emit one smaller APK per ABI (`arm64-v8a`, `armeabi-v7a`, `x86`, `x86_64`) instead of one universal APK.                              |
+| `--target <triple>` | Build a single architecture, e.g.`aarch64` for most phones.                                                                                 |
 
 Outputs land under `src-tauri/gen/android/app/build/outputs/`:
 
-- APK — `apk/universal/release/app-universal-release.apk`
-- AAB (for Play Store upload) — `bundle/universalRelease/app-universal-release.aab`
+- **APK** (universal) — `apk/universal/release/app-universal-release.apk`
+- **AAB** (Play Store upload) — `bundle/universalRelease/app-universal-release.aab`
+- with `--split-per-abi`, per-ABI APKs — `apk/<abi>/release/app-<abi>-release.apk`
 
 Install a built APK on a connected device manually with:
 
 ```bash
 adb install -r src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk
 ```
+
+> **A `release` APK must be signed to install.** Out of the box the release variant has **no signing
+> config**, so `pnpm tauri android build` emits `app-universal-release-unsigned.apk`, which Android
+> refuses to install (`INSTALL_PARSE_FAILED_NO_CERTIFICATES`). Either build `--debug` for a quick
+> shareable build, or configure release signing once (next section).
+
+### 4. Sign the release APK
+
+Do this once to produce installable/distributable release builds. The keystore and its passwords are
+**secrets** — the paths below (`*.jks`, `keystore.properties`) are gitignored; never commit them.
+
+**1. Generate a keystore** (keep the `.jks` somewhere safe and backed up — losing it means you can
+never ship an update to the same app identity):
+
+```bash
+keytool -genkey -v -keystore ~/onprem-rag-release.jks \
+  -keyalg RSA -keysize 2048 -validity 10000 -alias onprem-rag
+```
+
+**2. Point the build at it** — create `src-tauri/gen/android/keystore.properties` (gitignored):
+
+```properties
+storeFile=/absolute/path/to/onprem-rag-release.jks
+storePassword=<the store password you set>
+keyAlias=onprem-rag
+keyPassword=<the key password you set>
+```
+
+**3. Wire it into** `src-tauri/gen/android/app/build.gradle.kts` (this file **is** tracked, so the
+wiring persists; only the properties/keystore stay out of git). Load the props near the top, add a
+`signingConfigs` block, and reference it from the `release` build type:
+
+```kotlin
+// near the existing `tauriProperties` block
+val keystoreProperties = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+android {
+    // …
+    signingConfigs {
+        create("release") {
+            keyAlias = keystoreProperties["keyAlias"] as String
+            keyPassword = keystoreProperties["keyPassword"] as String
+            storeFile = file(keystoreProperties["storeFile"] as String)
+            storePassword = keystoreProperties["storePassword"] as String
+        }
+    }
+    buildTypes {
+        getByName("release") {
+            signingConfig = signingConfigs.getByName("release")
+            // …existing isMinifyEnabled / proguardFiles…
+        }
+    }
+}
+```
+
+Re-run `pnpm tauri android build --apk` — the output is now `app-universal-release.apk` (signed),
+ready for `adb install -r`.
 
 ### Connecting to the server from the phone
 
@@ -176,7 +252,7 @@ VITE_DEFAULT_SERVER_URL=http://<host-lan-ip>:8000
 The server binds `0.0.0.0:8000`, so it's reachable on the LAN. Cleartext HTTP is enabled in the
 Android manifest (`android:usesCleartextTraffic="true"`) precisely because on-prem servers are
 reached over plain HTTP on a LAN IP, and the server URL is chosen at runtime (any LAN IP) — Android's
-network-security config keys on concrete domains, so it cannot scope cleartext to an IP range.
+network-security config keys on concrete domains, so it canno.t scope cleartext to an IP range.
 
 > **On the emulator (AVD), use `http://10.0.2.2:8000`.** Inside the emulator `localhost` is the
 > emulator VM itself; `10.0.2.2` is its built-in alias for the **host machine's** loopback. (The

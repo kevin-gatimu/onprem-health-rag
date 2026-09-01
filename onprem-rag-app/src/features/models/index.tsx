@@ -38,6 +38,7 @@ export default function Models() {
   const rolesQuery = useQuery({
     queryKey: ['model-roles'],
     queryFn: getModelRoles,
+    refetchInterval: 12_000, // keep cached/loaded flags live (loads can happen elsewhere)
     staleTime: 30_000,
   });
 

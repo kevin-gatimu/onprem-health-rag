@@ -1,7 +1,7 @@
 // Renders the full conversation: persisted messages from the server query, then
 // the optimistic pending pair (user + assistant) when a run is in flight.
 // Auto-scrolls to the bottom on new content and on mount.
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { MessageSquare } from 'lucide-react';
 import type { StoredMessage } from '../../lib/bridge';
 import type { PendingRun } from '../../stores/chat';
@@ -17,7 +17,20 @@ export default function MessageList({ persisted, pending, activeConvId }: Messag
   const listRef = useRef<HTMLDivElement>(null);
 
   const showPending = pending !== null && pending.conversationId === activeConvId;
-  const hasContent = persisted.length > 0 || showPending;
+
+  // Mid-run refetches (e.g. mobile keyboard blur → refetchOnWindowFocus) can already
+  // contain the persisted copy of the in-flight user message — the server saves it at
+  // request start. Drop that trailing duplicate or the bubble renders twice.
+  const visible = useMemo(() => {
+    if (!showPending || pending === null) return persisted;
+    const last = persisted[persisted.length - 1];
+    if (last && last.role === 'user' && last.content === pending.user) {
+      return persisted.slice(0, -1);
+    }
+    return persisted;
+  }, [persisted, showPending, pending]);
+
+  const hasContent = visible.length > 0 || showPending;
 
   // Scroll to bottom whenever content changes: new persisted messages, new tokens,
   // or phase transitions (e.g. citations arrive while answer is still empty).
@@ -25,7 +38,7 @@ export default function MessageList({ persisted, pending, activeConvId }: Messag
     if (listRef.current) {
       listRef.current.scrollTop = listRef.current.scrollHeight;
     }
-  }, [persisted.length, pending?.answer, pending?.phase]);
+  }, [visible.length, pending?.answer, pending?.phase]);
 
   if (!hasContent) {
     return (
@@ -50,7 +63,7 @@ export default function MessageList({ persisted, pending, activeConvId }: Messag
       {/* Centered cap: keeps message bubbles in a comfortable reading column on wide
           monitors while the scrollbar stays at the pane edge. */}
       <div className="flex flex-col gap-4 max-w-4xl 3xl:max-w-5xl mx-auto w-full">
-        {persisted.map((msg) => (
+        {visible.map((msg) => (
           <MessageBubble key={msg.id} kind="persisted" message={msg} />
         ))}
 
