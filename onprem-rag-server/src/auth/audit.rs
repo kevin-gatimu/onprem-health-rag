@@ -2,7 +2,7 @@
 //! All writes are best-effort — a failure emits a warning and never propagates
 //! to the caller's request path so the user-visible operation always completes.
 
-use crate::documentdb::{DocumentDb, AUDIT_LOG};
+use crate::documentdb::{AUDIT_LOG, DocumentDb};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

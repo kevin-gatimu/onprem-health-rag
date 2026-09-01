@@ -13,6 +13,9 @@
 pub mod routes;
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::broadcast;
 
 use chrono::Utc;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, doc};
@@ -23,14 +26,43 @@ use crate::config::Config;
 use crate::connectors::{self, connector};
 use crate::documentdb::{DocumentDb, RECORDS, vector};
 use crate::embed;
-use crate::error::AppResult;
-
-/// How many chunks to embed + insert per batch. Keeps peak memory bounded and lets
-/// progress advance smoothly on large sources.
-const BATCH_SIZE: usize = 32;
+use crate::error::{AppError, AppResult};
 
 /// Emit a log line every this many rows so large tables aren't silent.
 const LOG_ROW_INTERVAL: i64 = 2500;
+
+#[derive(Clone, Default)]
+pub struct IngestProgressHub {
+    channels: Arc<Mutex<HashMap<String, broadcast::Sender<()>>>>,
+}
+
+impl IngestProgressHub {
+    pub fn register(&self, job_id: &str) -> broadcast::Receiver<()> {
+        let mut channels = self.channels.lock().expect("ingest progress lock poisoned");
+        channels
+            .entry(job_id.to_string())
+            .or_insert_with(|| broadcast::channel(32).0)
+            .subscribe()
+    }
+
+    pub fn subscribe(&self, job_id: &str) -> broadcast::Receiver<()> {
+        self.register(job_id)
+    }
+
+    fn publish(&self, job_id: &str) {
+        if let Ok(channels) = self.channels.lock() {
+            if let Some(sender) = channels.get(job_id) {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn remove(&self, job_id: &str) {
+        if let Ok(mut channels) = self.channels.lock() {
+            channels.remove(job_id);
+        }
+    }
+}
 
 /// A stored record: one embedded chunk of one source row. `_id` is deterministic
 /// (`{source_id}:{table}:{row_pk}:{chunk_index}`) so re-ingesting the same table
@@ -51,6 +83,8 @@ struct RecordDoc {
     text: String,
     #[serde(rename = "contentVector")]
     content_vector: Vec<f32>,
+    ingest_generation: String,
+    active: bool,
     ingested_at: chrono::DateTime<Utc>,
 }
 
@@ -122,7 +156,13 @@ fn log_to_bson(log: &[LogEntry]) -> Bson {
 
 /// Write all progress counters + the current log to the jobs doc. Called after every
 /// batch so the SSE poller always sees a fresh snapshot.
-async fn write_snap(db: &DocumentDb, job_id: &str, s: &Snap<'_>, log: &[LogEntry]) -> AppResult<()> {
+async fn write_snap(
+    db: &DocumentDb,
+    hub: &IngestProgressHub,
+    job_id: &str,
+    s: &Snap<'_>,
+    log: &[LogEntry],
+) -> AppResult<()> {
     db.jobs()
         .update_one(
             doc! { "_id": job_id },
@@ -143,6 +183,7 @@ async fn write_snap(db: &DocumentDb, job_id: &str, s: &Snap<'_>, log: &[LogEntry
             }},
         )
         .await?;
+    hub.publish(job_id);
     Ok(())
 }
 
@@ -177,18 +218,94 @@ async fn upsert_indexed_table(
         .await;
 }
 
+async fn activate_generation(
+    db: &DocumentDb,
+    source_id: &str,
+    table: &str,
+    generation: &str,
+    row_count: i64,
+    vector_count: i64,
+) -> AppResult<()> {
+    let mut session = db.db.client().start_session().await?;
+    session.start_transaction().await?;
+    let result: AppResult<()> = async {
+        db.records()
+            .update_many(
+                doc! { "source_id": source_id, "table": table, "active": true },
+                doc! { "$set": { "active": false } },
+            )
+            .session(&mut session)
+            .await?;
+        db.records()
+            .update_many(
+                doc! { "source_id": source_id, "table": table, "ingest_generation": generation },
+                doc! { "$set": { "active": true } },
+            )
+            .session(&mut session)
+            .await?;
+        db.indexed_tables()
+            .update_one(
+                doc! { "_id": format!("{source_id}:{table}") },
+                doc! { "$set": {
+                    "source_id": source_id,
+                    "source_table": table,
+                    "status": "indexed",
+                    "refresh_status": "idle",
+                    "row_count": row_count,
+                    "vector_count": vector_count,
+                    "active_generation": generation,
+                    "last_ingested": BsonDateTime::now(),
+                    "last_embedded_at": BsonDateTime::now(),
+                } },
+            )
+            .upsert(true)
+            .session(&mut session)
+            .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => session.commit_transaction().await.map_err(Into::into),
+        Err(error) => {
+            let _ = session.abort_transaction().await;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeCheckpoint {
+    pub table: String,
+    pub offset: i64,
+    pub generation: String,
+}
+
 /// Background entry point: run the pipeline and record the outcome on the job doc.
 /// Never panics the task — any error is written back as a failed job.
 pub async fn run(
     db: DocumentDb,
     config: Config,
+    progress_hub: IngestProgressHub,
     source_id: String,
     job_id: String,
     tables: Vec<String>,
     excluded_columns: HashMap<String, Vec<String>>,
     limit: Option<i64>,
+    resume: Option<ResumeCheckpoint>,
 ) {
-    if let Err(e) = execute(&db, &config, &source_id, &job_id, &tables, &excluded_columns, limit).await {
+    if let Err(e) = execute(
+        &db,
+        &config,
+        &progress_hub,
+        &source_id,
+        &job_id,
+        &tables,
+        &excluded_columns,
+        limit,
+        resume.as_ref(),
+    )
+    .await
+    {
         tracing::error!(job = %job_id, error = %e, "ingestion pipeline failed");
         let mut log = vec![];
         push_log(&mut log, "error", &format!("Job failed: {e}"));
@@ -203,7 +320,10 @@ pub async fn run(
                 }},
             )
             .await;
+        progress_hub.publish(&job_id);
     }
+    progress_hub.publish(&job_id);
+    progress_hub.remove(&job_id);
 }
 
 /// The pipeline proper. Returns an error only for catastrophic failures that prevent
@@ -212,11 +332,13 @@ pub async fn run(
 async fn execute(
     db: &DocumentDb,
     config: &Config,
+    progress_hub: &IngestProgressHub,
     source_id: &str,
     job_id: &str,
     tables: &[String],
     excluded_columns: &HashMap<String, Vec<String>>,
     limit: Option<i64>,
+    resume: Option<&ResumeCheckpoint>,
 ) -> AppResult<()> {
     // 1. Ensure vector + full-text indexes exist before writing any records.
     vector::ensure_indexes(db, config.embedding_dims).await?;
@@ -224,9 +346,21 @@ async fn execute(
     // 2. Load + decrypt the source spec.
     let spec = connectors::routes::load_spec(db, config, source_id).await?;
     let conn = connector(&spec);
+    let schema = conn.get_schema().await?;
+
+    let resume_table_index = resume
+        .map(|checkpoint| {
+            tables
+                .iter()
+                .position(|table| table == &checkpoint.table)
+                .ok_or_else(|| {
+                    AppError::BadRequest("checkpoint table is not in the saved request".into())
+                })
+        })
+        .transpose()?;
 
     let total_tables = tables.len() as i64;
-    let mut success_tables = 0i64;
+    let mut success_tables = resume_table_index.unwrap_or(0) as i64;
     let mut failed_tables = 0i64;
     let mut errors_count = 0i64;
     let mut processed_rows = 0i64;
@@ -238,6 +372,9 @@ async fn execute(
 
     // 3. Per-table loop: each table is an independent unit; one failure continues.
     for (table_idx, table) in tables.iter().enumerate() {
+        if resume_table_index.is_some_and(|resume_index| table_idx < resume_index) {
+            continue;
+        }
         let table_index = (table_idx + 1) as i64;
         let empty: Vec<String> = Vec::new();
         let excluded = excluded_columns.get(table.as_str()).unwrap_or(&empty);
@@ -251,12 +388,33 @@ async fn execute(
         );
         tracing::info!(job = %job_id, table, "starting table {table_index}/{total_tables}");
 
-        // Mark the table as "indexing" immediately so the history view reflects it.
-        upsert_indexed_table(db, source_id, table, "indexing", 0, 0, false).await;
+        let table_id = format!("{source_id}:{table}");
+        let previous_generation = db
+            .indexed_tables()
+            .find_one(doc! { "_id": &table_id })
+            .await?
+            .and_then(|document| {
+                document
+                    .get_str("active_generation")
+                    .ok()
+                    .map(str::to_owned)
+            });
+        if previous_generation.is_some() {
+            let _ = db
+                .indexed_tables()
+                .update_one(
+                    doc! { "_id": &table_id },
+                    doc! { "$set": { "refresh_status": "indexing" } },
+                )
+                .await;
+        } else {
+            upsert_indexed_table(db, source_id, table, "indexing", 0, 0, false).await;
+        }
 
         // Write a progress snapshot so the UI shows the current table name.
         let _ = write_snap(
             db,
+            progress_hub,
             job_id,
             &Snap {
                 status: "running",
@@ -291,117 +449,178 @@ async fn execute(
         };
         total_rows_est += table_total;
 
-        // Fetch rows with PII columns already excluded.
-        let rows = match conn.fetch_table(table, excluded, limit).await {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = format!("fetch_table({table}) failed: {e}");
-                tracing::error!(job = %job_id, "{}", msg);
-                push_log(&mut log, "error", &msg);
-                failed_tables += 1;
-                errors_count += 1;
-                upsert_indexed_table(db, source_id, table, "error", 0, 0, false).await;
-                continue;
-            }
+        let order_by = schema
+            .iter()
+            .find(|entry| entry.name == *table)
+            .and_then(|entry| entry.columns.iter().find(|column| column.is_primary_key))
+            .map(|column| column.name.as_str());
+        let resumed_table = resume.filter(|checkpoint| checkpoint.table == *table);
+        let generation = resumed_table
+            .map(|checkpoint| checkpoint.generation.clone())
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let page_size = config.ingest_page_size as i64;
+        let row_limit = limit.unwrap_or(i64::MAX).max(0).min(table_total);
+        let mut offset = resumed_table
+            .map(|checkpoint| checkpoint.offset.clamp(0, row_limit))
+            .unwrap_or(0);
+        let mut table_rows = offset;
+        let mut vector_count = if resumed_table.is_some() {
+            records_coll
+                .count_documents(doc! {
+                    "source_id": source_id,
+                    "table": table,
+                    "ingest_generation": &generation,
+                    "active": false,
+                })
+                .await? as i64
+        } else {
+            0
         };
-        tracing::info!(job = %job_id, table, rows = rows.len(), "fetched rows");
-
-        // Per-table replace: delete only this table's prior records so other tables
-        // remain queryable while this one is re-indexed.
-        let _ = db
-            .records()
-            .delete_many(doc! { "source_id": source_id, "table": table })
-            .await;
-
-        // Chunk each row's text into embed-sized passages.
-        let mut chunks: Vec<Chunk> = Vec::new();
-        for row in rows {
-            let texts = if config.chunk_enabled {
-                chunk_text(&row.text, config.chunk_size_tokens, config.chunk_overlap_tokens)
-            } else {
-                vec![row.text.clone()]
-            };
-            let fields = Value::Object(row.fields);
-            for (ci, text) in texts.into_iter().enumerate() {
-                if text.trim().is_empty() {
-                    continue;
-                }
-                chunks.push(Chunk {
-                    row_pk: row.pk.clone(),
-                    chunk_index: ci as i32,
-                    fields: fields.clone(),
-                    text,
-                    table: table.clone(),
-                });
-            }
-        }
-
-        // Embed + insert in BATCH_SIZE batches, advancing counters after each.
-        let mut table_rows = 0i64;
-        let mut vector_count = 0i64;
         let mut table_failed = false;
 
-        'batches: for batch in chunks.chunks(BATCH_SIZE) {
-            let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
-            let vectors = match embed::embed_documents(config, texts).await {
-                Ok(v) => v,
+        db.jobs()
+            .update_one(
+                doc! { "_id": job_id },
+                doc! { "$set": {
+                    "checkpoint_table": table,
+                    "checkpoint_offset": offset,
+                    "checkpoint_generation": &generation,
+                } },
+            )
+            .await?;
+
+        'pages: while offset < row_limit {
+            let requested = page_size.min(row_limit - offset);
+            let rows = match conn
+                .fetch_table_page(table, excluded, order_by, offset, requested)
+                .await
+            {
+                Ok(rows) => rows,
                 Err(e) => {
-                    let msg = format!("embed failed for table {table}: {e}");
+                    let msg = format!("fetch_table_page({table}, offset={offset}) failed: {e}");
                     tracing::error!(job = %job_id, "{}", msg);
                     push_log(&mut log, "error", &msg);
                     errors_count += 1;
                     table_failed = true;
-                    break 'batches;
+                    break 'pages;
                 }
             };
-
-            let docs: Vec<RecordDoc> = batch
-                .iter()
-                .zip(vectors)
-                .map(|(c, vector)| RecordDoc {
-                    // Include table in the _id so chunks from different tables never collide.
-                    id: format!("{source_id}:{}:{}:{}", c.table, c.row_pk, c.chunk_index),
-                    source_id: source_id.to_string(),
-                    table: c.table.clone(),
-                    row_pk: c.row_pk.clone(),
-                    chunk_index: c.chunk_index,
-                    fields: c.fields.clone(),
-                    text: c.text.clone(),
-                    content_vector: vector,
-                    ingested_at: Utc::now(),
+            if rows.is_empty() {
+                break;
+            }
+            let fetched_rows = rows.len() as i64;
+            // A crash can leave a partially inserted page. Replaying the checkpointed
+            // page first removes only that generation's affected rows, making retry safe.
+            let row_pks: Vec<String> = rows.iter().map(|row| row.pk.clone()).collect();
+            let deleted = records_coll
+                .delete_many(doc! {
+                    "source_id": source_id,
+                    "table": table,
+                    "ingest_generation": &generation,
+                    "active": false,
+                    "row_pk": { "$in": &row_pks },
                 })
-                .collect();
-
-            if !docs.is_empty() {
-                if let Err(e) = records_coll.insert_many(&docs).await {
-                    let msg = format!("insert failed for table {table}: {e}");
-                    tracing::error!(job = %job_id, "{}", msg);
-                    push_log(&mut log, "error", &msg);
-                    errors_count += 1;
-                    table_failed = true;
-                    break 'batches;
+                .await?;
+            vector_count = vector_count.saturating_sub(deleted.deleted_count as i64);
+            let mut chunks = Vec::new();
+            for row in rows {
+                let texts = if config.chunk_enabled {
+                    chunk_text(
+                        &row.text,
+                        config.chunk_size_tokens,
+                        config.chunk_overlap_tokens,
+                    )
+                } else {
+                    vec![row.text.clone()]
+                };
+                let fields = Value::Object(row.fields);
+                for (ci, text) in texts.into_iter().enumerate() {
+                    if !text.trim().is_empty() {
+                        chunks.push(Chunk {
+                            row_pk: row.pk.clone(),
+                            chunk_index: ci as i32,
+                            fields: fields.clone(),
+                            text,
+                            table: table.clone(),
+                        });
+                    }
                 }
-                // Accumulate UTF-8 bytes of embedded text as a proxy for "DB growth".
-                let batch_bytes: i64 = batch.iter().map(|c| c.text.len() as i64).sum();
-                db_size_bytes += batch_bytes;
-                vector_count += docs.len() as i64;
             }
 
-            table_rows += batch.len() as i64;
-            processed_rows += batch.len() as i64;
+            for batch in chunks.chunks(config.ingest_embed_batch_size) {
+                let texts: Vec<String> = batch.iter().map(|chunk| chunk.text.clone()).collect();
+                let vectors = match embed::embed_documents(config, texts).await {
+                    Ok(vectors) => vectors,
+                    Err(e) => {
+                        let msg = format!("embed failed for table {table}: {e}");
+                        tracing::error!(job = %job_id, "{}", msg);
+                        push_log(&mut log, "error", &msg);
+                        errors_count += 1;
+                        table_failed = true;
+                        break 'pages;
+                    }
+                };
+                let docs: Vec<RecordDoc> = batch
+                    .iter()
+                    .zip(vectors)
+                    .map(|(chunk, vector)| RecordDoc {
+                        id: format!(
+                            "{source_id}:{}:{}:{}:{generation}",
+                            chunk.table, chunk.row_pk, chunk.chunk_index
+                        ),
+                        source_id: source_id.to_string(),
+                        table: chunk.table.clone(),
+                        row_pk: chunk.row_pk.clone(),
+                        chunk_index: chunk.chunk_index,
+                        fields: chunk.fields.clone(),
+                        text: chunk.text.clone(),
+                        content_vector: vector,
+                        ingest_generation: generation.clone(),
+                        active: false,
+                        ingested_at: Utc::now(),
+                    })
+                    .collect();
+                if !docs.is_empty() {
+                    if let Err(e) = records_coll.insert_many(&docs).await {
+                        let msg = format!("insert failed for table {table}: {e}");
+                        tracing::error!(job = %job_id, "{}", msg);
+                        push_log(&mut log, "error", &msg);
+                        errors_count += 1;
+                        table_failed = true;
+                        break 'pages;
+                    }
+                    db_size_bytes += batch
+                        .iter()
+                        .map(|chunk| chunk.text.len() as i64)
+                        .sum::<i64>();
+                    vector_count += docs.len() as i64;
+                }
+            }
+            if table_failed {
+                break;
+            }
 
-            // Periodic log line so large tables aren't silent.
-            if table_rows > 0 && table_rows % LOG_ROW_INTERVAL < BATCH_SIZE as i64 {
+            offset += fetched_rows;
+            table_rows += fetched_rows;
+            processed_rows += fetched_rows;
+            let _ = db
+                .jobs()
+                .update_one(
+                    doc! { "_id": job_id },
+                    doc! { "$set": { "checkpoint_table": table, "checkpoint_offset": offset } },
+                )
+                .await;
+
+            if table_rows > 0 && table_rows % LOG_ROW_INTERVAL < page_size {
                 push_log(
                     &mut log,
                     "info",
                     &format!("Table {table}: {table_rows} rows processed…"),
                 );
             }
-
-            // Write the full progress snapshot after every batch.
             let _ = write_snap(
                 db,
+                progress_hub,
                 job_id,
                 &Snap {
                     status: "running",
@@ -409,7 +628,7 @@ async fn execute(
                     total_tables,
                     current_table: table,
                     table_rows,
-                    table_total,
+                    table_total: row_limit,
                     processed_rows,
                     total_rows: total_rows_est,
                     errors: errors_count,
@@ -420,26 +639,62 @@ async fn execute(
                 &log,
             )
             .await;
+
+            if fetched_rows < requested {
+                break;
+            }
         }
 
-        // Update per-table outcome.
+        // Update per-table outcome. A failed refresh never replaces the prior active generation.
+        // Stop at the first failure so the durable checkpoint unambiguously identifies
+        // the generation and page from which a resume must continue.
+        let mut stop_after_table = false;
         if table_failed {
             failed_tables += 1;
-            upsert_indexed_table(db, source_id, table, "error", table_rows, vector_count, false)
+            stop_after_table = true;
+            if previous_generation.is_some() {
+                let _ = db
+                    .indexed_tables()
+                    .update_one(
+                        doc! { "_id": &table_id },
+                        doc! { "$set": { "refresh_status": "error" } },
+                    )
+                    .await;
+            } else {
+                upsert_indexed_table(
+                    db,
+                    source_id,
+                    table,
+                    "error",
+                    table_rows,
+                    vector_count,
+                    false,
+                )
                 .await;
+            }
             tracing::error!(job = %job_id, table, "table ingestion failed");
+        } else if let Err(error) =
+            activate_generation(db, source_id, table, &generation, table_rows, vector_count).await
+        {
+            failed_tables += 1;
+            errors_count += 1;
+            stop_after_table = true;
+            push_log(
+                &mut log,
+                "error",
+                &format!("cutover failed for table {table}: {error}"),
+            );
         } else {
             success_tables += 1;
-            upsert_indexed_table(
-                db,
-                source_id,
-                table,
-                "indexed",
-                table_rows,
-                vector_count,
-                true,
-            )
-            .await;
+            let _ = db
+                .records()
+                .delete_many(doc! {
+                    "source_id": source_id,
+                    "table": table,
+                    "active": false,
+                    "ingest_generation": { "$ne": &generation },
+                })
+                .await;
             push_log(
                 &mut log,
                 "success",
@@ -448,6 +703,10 @@ async fn execute(
                 ),
             );
             tracing::info!(job = %job_id, table, rows = table_rows, vectors = vector_count, "table ingestion complete");
+        }
+
+        if stop_after_table {
+            break;
         }
     }
 
@@ -460,13 +719,15 @@ async fn execute(
         "failed"
     };
 
-    let final_level = if final_status == "completed" { "success" } else { "error" };
+    let final_level = if final_status == "completed" {
+        "success"
+    } else {
+        "error"
+    };
     push_log(
         &mut log,
         final_level,
-        &format!(
-            "Ingestion {final_status}: {success_tables} succeeded, {failed_tables} failed"
-        ),
+        &format!("Ingestion {final_status}: {success_tables} succeeded, {failed_tables} failed"),
     );
     tracing::info!(job = %job_id, status = final_status, success_tables, failed_tables, "ingestion finished");
 
@@ -492,6 +753,7 @@ async fn execute(
             }},
         )
         .await?;
+    progress_hub.publish(job_id);
 
     Ok(())
 }

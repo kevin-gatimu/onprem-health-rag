@@ -29,9 +29,7 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 static QUERY_CACHE: OnceLock<Mutex<LruCache<String, Vec<f32>>>> = OnceLock::new();
 
 fn query_cache() -> &'static Mutex<LruCache<String, Vec<f32>>> {
-    QUERY_CACHE.get_or_init(|| {
-        Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap()))
-    })
+    QUERY_CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(1024).unwrap())))
 }
 
 /// Map the configured model name to a fastembed variant. Defaults to BGE-M3.
@@ -40,7 +38,10 @@ fn resolve_model(name: &str) -> EmbeddingModel {
         "bge-m3" | "bgem3" | "baai/bge-m3" => EmbeddingModel::BGEM3,
         // Unknown name: fall back to BGE-M3 (the project default) with a warning.
         other => {
-            tracing::warn!(model = other, "unknown embedding model; falling back to bge-m3");
+            tracing::warn!(
+                model = other,
+                "unknown embedding model; falling back to bge-m3"
+            );
             EmbeddingModel::BGEM3
         }
     }
@@ -52,7 +53,9 @@ fn get_or_init(model: EmbeddingModel) -> AppResult<&'static Mutex<TextEmbedding>
     if let Some(e) = EMBEDDER.get() {
         return Ok(e);
     }
-    let _guard = INIT_LOCK.lock().map_err(|_| AppError::Internal("embedder init lock poisoned".into()))?;
+    let _guard = INIT_LOCK
+        .lock()
+        .map_err(|_| AppError::Internal("embedder init lock poisoned".into()))?;
     // Re-check under the lock: another caller may have initialised while we waited.
     if let Some(e) = EMBEDDER.get() {
         return Ok(e);
@@ -62,7 +65,9 @@ fn get_or_init(model: EmbeddingModel) -> AppResult<&'static Mutex<TextEmbedding>
         .map_err(|e| AppError::Internal(format!("failed to load embedding model: {e}")))?;
     // `set` only fails if another thread won the race; either way EMBEDDER is now set.
     let _ = EMBEDDER.set(Mutex::new(te));
-    EMBEDDER.get().ok_or_else(|| AppError::Internal("embedder disappeared after init".into()))
+    EMBEDDER
+        .get()
+        .ok_or_else(|| AppError::Internal("embedder disappeared after init".into()))
 }
 
 /// Embed a batch of texts, returning one vector per input (order preserved). Runs on
@@ -76,9 +81,12 @@ async fn embed_batch(config: &Config, texts: Vec<String>) -> AppResult<Vec<Vec<f
 
     let vectors = tokio::task::spawn_blocking(move || -> AppResult<Vec<Vec<f32>>> {
         let lock = get_or_init(model)?;
-        let mut te = lock.lock().map_err(|_| AppError::Internal("embedder lock poisoned".into()))?;
+        let mut te = lock
+            .lock()
+            .map_err(|_| AppError::Internal("embedder lock poisoned".into()))?;
         // `None` lets fastembed pick its default internal batch size.
-        te.embed(texts, None).map_err(|e| AppError::Internal(format!("embedding failed: {e}")))
+        te.embed(texts, None)
+            .map_err(|e| AppError::Internal(format!("embedding failed: {e}")))
     })
     .await
     .map_err(|e| AppError::Internal(format!("embedding task panicked: {e}")))??;
@@ -108,7 +116,10 @@ pub async fn embed_queries(config: &Config, queries: Vec<String>) -> AppResult<V
     if queries.is_empty() {
         return Ok(Vec::new());
     }
-    let keys: Vec<String> = queries.iter().map(|q| q.trim().to_ascii_lowercase()).collect();
+    let keys: Vec<String> = queries
+        .iter()
+        .map(|q| q.trim().to_ascii_lowercase())
+        .collect();
     let mut results: Vec<Option<Vec<f32>>> = vec![None; keys.len()];
     let mut miss_indices: Vec<usize> = Vec::new();
 
@@ -143,5 +154,6 @@ pub async fn embed_queries(config: &Config, queries: Vec<String>) -> AppResult<V
 /// Embed a single query for retrieval (cached via `embed_queries`).
 pub async fn embed_query(config: &Config, query: &str) -> AppResult<Vec<f32>> {
     let mut out = embed_queries(config, vec![query.to_string()]).await?;
-    out.pop().ok_or_else(|| AppError::Internal("embedding produced no vector".into()))
+    out.pop()
+        .ok_or_else(|| AppError::Internal("embedding produced no vector".into()))
 }

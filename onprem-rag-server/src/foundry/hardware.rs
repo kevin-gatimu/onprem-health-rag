@@ -53,7 +53,8 @@ fn detect_uncached() -> Vec<DetectedDevice> {
 /// Infer a vendor from a device name via substring match (case-insensitive).
 fn vendor_of(name: &str) -> String {
     let n = name.to_ascii_lowercase();
-    if n.contains("nvidia") || n.contains("geforce") || n.contains("quadro") || n.contains("tesla") {
+    if n.contains("nvidia") || n.contains("geforce") || n.contains("quadro") || n.contains("tesla")
+    {
         "NVIDIA"
     } else if n.contains("intel") {
         "Intel"
@@ -119,17 +120,29 @@ $npus = @(Get-CimInstance Win32_PnPEntity |
     if let Some(cpu) = raw.cpu.filter(|s| !s.trim().is_empty()) {
         let cpu = cpu.trim().to_string();
         let vendor = vendor_of(&cpu);
-        devices.push(DetectedDevice { kind: "CPU".into(), name: cpu, vendor });
+        devices.push(DetectedDevice {
+            kind: "CPU".into(),
+            name: cpu,
+            vendor,
+        });
     }
     for gpu in raw.gpus.into_iter().filter(|s| !s.trim().is_empty()) {
         let gpu = gpu.trim().to_string();
         let vendor = vendor_of(&gpu);
-        devices.push(DetectedDevice { kind: "GPU".into(), name: gpu, vendor });
+        devices.push(DetectedDevice {
+            kind: "GPU".into(),
+            name: gpu,
+            vendor,
+        });
     }
     for npu in raw.npus.into_iter().filter(|s| !s.trim().is_empty()) {
         let npu = npu.trim().to_string();
         let vendor = vendor_of(&npu);
-        devices.push(DetectedDevice { kind: "NPU".into(), name: npu, vendor });
+        devices.push(DetectedDevice {
+            kind: "NPU".into(),
+            name: npu,
+            vendor,
+        });
     }
     Ok(devices)
 }

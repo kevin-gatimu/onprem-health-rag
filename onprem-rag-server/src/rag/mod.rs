@@ -29,7 +29,11 @@ pub struct ChatTurn {
 
 /// Fold conversation history into a single standalone query. Returns the original
 /// question unchanged when there's no history or the rewrite is unusable.
-pub async fn rewrite_query(foundry: &FoundryManager, history: &[ChatTurn], question: &str) -> String {
+pub async fn rewrite_query(
+    foundry: &FoundryManager,
+    history: &[ChatTurn],
+    question: &str,
+) -> String {
     if history.is_empty() {
         return question.to_string();
     }
@@ -41,11 +45,16 @@ pub async fn rewrite_query(foundry: &FoundryManager, history: &[ChatTurn], quest
     let system = "You rewrite a follow-up question into a standalone search query using the \
                   conversation for context. Resolve pronouns and references. Output ONLY the \
                   rewritten query on a single line, with no preamble or quotes.";
-    let user = format!("Conversation:\n{convo}\n\nFollow-up question: {question}\n\nStandalone query:");
+    let user =
+        format!("Conversation:\n{convo}\n\nFollow-up question: {question}\n\nStandalone query:");
     match foundry.complete(system, &user).await {
         Ok(text) => {
             let line = first_line(&text);
-            if line.is_empty() { question.to_string() } else { line }
+            if line.is_empty() {
+                question.to_string()
+            } else {
+                line
+            }
         }
         Err(e) => {
             tracing::warn!(error = %e, "query rewrite failed; using original question");
@@ -59,7 +68,7 @@ pub async fn rewrite_query(foundry: &FoundryManager, history: &[ChatTurn], quest
 /// target including the primary. Best-effort: on failure it's just `[query]`.
 pub async fn expand_queries(foundry: &FoundryManager, config: &Config, query: &str) -> Vec<String> {
     let mut out = vec![query.to_string()];
-    if !config.multi_query_enabled || config.multi_query_count <= 1 {
+    if !config.multi_query_enabled || config.multi_query_count <= 1 || skip_expansion(query) {
         return out;
     }
     let extra = config.multi_query_count - 1;
@@ -86,6 +95,24 @@ pub async fn expand_queries(foundry: &FoundryManager, config: &Config, query: &s
     out
 }
 
+/// Cheap, deterministic queries already carry enough lexical signal and do not justify
+/// a model round-trip for expansion.
+fn skip_expansion(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.split_whitespace().count() <= 3 || trimmed.contains('"') {
+        return true;
+    }
+    trimmed.split_whitespace().any(|token| {
+        let token =
+            token.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '.');
+        token.len() >= 3
+            && token.chars().any(|c| c.is_ascii_digit())
+            && token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    })
+}
+
 /// Rewrite and expand queries in one step. When there is no history, the original
 /// question is returned as-is (no model call). When there is history AND multi-query
 /// expansion is enabled, a single model call produces both the standalone rewrite and
@@ -98,7 +125,8 @@ pub async fn prepare_queries(
     history: &[ChatTurn],
     question: &str,
 ) -> (String, Vec<String>) {
-    let want_expansion = config.multi_query_enabled && config.multi_query_count > 1;
+    let want_expansion =
+        config.multi_query_enabled && config.multi_query_count > 1 && !skip_expansion(question);
 
     // No history: standalone is the original question. Optionally expand.
     if history.is_empty() {
@@ -175,6 +203,34 @@ pub const SYSTEM_PROMPT: &str = "You are a clinical records assistant. Answer th
     relevant records and do not speculate. Be concise and precise; never invent patient details, \
     dosages, dates, or values that are not in the context.";
 
+/// Enforce deterministic approximate-token budgets before citations are serialized.
+/// Source projections are whitespace-delimited, so word count is a conservative and
+/// model-independent proxy that avoids loading a tokenizer on the request path.
+pub fn apply_context_budget(
+    passages: Vec<Passage>,
+    total_tokens: usize,
+    per_row_tokens: usize,
+) -> Vec<Passage> {
+    let mut remaining = total_tokens;
+    let per_row_tokens = per_row_tokens.min(total_tokens);
+    let mut bounded = Vec::new();
+
+    for mut passage in passages {
+        let allowance = remaining.min(per_row_tokens);
+        if allowance == 0 {
+            break;
+        }
+        let words: Vec<&str> = passage.text.split_whitespace().take(allowance).collect();
+        if words.is_empty() {
+            continue;
+        }
+        remaining = remaining.saturating_sub(words.len());
+        passage.text = words.join(" ");
+        bounded.push(passage);
+    }
+    bounded
+}
+
 /// Build the user-message body: numbered context passages followed by the question.
 /// Passage numbering here is 1-based and matches the citation indices the model emits
 /// and the `citations` the route sends to the client.
@@ -205,4 +261,48 @@ fn strip_list_marker(line: &str) -> String {
         .trim_start_matches(|c: char| c.is_ascii_digit())
         .trim_start_matches(['.', ')', '-', '*', ' ']);
     l.trim_matches(|c| c == '"' || c == '\'').trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn passage(id: &str, text: &str) -> Passage {
+        Passage {
+            id: id.to_string(),
+            source_id: "source".to_string(),
+            table: "encounters".to_string(),
+            row_pk: id.to_string(),
+            chunk_index: 0,
+            text: text.to_string(),
+            fields: serde_json::json!({}),
+            score: 0.9,
+            reranked: true,
+            vector_rank: Some(1),
+            text_rank: Some(2),
+            fused_score: 0.03,
+            rerank_score: Some(0.9),
+        }
+    }
+
+    #[test]
+    fn context_budget_caps_each_row_and_total() {
+        let bounded = apply_context_budget(
+            vec![
+                passage("one", "one two three four five"),
+                passage("two", "six seven eight nine ten"),
+            ],
+            5,
+            3,
+        );
+
+        assert_eq!(bounded.len(), 2);
+        assert_eq!(bounded[0].text, "one two three");
+        assert_eq!(bounded[1].text, "six seven");
+    }
+
+    #[test]
+    fn zero_context_budget_removes_all_passages() {
+        assert!(apply_context_budget(vec![passage("one", "one")], 0, 10).is_empty());
+    }
 }

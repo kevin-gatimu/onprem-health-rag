@@ -208,43 +208,79 @@ mod tests {
 
     #[test]
     fn trend_markers_recognised() {
-        assert_eq!(classify_lexical("Show trend of malaria cases per month"), Some(QueryIntent::Trend));
-        assert_eq!(classify_lexical("Malaria over time"), Some(QueryIntent::Trend));
+        assert_eq!(
+            classify_lexical("Show trend of malaria cases per month"),
+            Some(QueryIntent::Trend)
+        );
+        assert_eq!(
+            classify_lexical("Malaria over time"),
+            Some(QueryIntent::Trend)
+        );
     }
 
     #[test]
     fn aggregation_markers_recognised() {
-        assert_eq!(classify_lexical("How many patients have diabetes?"), Some(QueryIntent::Aggregation));
-        assert_eq!(classify_lexical("Most common diagnoses"), Some(QueryIntent::Aggregation));
-        assert_eq!(classify_lexical("Top 10 diagnoses by count"), Some(QueryIntent::Aggregation));
+        assert_eq!(
+            classify_lexical("How many patients have diabetes?"),
+            Some(QueryIntent::Aggregation)
+        );
+        assert_eq!(
+            classify_lexical("Most common diagnoses"),
+            Some(QueryIntent::Aggregation)
+        );
+        assert_eq!(
+            classify_lexical("Top 10 diagnoses by count"),
+            Some(QueryIntent::Aggregation)
+        );
     }
 
     #[test]
     fn enumeration_markers_recognised() {
-        assert_eq!(classify_lexical("list all patients"), Some(QueryIntent::Enumeration));
-        assert_eq!(classify_lexical("who are the patients"), Some(QueryIntent::Enumeration));
-        assert_eq!(classify_lexical("show all records"), Some(QueryIntent::Enumeration));
+        assert_eq!(
+            classify_lexical("list all patients"),
+            Some(QueryIntent::Enumeration)
+        );
+        assert_eq!(
+            classify_lexical("who are the patients"),
+            Some(QueryIntent::Enumeration)
+        );
+        assert_eq!(
+            classify_lexical("show all records"),
+            Some(QueryIntent::Enumeration)
+        );
     }
 
     #[test]
     fn enumeration_takes_priority_over_aggregation() {
         // "list all" should win over "how many" if both appear.
-        assert_eq!(classify_lexical("list all patients and how many there are"), Some(QueryIntent::Enumeration));
+        assert_eq!(
+            classify_lexical("list all patients and how many there are"),
+            Some(QueryIntent::Enumeration)
+        );
     }
 
     #[test]
     fn how_many_is_aggregation_not_enumeration() {
-        assert_eq!(classify_lexical("how many patients have diabetes?"), Some(QueryIntent::Aggregation));
+        assert_eq!(
+            classify_lexical("how many patients have diabetes?"),
+            Some(QueryIntent::Aggregation)
+        );
     }
 
     #[test]
     fn lookup_recognised() {
-        assert_eq!(classify_lexical("Find patient P-001234"), Some(QueryIntent::Lookup));
+        assert_eq!(
+            classify_lexical("Find patient P-001234"),
+            Some(QueryIntent::Lookup)
+        );
     }
 
     #[test]
     fn narrative_recognised() {
-        assert_eq!(classify_lexical("Explain what hypertension means"), Some(QueryIntent::Narrative));
+        assert_eq!(
+            classify_lexical("Explain what hypertension means"),
+            Some(QueryIntent::Narrative)
+        );
     }
 
     #[test]

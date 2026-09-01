@@ -21,17 +21,23 @@ pub async fn seed_admin(db: &DocumentDb, config: &Config) -> AppResult<()> {
     // --- Email backfill ----------------------------------------------------------
     // Must run before `ensure_user_indexes` creates the unique email index.
     // Uses an aggregation-pipeline update so a single round trip handles all rows.
-    match db.db.run_command(doc! {
-        "update": USERS,
-        "updates": [{
-            "q": { "$or": [{ "email": { "$exists": false } }, { "email": "" }] },
-            "u": [{ "$set": { "email": { "$concat": ["$username", "@localhost"] } } }],
-            "multi": true
-        }]
-    }).await {
+    match db
+        .db
+        .run_command(doc! {
+            "update": USERS,
+            "updates": [{
+                "q": { "$or": [{ "email": { "$exists": false } }, { "email": "" }] },
+                "u": [{ "$set": { "email": { "$concat": ["$username", "@localhost"] } } }],
+                "multi": true
+            }]
+        })
+        .await
+    {
         Ok(r) => {
             // `nModified` is i32 in the wire protocol; fall back to i64 defensively.
-            let n = r.get_i32("nModified").map(|v| v as i64)
+            let n = r
+                .get_i32("nModified")
+                .map(|v| v as i64)
                 .or_else(|_| r.get_i64("nModified"))
                 .unwrap_or(0);
             if n > 0 {
@@ -43,7 +49,9 @@ pub async fn seed_admin(db: &DocumentDb, config: &Config) -> AppResult<()> {
 
     // --- Admin seed --------------------------------------------------------------
     let users = db.collection::<User>(USERS);
-    let existing = users.find_one(doc! { "username": &config.admin_username }).await?;
+    let existing = users
+        .find_one(doc! { "username": &config.admin_username })
+        .await?;
     if existing.is_some() {
         tracing::debug!(user = %config.admin_username, "admin already present; skipping seed");
         return Ok(());

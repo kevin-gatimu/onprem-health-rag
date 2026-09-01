@@ -58,8 +58,12 @@ lerna-debug.log*
 *.sln
 *.sw?
 
-# ── Claude Code ──────────────────────────────────────────────────────────────
-# Machine-local settings (permissions etc.) stay local; project skills are tracked.
+# ── Evaluation output ────────────────────────────────────────────────────────
+/eval/reports/
+
+# ── Agent tooling ────────────────────────────────────────────────────────────
+# Machine-local agent skills and settings stay local.
+/.agents/
 .claude/settings.local.json
 
 # ── OS cruft ──────────────────────────────────────────────────────────────────

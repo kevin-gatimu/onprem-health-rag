@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use crate::state::Bridge;
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
+use futures_util::{
+    future::{AbortHandle, Abortable},
+    StreamExt,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{Emitter, State};
@@ -47,7 +50,11 @@ pub fn get_server_url(bridge: State<'_, Bridge>) -> String {
 /// Point the bridge at a different server. Also persists the URL to the store so
 /// it survives an app restart (critical on Android where the OS kills backgrounded apps).
 #[tauri::command]
-pub fn set_server_url(url: String, app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+pub fn set_server_url(
+    url: String,
+    app: tauri::AppHandle,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("server URL must not be empty".into());
@@ -100,7 +107,10 @@ pub async fn login(
         return Err(format!("login failed: HTTP {}", resp.status()));
     }
 
-    let body: LoginResponse = resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
+    let body: LoginResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
     // Clone the token so we can both store it in the Bridge and persist it to disk.
     bridge.set_token(Some(body.token.clone()));
     let store = app.store("bridge-store.json").map_err(|e| e.to_string())?;
@@ -123,7 +133,9 @@ pub async fn me(bridge: State<'_, Bridge>) -> Result<UserInfo, String> {
         .map_err(|e| format!("request failed: {e}"))?;
 
     check_auth(&bridge, &resp)?;
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// Clear the stored token from both the Bridge and the persistent store.
@@ -132,6 +144,7 @@ pub async fn me(bridge: State<'_, Bridge>) -> Result<UserInfo, String> {
 /// logout must always succeed.
 #[tauri::command]
 pub async fn logout(app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+    bridge.abort_all_runs();
     // Best-effort server-side revocation: bump our token_version so this token
     // dies immediately, not just at expiry. Any failure is ignored — local
     // logout must always succeed.
@@ -174,7 +187,9 @@ pub async fn list_users(bridge: State<'_, Bridge>) -> Result<Vec<UserInfo>, Stri
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<UserInfo>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<UserInfo>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /auth/users` — create a new user. Admin only.
@@ -209,7 +224,9 @@ pub async fn create_user(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /auth/users/<id>` — update a user's name, email, or role. Admin only.
@@ -239,7 +256,9 @@ pub async fn update_user(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /auth/users/<id>` — delete a user. Admin only. Ignores the `{ok:true}` body.
@@ -303,7 +322,9 @@ pub async fn update_me(name: String, bridge: State<'_, Bridge>) -> Result<UserIn
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /auth/me/password` — change own password. Any authenticated user.
@@ -367,7 +388,9 @@ pub async fn get_stats(bridge: State<'_, Bridge>) -> Result<DashboardStats, Stri
         .map_err(|e| format!("request failed: {e}"))?;
 
     check_auth(&bridge, &resp)?;
-    resp.json::<DashboardStats>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<DashboardStats>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +499,9 @@ pub async fn get_hardware(bridge: State<'_, Bridge>) -> Result<HardwareInfo, Str
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<HardwareInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<HardwareInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /models` — the Foundry Local catalog with cached/loaded state.
@@ -495,7 +520,9 @@ pub async fn list_models(bridge: State<'_, Bridge>) -> Result<Vec<ModelSummary>,
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<ModelSummary>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<ModelSummary>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /models/select` — download (if needed), load, and select a chat model. Admin only.
@@ -515,8 +542,10 @@ pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<St
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    let body: SelectModelResponse =
-        resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
+    let body: SelectModelResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
     Ok(body.model)
 }
 
@@ -573,7 +602,9 @@ pub async fn delete_model(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /hardware/register-eps` — download + register all available execution providers
@@ -593,7 +624,9 @@ pub async fn register_eps(bridge: State<'_, Bridge>) -> Result<EpRegistration, S
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /models/roles` — the roles this deployment uses and which models serve them.
@@ -613,7 +646,9 @@ pub async fn model_roles(bridge: State<'_, Bridge>) -> Result<Vec<ModelRole>, St
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<ModelRole>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<ModelRole>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /generate` — stream a test completion. Consumes the server SSE and
@@ -769,7 +804,9 @@ pub async fn get_setup_status(bridge: State<'_, Bridge>) -> Result<SetupStatus, 
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SetupStatus>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SetupStatus>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /models/unload` — unload a variant from memory without deleting its
@@ -864,18 +901,25 @@ pub async fn list_sources(bridge: State<'_, Bridge>) -> Result<Vec<SourceInfo>, 
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<SourceInfo>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<SourceInfo>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /sources/test` — connect and verify without saving. Admin only.
 #[tauri::command]
 pub async fn test_source(source: SourceInput, bridge: State<'_, Bridge>) -> Result<(), String> {
-    post_source("/sources/test", &source, &bridge).await.map(|_| ())
+    post_source("/sources/test", &source, &bridge)
+        .await
+        .map(|_| ())
 }
 
 /// `POST /sources` — test then save (password encrypted server-side). Admin only.
 #[tauri::command]
-pub async fn save_source(source: SourceInput, bridge: State<'_, Bridge>) -> Result<SourceInfo, String> {
+pub async fn save_source(
+    source: SourceInput,
+    bridge: State<'_, Bridge>,
+) -> Result<SourceInfo, String> {
     let value = post_source("/sources", &source, &bridge).await?;
     serde_json::from_value(value).map_err(|e| format!("invalid response: {e}"))
 }
@@ -900,7 +944,9 @@ async fn post_source(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /sources/<id>` — edit a saved source. Admin only.
@@ -924,12 +970,17 @@ pub async fn update_source(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SourceInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SourceInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /sources/<id>/test` — re-test a saved source, persisting the outcome. Admin only.
 #[tauri::command]
-pub async fn test_saved_source(id: String, bridge: State<'_, Bridge>) -> Result<SourceInfo, String> {
+pub async fn test_saved_source(
+    id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SourceInfo, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url(&format!("/sources/{id}/test"));
     let resp = bridge
@@ -943,7 +994,9 @@ pub async fn test_saved_source(id: String, bridge: State<'_, Bridge>) -> Result<
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SourceInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SourceInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /sources/<id>` — remove a source and its ingested records. Admin only.
@@ -1107,7 +1160,10 @@ pub async fn start_ingest(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    let started: IngestStarted = resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
+    let started: IngestStarted = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
     let job_id = started.job_id;
 
     // Follow the progress stream to completion.
@@ -1179,7 +1235,9 @@ pub async fn get_schema(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<TableSchema>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<TableSchema>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /schema/analyze` — AI-assisted PII detection + schema summary.
@@ -1203,7 +1261,9 @@ pub async fn analyze_schema(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SchemaAnalysis>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SchemaAnalysis>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /ingest/history` — ingested-table records grouped by source. Any authenticated user.
@@ -1441,7 +1501,9 @@ pub async fn list_records(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<RecordsPage>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<RecordsPage>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /audit` — filterable, paginated audit log. Admin only (enforced server-side).
@@ -1486,7 +1548,9 @@ pub async fn get_audit(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<AuditPage>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<AuditPage>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /tables/<table_id>/info` — inspector for one indexed table. Any authenticated
@@ -1510,7 +1574,9 @@ pub async fn get_table_info(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<TableInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<TableInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /ingest/connection/<source_id>` — remove every indexed table and all
@@ -1522,7 +1588,10 @@ pub async fn delete_ingest_connection(
     bridge: State<'_, Bridge>,
 ) -> Result<serde_json::Value, String> {
     let token = bridge.token().ok_or("not logged in")?;
-    let url = bridge.url(&format!("/ingest/connection/{}", encode_path_segment(&source_id)));
+    let url = bridge.url(&format!(
+        "/ingest/connection/{}",
+        encode_path_segment(&source_id)
+    ));
     let resp = bridge
         .client
         .delete(&url)
@@ -1534,7 +1603,9 @@ pub async fn delete_ingest_connection(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /ingest/all` — clear every record and indexed-table entry across all
@@ -1555,7 +1626,9 @@ pub async fn clear_all_records(bridge: State<'_, Bridge>) -> Result<serde_json::
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,7 +1642,10 @@ pub async fn clear_all_records(bridge: State<'_, Bridge>) -> Result<serde_json::
 /// Idempotent: if a stream is already running this returns immediately. Runs until
 /// the connection ends (e.g. logout → 401), then clears the guard so it can restart.
 #[tauri::command]
-pub async fn start_log_stream(app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+pub async fn start_log_stream(
+    app: tauri::AppHandle,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
     // Start at most once; `swap` returning true means a stream is already live.
@@ -1732,7 +1808,9 @@ pub async fn search(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SearchResponse>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SearchResponse>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /chat` — grounded RAG answer streamed as SSE. Emits `chat://citations`
@@ -1754,63 +1832,97 @@ pub async fn chat(
 ) -> Result<(), String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url("/chat");
-    let resp = bridge
-        .client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "question": question,
-            "history": history,
-            "mode": opts.mode,
-            "rerank": opts.rerank,
-            "top_k": opts.top_k,
-            "conversation_id": conversation_id,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    check_auth(&bridge, &resp)?;
-    if !resp.status().is_success() {
-        return Err(error_body(resp).await);
-    }
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    bridge.register_run(run_id.clone(), abort_handle);
+    let result = Abortable::new(
+        async {
+            let resp = bridge
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "question": question,
+                    "history": history,
+                    "mode": opts.mode,
+                    "rerank": opts.rerank,
+                    "top_k": opts.top_k,
+                    "conversation_id": conversation_id,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            check_auth(&bridge, &resp)?;
+            if !resp.status().is_success() {
+                return Err(error_body(resp).await);
+            }
 
-    let mut events = resp.bytes_stream().eventsource();
-    while let Some(event) = events.next().await {
-        let event = event.map_err(|e| format!("stream error: {e}"))?;
-        match event.event.as_str() {
-            "routed" => {
-                // Intent Router v2: the decision payload ({route,intent,tier,cached,backend}).
-                // Relayed for the activity strip; older UIs simply ignore chat://routed.
-                let _ = app.emit(
-                    "chat://routed",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
+            let mut events = resp.bytes_stream().eventsource();
+            while let Some(event) = events.next().await {
+                let event = event.map_err(|e| format!("stream error: {e}"))?;
+                match event.event.as_str() {
+                    "routed" => {
+                        // Intent Router v2: the decision payload ({route,intent,tier,cached,backend}).
+                        // Relayed for the activity strip; older UIs simply ignore chat://routed.
+                        let _ = app.emit(
+                            "chat://routed",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "citations" => {
+                        let _ = app.emit(
+                            "chat://citations",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "token" => {
+                        let _ = app.emit(
+                            "chat://token",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: decode_token(&event.data),
+                            },
+                        );
+                    }
+                    "error" => {
+                        let _ = app.emit(
+                            "chat://error",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data.clone(),
+                            },
+                        );
+                        return Err(event.data);
+                    }
+                    "done" => break,
+                    _ => {}
+                }
             }
-            "citations" => {
-                let _ = app.emit(
-                    "chat://citations",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            "token" => {
-                let _ = app.emit(
-                    "chat://token",
-                    ChatEvent { run_id: run_id.clone(), data: decode_token(&event.data) },
-                );
-            }
-            "error" => {
-                let _ = app.emit(
-                    "chat://error",
-                    ChatEvent { run_id: run_id.clone(), data: event.data.clone() },
-                );
-                return Err(event.data);
-            }
-            "done" => break,
-            _ => {}
-        }
-    }
-    let _ = app.emit("chat://done", ChatEvent { run_id: run_id.clone(), data: String::new() });
-    Ok(())
+            let _ = app.emit(
+                "chat://done",
+                ChatEvent {
+                    run_id: run_id.clone(),
+                    data: String::new(),
+                },
+            );
+            Ok(())
+        },
+        abort_registration,
+    )
+    .await;
+    bridge.remove_run(&run_id);
+    result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
+}
+
+#[tauri::command]
+pub fn cancel_run(run_id: String, bridge: State<'_, Bridge>) -> bool {
+    bridge.abort_run(&run_id);
+    true
 }
 
 /// `GET /conversations` — all conversations for the authenticated user (sorted by most recent).
@@ -1829,7 +1941,9 @@ pub async fn list_conversations(bridge: State<'_, Bridge>) -> Result<Vec<Convers
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<Conversation>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<Conversation>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /conversations` — create a new conversation with an optional title and agent kind.
@@ -1855,7 +1969,9 @@ pub async fn create_conversation(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Conversation>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Conversation>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /conversations/<id>` — rename a conversation. Returns the updated entry.
@@ -1879,7 +1995,9 @@ pub async fn rename_conversation(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Conversation>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Conversation>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /conversations/<id>` — delete a conversation and cascade its messages.
@@ -1904,7 +2022,10 @@ pub async fn delete_conversation(id: String, bridge: State<'_, Bridge>) -> Resul
 
 /// `GET /conversations/<id>/messages` — all messages in a conversation (ascending by time).
 #[tauri::command]
-pub async fn get_messages(id: String, bridge: State<'_, Bridge>) -> Result<Vec<StoredMessage>, String> {
+pub async fn get_messages(
+    id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<StoredMessage>, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url(&format!("/conversations/{id}/messages"));
     let resp = bridge
@@ -1918,7 +2039,9 @@ pub async fn get_messages(id: String, bridge: State<'_, Bridge>) -> Result<Vec<S
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<StoredMessage>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<StoredMessage>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /agent-conversations?kind=<kind>` — agent conversations for one kind,
@@ -1929,7 +2052,10 @@ pub async fn list_agent_conversations(
     bridge: State<'_, Bridge>,
 ) -> Result<Vec<Conversation>, String> {
     let token = bridge.token().ok_or("not logged in")?;
-    let url = bridge.url(&format!("/agent-conversations?kind={}", encode_path_segment(&kind)));
+    let url = bridge.url(&format!(
+        "/agent-conversations?kind={}",
+        encode_path_segment(&kind)
+    ));
     let resp = bridge
         .client
         .get(&url)
@@ -1941,7 +2067,9 @@ pub async fn list_agent_conversations(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<Conversation>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<Conversation>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /agents/<kind>` — AI Agents SSE endpoint. The server emits a `routed` event
@@ -1968,81 +2096,118 @@ pub async fn agent(
     // Build the path dynamically; `kind` is validated server-side (unknown kinds
     // return a 400 from the Rocket route guard, caught by `check_auth` / `error_body`).
     let url = bridge.url(&format!("/agents/{}", encode_path_segment(&kind)));
-    let resp = bridge
-        .client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "question": question,
-            "conversation_id": conversation_id,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    check_auth(&bridge, &resp)?;
-    if !resp.status().is_success() {
-        return Err(error_body(resp).await);
-    }
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    bridge.register_run(run_id.clone(), abort_handle);
+    let result = Abortable::new(
+        async {
+            let resp = bridge
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "question": question,
+                    "conversation_id": conversation_id,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            check_auth(&bridge, &resp)?;
+            if !resp.status().is_success() {
+                return Err(error_body(resp).await);
+            }
 
-    let mut events = resp.bytes_stream().eventsource();
-    while let Some(event) = events.next().await {
-        let event = event.map_err(|e| format!("stream error: {e}"))?;
-        match event.event.as_str() {
-            // First event: the server's resolved agent kind (JSON-encoded string).
-            "routed" => {
-                let _ = app.emit(
-                    "agent://routed",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
+            let mut events = resp.bytes_stream().eventsource();
+            while let Some(event) = events.next().await {
+                let event = event.map_err(|e| format!("stream error: {e}"))?;
+                match event.event.as_str() {
+                    // First event: the server's resolved agent kind (JSON-encoded string).
+                    "routed" => {
+                        let _ = app.emit(
+                            "agent://routed",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: the parsed aggregation spec (provenance).
+                    "spec" => {
+                        let _ = app.emit(
+                            "agent://spec",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: chart-ready rows [{label, value}].
+                    "rows" => {
+                        let _ = app.emit(
+                            "agent://rows",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: the MongoDB pipeline used (explain / audit trail).
+                    "pipeline" => {
+                        let _ = app.emit(
+                            "agent://pipeline",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Semantic path: citation passages backing the answer.
+                    "citations" => {
+                        let _ = app.emit(
+                            "agent://citations",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Both paths: streamed narration / answer tokens (JSON-encoded to preserve spaces).
+                    "token" => {
+                        let _ = app.emit(
+                            "agent://token",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: decode_token(&event.data),
+                            },
+                        );
+                    }
+                    "error" => {
+                        let _ = app.emit(
+                            "agent://error",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data.clone(),
+                            },
+                        );
+                        return Err(event.data);
+                    }
+                    "done" => break,
+                    _ => {}
+                }
             }
-            // Structured path: the parsed aggregation spec (provenance).
-            "spec" => {
-                let _ = app.emit(
-                    "agent://spec",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Structured path: chart-ready rows [{label, value}].
-            "rows" => {
-                let _ = app.emit(
-                    "agent://rows",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Structured path: the MongoDB pipeline used (explain / audit trail).
-            "pipeline" => {
-                let _ = app.emit(
-                    "agent://pipeline",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Semantic path: citation passages backing the answer.
-            "citations" => {
-                let _ = app.emit(
-                    "agent://citations",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Both paths: streamed narration / answer tokens (JSON-encoded to preserve spaces).
-            "token" => {
-                let _ = app.emit(
-                    "agent://token",
-                    ChatEvent { run_id: run_id.clone(), data: decode_token(&event.data) },
-                );
-            }
-            "error" => {
-                let _ = app.emit(
-                    "agent://error",
-                    ChatEvent { run_id: run_id.clone(), data: event.data.clone() },
-                );
-                return Err(event.data);
-            }
-            "done" => break,
-            _ => {}
-        }
-    }
-    let _ = app.emit("agent://done", ChatEvent { run_id: run_id.clone(), data: String::new() });
-    Ok(())
+            let _ = app.emit(
+                "agent://done",
+                ChatEvent {
+                    run_id: run_id.clone(),
+                    data: String::new(),
+                },
+            );
+            Ok(())
+        },
+        abort_registration,
+    )
+    .await;
+    bridge.remove_run(&run_id);
+    result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
 }
 
 /// The server JSON-encodes `token` payloads so SSE doesn't strip their leading

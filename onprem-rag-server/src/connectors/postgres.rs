@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use super::{ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err,
-            make_row_filtered};
+use super::{
+    ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err, make_row_filtered,
+};
 use crate::error::{AppError, AppResult};
 
 pub struct PostgresConnector {
@@ -147,14 +148,17 @@ impl SourceConnector for PostgresConnector {
             let col: String = row.try_get("column_name").unwrap_or_default();
             let dtype: String = row.try_get("data_type").unwrap_or_default();
             let nullable: String = row.try_get("is_nullable").unwrap_or_default();
-            table_columns.entry(table.clone()).or_default().push(ColumnSchema {
-                is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
-                is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
-                nullable: nullable.eq_ignore_ascii_case("YES"),
-                name: col,
-                type_: dtype,
-                likely_pii: false,
-            });
+            table_columns
+                .entry(table.clone())
+                .or_default()
+                .push(ColumnSchema {
+                    is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
+                    is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    name: col,
+                    type_: dtype,
+                    likely_pii: false,
+                });
         }
 
         // Build the final list in alphabetical order (matching the table query order).
@@ -162,7 +166,11 @@ impl SourceConnector for PostgresConnector {
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns }
+                TableSchema {
+                    name,
+                    row_count,
+                    columns,
+                }
             })
             .collect();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
@@ -183,25 +191,26 @@ impl SourceConnector for PostgresConnector {
         Ok(n)
     }
 
-    async fn fetch_table(
+    async fn fetch_table_page(
         &self,
         table: &str,
         excluded: &[String],
-        limit: Option<i64>,
+        order_by: Option<&str>,
+        offset: i64,
+        page_size: i64,
     ) -> AppResult<Vec<FetchedRow>> {
         let pool = self.pool(2).await?;
-        // Double-quote the identifier. The table was validated by start_ingest.
-        let mut sql = format!(
-            "SELECT to_jsonb(_sub) AS row_json FROM (SELECT * FROM \"{table}\") AS _sub"
+        let order = order_by
+            .map(|column| format!("\"{column}\""))
+            .unwrap_or_else(|| "ctid".to_string());
+        let sql = format!(
+            "SELECT to_jsonb(_sub) AS row_json FROM (SELECT * FROM \"{table}\" ORDER BY {order} OFFSET {offset} LIMIT {page_size}) AS _sub"
         );
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
 
         let rows = sqlx::query(&sql)
             .fetch_all(&pool)
             .await
-            .map_err(|e| conn_err(&format!("PostgreSQL fetch_table({table}) failed"), e))?;
+            .map_err(|e| conn_err(&format!("PostgreSQL fetch_table_page({table}) failed"), e))?;
         pool.close().await;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -211,8 +220,7 @@ impl SourceConnector for PostgresConnector {
                 .map_err(|e| AppError::Internal(format!("decoding row {i} failed: {e}")))?;
             match value {
                 serde_json::Value::Object(fields) => {
-                    // Drop excluded columns before project_text so PII is not embedded.
-                    out.push(make_row_filtered(fields, excluded, i));
+                    out.push(make_row_filtered(fields, excluded, offset as usize + i));
                 }
                 other => {
                     return Err(AppError::Internal(format!(

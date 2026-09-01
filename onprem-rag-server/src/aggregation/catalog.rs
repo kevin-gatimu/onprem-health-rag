@@ -60,12 +60,21 @@ pub struct FieldMeta {
     pub description: Option<String>,
 }
 
+#[cfg(test)]
 impl FieldMeta {
     pub fn new(name: impl Into<String>, t: FieldType) -> Self {
-        FieldMeta { name: name.into(), field_type: t, description: None }
+        FieldMeta {
+            name: name.into(),
+            field_type: t,
+            description: None,
+        }
     }
     pub fn with_desc(name: impl Into<String>, t: FieldType, desc: impl Into<String>) -> Self {
-        FieldMeta { name: name.into(), field_type: t, description: Some(desc.into()) }
+        FieldMeta {
+            name: name.into(),
+            field_type: t,
+            description: Some(desc.into()),
+        }
     }
 }
 
@@ -107,7 +116,11 @@ impl Catalog {
     /// an empty catalog, so this fails closed rather than panicking on boot before
     /// the first successful DB-backed build.
     pub fn empty() -> Self {
-        Catalog { collections: HashMap::new(), code_vocab: HashMap::new(), synonyms: HashMap::new() }
+        Catalog {
+            collections: HashMap::new(),
+            code_vocab: HashMap::new(),
+            synonyms: HashMap::new(),
+        }
     }
 
     /// Return `true` if `collection` is allow-listed.
@@ -117,12 +130,17 @@ impl Catalog {
 
     /// Return `true` if `field` is allow-listed for `collection`.
     pub fn has_field(&self, collection: &str, field: &str) -> bool {
-        self.collections.get(collection).map_or(false, |c| c.has_field(field))
+        self.collections
+            .get(collection)
+            .map_or(false, |c| c.has_field(field))
     }
 
     /// Resolve a field name through the synonym map; returns owned canonical name.
     pub fn resolve_synonym_owned(&self, name: &str) -> String {
-        self.synonyms.get(name).cloned().unwrap_or_else(|| name.to_string())
+        self.synonyms
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     /// Build a compact schema summary string for the planner system prompt.
@@ -134,8 +152,17 @@ impl Catalog {
             let meta = &self.collections[name];
             out.push_str(&format!("\n**{}** — {}\n", name, meta.label));
             for f in &meta.fields {
-                let desc = f.description.as_deref().map(|d| format!(" — {d}")).unwrap_or_default();
-                out.push_str(&format!("  - `{}` ({}){}\n", f.name, f.field_type.label(), desc));
+                let desc = f
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "  - `{}` ({}){}\n",
+                    f.name,
+                    f.field_type.label(),
+                    desc
+                ));
             }
         }
         if !self.code_vocab.is_empty() {
@@ -173,10 +200,7 @@ impl Catalog {
 pub async fn build_from_store(db: &crate::documentdb::DocumentDb) -> Catalog {
     match build_from_store_inner(db).await {
         Ok(cat) => {
-            tracing::info!(
-                tables = cat.collections.len(),
-                "catalog built from store"
-            );
+            tracing::info!(tables = cat.collections.len(), "catalog built from store");
             cat
         }
         Err(e) => {
@@ -215,6 +239,7 @@ async fn build_from_store_inner(
     // Fall back to scanning distinct table values in records.
     if table_names.is_empty() {
         let pipeline: Vec<Document> = vec![
+            doc! { "$match": { "active": true } },
             doc! { "$group": { "_id": "$table" } },
             doc! { "$sort": { "_id": 1 } },
         ];
@@ -234,7 +259,7 @@ async fn build_from_store_inner(
         // Sample up to 5 docs per table to discover and type the fields.
         let mut cursor = db
             .records()
-            .find(doc! { "table": table })
+            .find(doc! { "table": table, "active": true })
             .projection(doc! { "fields": 1, "_id": 0 })
             .limit(5)
             .await?;
@@ -245,7 +270,9 @@ async fn build_from_store_inner(
             if let Ok(fields_doc) = d.get_document("fields") {
                 for (key, value) in fields_doc.iter() {
                     // Union keys; keep first inferred type (first non-null doc wins).
-                    field_map.entry(key.clone()).or_insert_with(|| infer_field_type(key, value));
+                    field_map
+                        .entry(key.clone())
+                        .or_insert_with(|| infer_field_type(key, value));
                 }
             }
         }
@@ -256,19 +283,30 @@ async fn build_from_store_inner(
 
         let mut fields: Vec<FieldMeta> = field_map
             .into_iter()
-            .map(|(name, ft)| FieldMeta { name, field_type: ft, description: None })
+            .map(|(name, ft)| FieldMeta {
+                name,
+                field_type: ft,
+                description: None,
+            })
             .collect();
         // Stable sort so planner_context output is deterministic.
         fields.sort_by(|a, b| a.name.cmp(&b.name));
 
         collections.insert(
             table.clone(),
-            CollectionMeta { label: format!("{table} records"), fields },
+            CollectionMeta {
+                label: format!("{table} records"),
+                fields,
+            },
         );
     }
 
     let (code_vocab, synonyms) = augmentation_layer();
-    Ok(Catalog { collections, code_vocab, synonyms })
+    Ok(Catalog {
+        collections,
+        code_vocab,
+        synonyms,
+    })
 }
 
 /// Infer a `FieldType` from a BSON value and key name.
@@ -289,7 +327,11 @@ fn infer_field_type(key: &str, value: &mongodb::bson::Bson) -> FieldType {
     match value {
         Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) => FieldType::Numeric,
         Bson::String(s) => {
-            if looks_like_date(s) { FieldType::Date } else { FieldType::String }
+            if looks_like_date(s) {
+                FieldType::Date
+            } else {
+                FieldType::String
+            }
         }
         Bson::DateTime(_) => FieldType::Date,
         _ => FieldType::String,
@@ -356,6 +398,7 @@ fn augmentation_layer() -> (HashMap<String, String>, HashMap<String, String>) {
 
 /// Build the catalog from the known AKUH EMR schema. Used in unit tests and as
 /// the reference schema. Production code uses `build_from_store` instead.
+#[cfg(test)]
 pub(crate) fn build_hardcoded() -> Catalog {
     let mut collections: HashMap<String, CollectionMeta> = HashMap::new();
 
@@ -364,35 +407,79 @@ pub(crate) fn build_hardcoded() -> Catalog {
         CollectionMeta {
             label: "All ingested records from all EMR sources (master collection)".into(),
             fields: vec![
-                FieldMeta::with_desc("source_id", FieldType::Id, "ID of the EMR source (connector)"),
+                FieldMeta::with_desc(
+                    "source_id",
+                    FieldType::Id,
+                    "ID of the EMR source (connector)",
+                ),
                 FieldMeta::with_desc("patient_id", FieldType::Id, "Patient identifier"),
-                FieldMeta::with_desc("encounter_id", FieldType::Id, "Clinical encounter identifier"),
+                FieldMeta::with_desc(
+                    "encounter_id",
+                    FieldType::Id,
+                    "Clinical encounter identifier",
+                ),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility name"),
                 FieldMeta::with_desc("diagnosis_code", FieldType::String, "ICD-10 diagnosis code"),
-                FieldMeta::with_desc("diagnosis_display", FieldType::String, "Human-readable diagnosis name"),
-                FieldMeta::with_desc("encounter_date", FieldType::Date, "Date of the clinical encounter"),
+                FieldMeta::with_desc(
+                    "diagnosis_display",
+                    FieldType::String,
+                    "Human-readable diagnosis name",
+                ),
+                FieldMeta::with_desc(
+                    "encounter_date",
+                    FieldType::Date,
+                    "Date of the clinical encounter",
+                ),
                 FieldMeta::with_desc("gender", FieldType::String, "Patient gender"),
                 FieldMeta::with_desc("dob", FieldType::Date, "Patient date of birth"),
                 FieldMeta::new("name", FieldType::String),
                 FieldMeta::new("phone", FieldType::String),
                 FieldMeta::new("address", FieldType::String),
-                FieldMeta::with_desc("registration_date", FieldType::Date, "Patient registration date"),
+                FieldMeta::with_desc(
+                    "registration_date",
+                    FieldType::Date,
+                    "Patient registration date",
+                ),
                 FieldMeta::with_desc("heart_rate", FieldType::Numeric, "Heart rate in bpm"),
-                FieldMeta::with_desc("blood_pressure", FieldType::String, "Blood pressure reading"),
+                FieldMeta::with_desc(
+                    "blood_pressure",
+                    FieldType::String,
+                    "Blood pressure reading",
+                ),
                 FieldMeta::with_desc("temperature", FieldType::Numeric, "Body temperature (C)"),
                 FieldMeta::with_desc("weight", FieldType::Numeric, "Weight in kg"),
                 FieldMeta::with_desc("height", FieldType::Numeric, "Height in cm"),
-                FieldMeta::with_desc("recorded_at", FieldType::Date, "Timestamp of vital sign recording"),
-                FieldMeta::with_desc("rx_number", FieldType::String, "Prescription reference number"),
-                FieldMeta::with_desc("prescriber_id", FieldType::Id, "Prescribing provider identifier"),
-                FieldMeta::with_desc("issue_date", FieldType::Date, "Date prescription was issued"),
+                FieldMeta::with_desc(
+                    "recorded_at",
+                    FieldType::Date,
+                    "Timestamp of vital sign recording",
+                ),
+                FieldMeta::with_desc(
+                    "rx_number",
+                    FieldType::String,
+                    "Prescription reference number",
+                ),
+                FieldMeta::with_desc(
+                    "prescriber_id",
+                    FieldType::Id,
+                    "Prescribing provider identifier",
+                ),
+                FieldMeta::with_desc(
+                    "issue_date",
+                    FieldType::Date,
+                    "Date prescription was issued",
+                ),
                 FieldMeta::with_desc("valid_until", FieldType::Date, "Prescription expiry date"),
                 FieldMeta::with_desc("status", FieldType::String, "Record or prescription status"),
                 FieldMeta::with_desc("drug_name", FieldType::String, "Name of prescribed drug"),
                 FieldMeta::with_desc("dosage", FieldType::String, "Prescribed dosage"),
                 FieldMeta::with_desc("test_name", FieldType::String, "Laboratory test name"),
                 FieldMeta::with_desc("ordered_date", FieldType::Date, "Date lab order was placed"),
-                FieldMeta::with_desc("result_value", FieldType::Numeric, "Numeric lab result value"),
+                FieldMeta::with_desc(
+                    "result_value",
+                    FieldType::Numeric,
+                    "Numeric lab result value",
+                ),
                 FieldMeta::with_desc("result_unit", FieldType::String, "Unit for the lab result"),
             ],
         },
@@ -424,7 +511,11 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::new("patient_id", FieldType::Id),
                 FieldMeta::with_desc("encounter_date", FieldType::Date, "Date of encounter"),
                 FieldMeta::with_desc("diagnosis_code", FieldType::String, "ICD-10 code"),
-                FieldMeta::with_desc("diagnosis_display", FieldType::String, "Diagnosis description"),
+                FieldMeta::with_desc(
+                    "diagnosis_display",
+                    FieldType::String,
+                    "Diagnosis description",
+                ),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility"),
             ],
         },
@@ -457,7 +548,11 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::new("encounter_id", FieldType::Id),
                 FieldMeta::with_desc("test_name", FieldType::String, "Test ordered"),
                 FieldMeta::with_desc("ordered_date", FieldType::Date, "Order date"),
-                FieldMeta::with_desc("status", FieldType::String, "pending | completed | cancelled"),
+                FieldMeta::with_desc(
+                    "status",
+                    FieldType::String,
+                    "pending | completed | cancelled",
+                ),
                 FieldMeta::with_desc("result_value", FieldType::Numeric, "Numeric result"),
                 FieldMeta::with_desc("result_unit", FieldType::String, "Result unit"),
             ],
@@ -489,5 +584,9 @@ pub(crate) fn build_hardcoded() -> Catalog {
     synonyms.insert("condition".into(), "diagnosis_display".into());
     synonyms.insert("provider".into(), "prescriber_id".into());
 
-    Catalog { collections, code_vocab, synonyms }
+    Catalog {
+        collections,
+        code_vocab,
+        synonyms,
+    }
 }
