@@ -122,15 +122,17 @@ pub trait SourceConnector: Send + Sync {
     /// SQL injection — `start_ingest` does this validation before spawning the job.
     async fn count_table(&self, table: &str) -> AppResult<i64>;
 
-    /// Fetch all rows from a named table, dropping `excluded` columns from the fields
-    /// map *before* `project_text`. This ensures excluded (PII) columns are neither
-    /// embedded nor stored on the record document. The caller must validate `table`
-    /// against `get_schema()` beforehand (the route does this at job-start).
-    async fn fetch_table(
+    /// Fetch one bounded page from a named table. `order_by` must come from the
+    /// connector's introspected schema; callers must never pass client-provided SQL.
+    /// Excluded columns are removed before projection so PII is neither embedded nor
+    /// stored. The returned vector has at most `page_size` rows.
+    async fn fetch_table_page(
         &self,
         table: &str,
         excluded: &[String],
-        limit: Option<i64>,
+        order_by: Option<&str>,
+        offset: i64,
+        page_size: i64,
     ) -> AppResult<Vec<FetchedRow>>;
 
     /// Execute a **pre-validated, read-only SELECT** and return `(column_names, rows)`.

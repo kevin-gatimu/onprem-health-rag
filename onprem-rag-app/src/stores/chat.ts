@@ -1,19 +1,14 @@
-// Chat store — single in-flight RAG run.
-//
-// There is only ever one pending run at a time (the UI locks during streaming).
-// Every setter guards on runId so a stale run's late events are silently dropped.
-// The boot-time listeners in bridgeEvents.ts write here; the Chat screen reads it.
+// Chat store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { Passage, VerifyReport } from '../lib/bridge';
+import type { Passage, RetrievalOpts } from '../lib/bridge';
 
-export type ChatPhase = 'searching' | 'generating' | 'done';
+export type ChatPhase = 'searching' | 'generating' | 'done' | 'stopped';
 
 export interface PendingRun {
   runId: string;
   conversationId: string;
-  /** The user's question text (used for the optimistic user bubble). */
   user: string;
-  /** Accumulated streamed answer text. */
+  opts: RetrievalOpts;
   answer: string;
   citations: Passage[];
   /** Faithfulness verdict, or null until the post-stream `verify` event arrives
@@ -21,85 +16,138 @@ export interface PendingRun {
   verify: VerifyReport | null;
   error: string | null;
   phase: ChatPhase;
+  startedAt: number;
+}
+
+export interface QueuedChatPrompt {
+  id: string;
+  conversationId: string;
+  user: string;
+  opts: RetrievalOpts;
+  queuedAt: number;
 }
 
 interface ChatState {
-  pending: PendingRun | null;
-  startRun(runId: string, conversationId: string, user: string): void;
-  /** Append a batch of token strings. Ignores stale runId. */
+  activeConversationId: string | null;
+  runs: Record<string, PendingRun>;
+  queues: Record<string, QueuedChatPrompt[]>;
+  drafts: Record<string, string>;
+  setActiveConversation(id: string | null): void;
+  setDraft(conversationKey: string, text: string): void;
+  startRun(runId: string, conversationId: string, user: string, opts: RetrievalOpts): void;
   appendAnswer(runId: string, batch: string[]): void;
-  /** Set the retrieved passages and advance phase to 'generating'. Ignores stale runId. */
-  setCitations(runId: string, c: Passage[]): void;
-  /** Attach the post-stream faithfulness report. Ignores stale runId. */
-  setVerify(runId: string, report: VerifyReport): void;
-  /** Record an error and set phase to 'done'. Ignores stale runId. */
-  setError(runId: string, msg: string): void;
-  /** Mark phase 'done' (stream completed normally). Ignores stale runId. */
+  setCitations(runId: string, citations: Passage[]): void;
+  setError(runId: string, message: string): void;
+  markStopped(runId: string): void;
   finish(runId: string): void;
-  /** Clear the pending run (call only after invalidateQueries resolves). */
-  clear(): void;
+  removeRun(runId: string): void;
+  enqueue(prompt: QueuedChatPrompt): void;
+  removeQueued(conversationId: string, promptId: string): void;
+  reset(): void;
 }
 
 export const useChat = create<ChatState>((set, get) => ({
-  pending: null,
+  activeConversationId: null,
+  runs: {},
+  queues: {},
+  drafts: {},
 
-  startRun(runId, conversationId, user) {
-    set({
-      pending: {
-        runId,
-        conversationId,
-        user,
-        answer: '',
-        citations: [],
-        verify: null,
-        error: null,
-        phase: 'searching',
+  setActiveConversation(activeConversationId) {
+    set({ activeConversationId });
+  },
+
+  setDraft(conversationKey, text) {
+    set((state) => ({ drafts: { ...state.drafts, [conversationKey]: text } }));
+  },
+
+  startRun(runId, conversationId, user, opts) {
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: {
+          runId,
+          conversationId,
+          user,
+          opts,
+          answer: '',
+          citations: [],
+          error: null,
+          phase: 'searching',
+          startedAt: Date.now(),
+        },
       },
-    });
+    }));
   },
 
   appendAnswer(runId, batch) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, answer: s.pending.answer + batch.join('') }
-        : null,
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], answer: state.runs[runId].answer + batch.join('') },
+      },
     }));
   },
 
-  setCitations(runId, c) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, citations: c, phase: 'generating' }
-        : null,
+  setCitations(runId, citations) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], citations, phase: 'generating' } },
     }));
   },
 
-  setVerify(runId, report) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending ? { ...s.pending, verify: report } : null,
+  setError(runId, error) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], error, phase: 'done' } },
     }));
   },
 
-  setError(runId, msg) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, error: msg, phase: 'done' }
-        : null,
+  markStopped(runId) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], phase: 'stopped' } },
     }));
   },
 
   finish(runId) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending ? { ...s.pending, phase: 'done' } : null,
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], phase: 'done' } },
     }));
   },
 
-  clear() {
-    set({ pending: null });
+  removeRun(runId) {
+    set((state) => {
+      const runs = { ...state.runs };
+      delete runs[runId];
+      return { runs };
+    });
+  },
+
+  enqueue(prompt) {
+    set((state) => ({
+      queues: {
+        ...state.queues,
+        [prompt.conversationId]: [...(state.queues[prompt.conversationId] ?? []), prompt],
+      },
+    }));
+  },
+
+  removeQueued(conversationId, promptId) {
+    set((state) => ({
+      queues: {
+        ...state.queues,
+        [conversationId]: (state.queues[conversationId] ?? []).filter((item) => item.id !== promptId),
+      },
+    }));
+  },
+
+  reset() {
+    set({ activeConversationId: null, runs: {}, queues: {}, drafts: {} });
   },
 }));

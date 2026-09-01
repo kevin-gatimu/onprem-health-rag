@@ -95,7 +95,7 @@ pub async fn list_conversations(
         .db
         .chat_conversations()
         .find(doc! { "user_id": &user.id, "agent_kind": { "$exists": false } })
-        .sort(doc! { "updated_at": -1 })
+        .sort(doc! { "updated_at": -1, "_id": -1 })
         .await?
         .try_collect()
         .await?;
@@ -116,7 +116,7 @@ pub async fn list_agent_conversations(
         .db
         .chat_conversations()
         .find(doc! { "user_id": &user.id, "agent_kind": kind })
-        .sort(doc! { "updated_at": -1 })
+        .sort(doc! { "updated_at": -1, "_id": -1 })
         .await?
         .try_collect()
         .await?;
@@ -233,7 +233,11 @@ pub async fn delete_conversation(
     }
 
     // Cascade: delete all messages belonging to this conversation.
-    state.db.chat_messages().delete_many(doc! { "conversation_id": id }).await?;
+    state
+        .db
+        .chat_messages()
+        .delete_many(doc! { "conversation_id": id })
+        .await?;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -260,7 +264,7 @@ pub async fn list_messages(
         .db
         .chat_messages()
         .find(doc! { "conversation_id": id })
-        .sort(doc! { "created_at": 1 })
+        .sort(doc! { "created_at": 1, "_id": 1 })
         .await?
         .try_collect()
         .await?;
@@ -296,11 +300,29 @@ pub(crate) fn clip_message_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
-    let mut end = max_bytes.min(s.len());
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n[truncated]", &s[..end])
+
+    // Fetch the N most-recent messages (descending), then reverse to ascending.
+    let docs: Vec<Document> = match db
+        .chat_messages()
+        .find(doc! { "conversation_id": conversation_id })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .limit(limit)
+        .await
+    {
+        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+
+    let mut turns: Vec<ChatTurn> = docs
+        .iter()
+        .filter_map(|d| {
+            let role = d.get_str("role").ok()?.to_string();
+            let content = d.get_str("content").ok()?.to_string();
+            Some(ChatTurn { role, content })
+        })
+        .collect();
+    turns.reverse(); // oldest → newest
+    turns
 }
 
 /// Insert a user message. If this is the conversation's **first** user message,
@@ -338,7 +360,9 @@ pub(crate) async fn persist_user_message(
     } else {
         doc! { "$set": { "updated_at": now } }
     };
-    db.chat_conversations().update_one(doc! { "_id": oid }, update).await?;
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, update)
+        .await?;
 
     Ok(())
 }
@@ -356,8 +380,7 @@ pub(crate) async fn persist_assistant_message(
 
     // Serialize citations as a compact JSON string — avoids BSON round-trip issues
     // with serde_json::Value and keeps the schema simple.
-    let citations_json =
-        serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
+    let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
 
     let now = BsonDateTime::now();
     db.chat_messages()
@@ -414,8 +437,7 @@ pub(crate) async fn persist_agent_assistant_message(
         msg_doc.insert("structured_json", sj);
     } else {
         // Semantic path: store citations (may be an empty array for the refuse path).
-        let citations_json =
-            serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
+        let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
         msg_doc.insert("citations_json", citations_json);
     }
 
@@ -472,7 +494,10 @@ fn read_dt_field(d: &Document, key: &str) -> String {
 /// Build a `ConversationOut` from a raw BSON document.
 fn conv_doc_to_out(d: &Document) -> ConversationOut {
     ConversationOut {
-        id: d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default(),
+        id: d
+            .get_object_id("_id")
+            .map(|o| o.to_hex())
+            .unwrap_or_default(),
         title: d.get_str("title").unwrap_or("").to_string(),
         agent_kind: d.get_str("agent_kind").ok().map(str::to_string),
         created_at: read_dt_field(d, "created_at"),
@@ -497,7 +522,10 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
     let agent_kind = d.get_str("agent_kind").ok().map(str::to_string);
 
     MessageOut {
-        id: d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default(),
+        id: d
+            .get_object_id("_id")
+            .map(|o| o.to_hex())
+            .unwrap_or_default(),
         role: d.get_str("role").unwrap_or("").to_string(),
         content: d.get_str("content").unwrap_or("").to_string(),
         citations,

@@ -778,29 +778,19 @@ impl FoundryManager {
                 c
             }
         };
-        // No tools are offered here, whatever `spec.tools` says.
-        //
-        // Every caller of this function streams the model's *content* straight to the
-        // user: narration of already-executed rows, or grounded semantic generation.
-        // None of them parse or execute a tool call. Offering `run_aggregation` anyway
-        // invited exactly the failure it promised to enable — a model that answered
-        // "list 5 patients" by emitting a literal
-        // `<tool_call>{"name":"run_aggregation",...}</tool_call>` block, which is
-        // content, so `ThinkFilter` (which only strips `<think>`) streamed it verbatim
-        // into the chat transcript.
-        //
-        // Tool calls belong to `plan_tool`, which forces the call, parses the arguments,
-        // validates them, and executes them. `spec.tools` still gates that path.
-        let tools_ref: Option<&[ChatCompletionTools]> = None;
-        // Mark the model busy *before* opening the stream so eviction/unload can't
-        // slip in between; the guard rides inside the returned stream and clears
-        // on drop (including early client disconnects).
-        let busy = BusyGuard::new(model.id().to_string());
-        let inner = client
+        // Phase-3 tool seam: when the spec declares tools (HealthQuery, Trends,
+        // PatientLookup, Extract, Verify, MultiHop), expose the run_aggregation tool
+        // so the model can invoke structured data operations mid-stream.
+        let tools = if spec.tools {
+            Some(vec![run_aggregation_tool()])
+        } else {
+            None
+        };
+        let tools_ref: Option<&[ChatCompletionTools]> = tools.as_deref();
+        client
             .complete_streaming_chat(&msgs, tools_ref)
             .await
-            .map_err(map_err)?;
-        Ok(GuardedChatStream { inner, _busy: busy })
+            .map_err(map_err)
     }
 
     /// Non-streaming completion against a fully-resolved `ModelSpec`. Drains
@@ -828,7 +818,11 @@ impl FoundryManager {
     /// Open a streaming chat completion against the current model with a system + user
     /// message pair. Backward-compatible wrapper over `generate_stream_with` using a
     /// default GPU spec — callers in `rag/routes.rs` are unchanged.
-    pub async fn generate_stream(&self, system: &str, user: &str) -> AppResult<GuardedChatStream> {
+    pub async fn generate_stream(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<ChatCompletionStream> {
         let spec = ModelSpec {
             alias: self.current_model(),
             thinking: false,
@@ -1418,24 +1412,10 @@ impl FoundryManager {
             .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
             .response_format(ChatResponseFormat::JsonSchema(schema_str.clone()));
 
-        let resp = match with_schema.complete_chat(&msgs, Some(&[tool.clone()])).await {
-            Ok(r) => r,
-            Err(e) if is_grammar_error(&e) => {
-                tracing::warn!(
-                    tool = tool_name, error = %e,
-                    "backend rejected the combined tool + response_format grammar; \
-                     retrying with the forced tool call alone"
-                );
-                model
-                    .create_chat_client()
-                    .temperature(spec.temperature as f64)
-                    .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
-                    .complete_chat(&msgs, Some(&[tool.clone()]))
-                    .await
-                    .map_err(map_err)?
-            }
-            Err(e) => return Err(map_err(e)),
-        };
+        let resp = client
+            .complete_chat(&msgs, Some(&[tool.clone()]))
+            .await
+            .map_err(map_err)?;
 
         match try_parse_tool::<T>(&resp) {
             Ok(result) => return Ok(result),

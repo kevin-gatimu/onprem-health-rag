@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use mongodb::bson::doc;
 use rocket::serde::json::Json;
-use rocket::serde::json::{json, Value};
+use rocket::serde::json::{Value, json};
 use rocket::{State, delete, get, patch, post};
 use serde::{Deserialize, Serialize};
 
@@ -85,7 +85,11 @@ impl From<SourceDoc> for SourceInfo {
             table: d.table,
             created_at: d.created_at,
             // Empty (legacy / untested) surfaces to the UI as "disconnected".
-            status: if d.status.is_empty() { "disconnected".into() } else { d.status },
+            status: if d.status.is_empty() {
+                "disconnected".into()
+            } else {
+                d.status
+            },
             last_connected: d.last_connected,
             error: d.error,
         }
@@ -134,7 +138,10 @@ pub struct TestResult {
 /// Used by ingestion (WS5) to connect to a previously-registered database.
 pub(crate) async fn load_spec(db: &DocumentDb, config: &Config, id: &str) -> AppResult<SourceSpec> {
     let coll = db.collection::<SourceDoc>(SOURCES);
-    let doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let password = CredentialCipher::from_config(config).decrypt(&doc.password_enc)?;
     Ok(SourceSpec {
         kind: doc.kind,
@@ -154,7 +161,9 @@ fn validate(input: &SourceInput) -> AppResult<()> {
         return Err(AppError::BadRequest("source name is required".into()));
     }
     if input.host.trim().is_empty() || input.database.trim().is_empty() {
-        return Err(AppError::BadRequest("host and database are required".into()));
+        return Err(AppError::BadRequest(
+            "host and database are required".into(),
+        ));
     }
     Ok(())
 }
@@ -198,11 +207,19 @@ pub(crate) fn humanize_conn_error(raw: &str) -> String {
 
 /// `GET /sources` — list saved sources (no secrets). Any authenticated user.
 #[get("/sources")]
-pub async fn list_sources(state: &State<AppState>, _user: AuthUser) -> AppResult<Json<Vec<SourceInfo>>> {
+pub async fn list_sources(
+    state: &State<AppState>,
+    _user: AuthUser,
+) -> AppResult<Json<Vec<SourceInfo>>> {
     use futures::TryStreamExt;
 
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let docs: Vec<SourceDoc> = coll.find(doc! {}).await?.try_collect().await?;
+    let docs: Vec<SourceDoc> = coll
+        .find(doc! {})
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?
+        .try_collect()
+        .await?;
     Ok(Json(docs.into_iter().map(SourceInfo::from).collect()))
 }
 
@@ -232,7 +249,9 @@ pub async fn create_source(
     let name = input.name.trim().to_string();
     let coll = state.db.collection::<SourceDoc>(SOURCES);
     if coll.find_one(doc! { "name": &name }).await?.is_some() {
-        return Err(AppError::BadRequest(format!("a source named '{name}' already exists")));
+        return Err(AppError::BadRequest(format!(
+            "a source named '{name}' already exists"
+        )));
     }
 
     let spec = input.into_spec();
@@ -265,9 +284,14 @@ pub async fn create_source(
     // user.id was moved into source.created_by when building the struct; use the
     // stored copy rather than contorting the handler to clone it earlier.
     audit::write_audit(
-        &state.db, &source.created_by, &user.username, "source_created", &source.id,
+        &state.db,
+        &source.created_by,
+        &user.username,
+        "source_created",
+        &source.id,
         Some(json!({ "name": source.name, "kind": format!("{:?}", source.kind) })),
-    ).await;
+    )
+    .await;
     Ok(Json(SourceInfo::from(source)))
 }
 
@@ -300,7 +324,10 @@ pub async fn update_source(
 ) -> AppResult<Json<SourceInfo>> {
     user.require_admin()?;
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let mut doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let mut doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let upd = body.into_inner();
 
     if let Some(n) = upd.name {
@@ -311,7 +338,9 @@ pub async fn update_source(
         // Guard against colliding with a different source's name.
         if let Some(other) = coll.find_one(doc! { "name": &n }).await? {
             if other.id != doc.id {
-                return Err(AppError::BadRequest(format!("a source named '{n}' already exists")));
+                return Err(AppError::BadRequest(format!(
+                    "a source named '{n}' already exists"
+                )));
             }
         }
         doc.name = n;
@@ -347,7 +376,15 @@ pub async fn update_source(
     doc.error = None;
 
     coll.replace_one(doc! { "_id": id }, &doc).await?;
-    audit::write_audit(&state.db, &user.id, &user.username, "source_updated", id, None).await;
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "source_updated",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(SourceInfo::from(doc)))
 }
 
@@ -362,7 +399,10 @@ pub async fn test_saved_source(
 ) -> AppResult<Json<SourceInfo>> {
     user.require_admin()?;
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let mut doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let mut doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let spec = load_spec(&state.db, &state.config, id).await?;
 
     match connector(&spec).test().await {
@@ -407,7 +447,15 @@ pub async fn delete_source(
         .collection::<mongodb::bson::Document>(INDEXED_TABLES)
         .delete_many(doc! { "source_id": id })
         .await?;
-    audit::write_audit(&state.db, &user.id, &user.username, "source_deleted", id, None).await;
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "source_deleted",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -580,9 +628,7 @@ pub async fn analyze_schema(
                     }
                 }
                 // Merge LLM-detected PII columns on top of the deterministic pass.
-                if let Some(pii_map) =
-                    parsed.get("pii_columns").and_then(|v| v.as_object())
-                {
+                if let Some(pii_map) = parsed.get("pii_columns").and_then(|v| v.as_object()) {
                     for (table, cols) in pii_map {
                         if let Some(col_arr) = cols.as_array() {
                             let llm_cols: Vec<String> = col_arr
@@ -597,9 +643,7 @@ pub async fn analyze_schema(
                     }
                 }
                 // LLM-suggested tables (may differ from the keyword pass).
-                if let Some(sug_arr) =
-                    parsed.get("suggested_tables").and_then(|v| v.as_array())
-                {
+                if let Some(sug_arr) = parsed.get("suggested_tables").and_then(|v| v.as_array()) {
                     let llm_suggested: Vec<String> = sug_arr
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
@@ -611,9 +655,7 @@ pub async fn analyze_schema(
                         }
                     }
                 }
-                if let Some(notes) =
-                    parsed.get("data_quality_notes").and_then(|v| v.as_array())
-                {
+                if let Some(notes) = parsed.get("data_quality_notes").and_then(|v| v.as_array()) {
                     data_quality_notes = notes
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
@@ -630,5 +672,10 @@ pub async fn analyze_schema(
         cols.dedup();
     }
 
-    Ok(Json(SchemaAnalysis { summary, suggested_tables, pii_columns, data_quality_notes }))
+    Ok(Json(SchemaAnalysis {
+        summary,
+        suggested_tables,
+        pii_columns,
+        data_quality_notes,
+    }))
 }

@@ -1,8 +1,10 @@
 //! Argon2id password hashing and verification.
 
 use crate::error::{AppError, AppResult};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng};
 use argon2::Argon2;
+use argon2::password_hash::{
+    PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng,
+};
 use std::sync::LazyLock;
 
 /// A precomputed argon2id hash of a throwaway value. Verifying a supplied password

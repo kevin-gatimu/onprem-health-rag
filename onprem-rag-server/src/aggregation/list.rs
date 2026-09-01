@@ -71,10 +71,7 @@ pub async fn run(
     Ok((rows, total, pipeline))
 }
 
-async fn run_page_pipeline(
-    db: &DocumentDb,
-    pipeline: &[Document],
-) -> AppResult<Vec<Json>> {
+async fn run_page_pipeline(db: &DocumentDb, pipeline: &[Document]) -> AppResult<Vec<Json>> {
     let mut cursor = db
         .records()
         .aggregate(pipeline.to_vec())
@@ -118,10 +115,11 @@ pub fn build_pipeline(auth: &AuthUser, spec: &RunList) -> Vec<Document> {
 
     let mut pipeline = Vec::new();
 
-    // Stage 1: $match — authz AND table scope AND user filter.
+    // Stage 1: $match — active generation, authz, table scope, and user filter.
     // The table scope is the correctness invariant: row_pk is unique within a table,
     // so the dedup stage below produces one row per source record only when scoped.
     let mut match_doc = build_authz_filter(auth);
+    match_doc.insert("active", true);
     match_doc.insert("table", &spec.collection);
     for (k, v) in translate_filter(&spec.filter) {
         match_doc.insert(k, v);
@@ -173,6 +171,7 @@ pub fn build_count_pipeline(auth: &AuthUser, spec: &RunList) -> Vec<Document> {
     let mut pipeline = Vec::new();
 
     let mut match_doc = build_authz_filter(auth);
+    match_doc.insert("active", true);
     match_doc.insert("table", &spec.collection);
     for (k, v) in translate_filter(&spec.filter) {
         match_doc.insert(k, v);
@@ -228,7 +227,11 @@ pub fn validate_list(spec: &RunList, catalog: &Catalog) -> AppResult<RunList> {
         return Err(AppError::BadRequest(format!(
             "unknown collection '{}'; allowed: {}",
             spec.collection,
-            if avail.is_empty() { "(none — ingest data first)".to_string() } else { avail.join(", ") }
+            if avail.is_empty() {
+                "(none — ingest data first)".to_string()
+            } else {
+                avail.join(", ")
+            }
         )));
     }
 
@@ -272,7 +275,10 @@ pub fn validate_list(spec: &RunList, catalog: &Catalog) -> AppResult<RunList> {
         if s.by != "row_pk" && s.by != "_id" {
             check_field(&s.by)?;
         }
-        Some(Sort { by: s.by.clone(), dir: s.dir.clone() })
+        Some(Sort {
+            by: s.by.clone(),
+            dir: s.dir.clone(),
+        })
     } else {
         None
     };
@@ -368,7 +374,11 @@ mod tests {
     use crate::auth::{Role, guard::AuthUser};
 
     fn test_user() -> AuthUser {
-        AuthUser { id: "u1".into(), username: "tester".into(), role: Role::Doctor }
+        AuthUser {
+            id: "u1".into(),
+            username: "tester".into(),
+            role: Role::Doctor,
+        }
     }
 
     fn patients_spec() -> RunList {
@@ -399,24 +409,41 @@ mod tests {
     #[test]
     fn pipeline_has_dedup_group_at_stage_1() {
         let pipeline = build_pipeline(&test_user(), &patients_spec());
-        let group = pipeline[1].get_document("$group").expect("stage 1 must be $group");
+        let group = pipeline[1]
+            .get_document("$group")
+            .expect("stage 1 must be $group");
         assert_eq!(group.get_str("_id").unwrap_or(""), "$row_pk");
     }
 
     #[test]
     fn pipeline_has_replace_root_at_stage_2() {
         let pipeline = build_pipeline(&test_user(), &patients_spec());
-        assert!(pipeline[2].contains_key("$replaceRoot"), "stage 2 must be $replaceRoot");
+        assert!(
+            pipeline[2].contains_key("$replaceRoot"),
+            "stage 2 must be $replaceRoot"
+        );
     }
 
     #[test]
     fn pipeline_has_sort_skip_limit_in_order() {
-        let spec = RunList { offset: 10, ..patients_spec() };
+        let spec = RunList {
+            offset: 10,
+            ..patients_spec()
+        };
         let pipeline = build_pipeline(&test_user(), &spec);
 
-        let sort_idx = pipeline.iter().position(|s| s.contains_key("$sort")).unwrap();
-        let skip_idx = pipeline.iter().position(|s| s.contains_key("$skip")).unwrap();
-        let limit_idx = pipeline.iter().position(|s| s.contains_key("$limit")).unwrap();
+        let sort_idx = pipeline
+            .iter()
+            .position(|s| s.contains_key("$sort"))
+            .unwrap();
+        let skip_idx = pipeline
+            .iter()
+            .position(|s| s.contains_key("$skip"))
+            .unwrap();
+        let limit_idx = pipeline
+            .iter()
+            .position(|s| s.contains_key("$limit"))
+            .unwrap();
 
         assert!(sort_idx < skip_idx, "$sort must precede $skip");
         assert!(skip_idx < limit_idx, "$skip must precede $limit");
@@ -426,7 +453,10 @@ mod tests {
     fn count_pipeline_ends_with_count_stage() {
         let pipeline = build_count_pipeline(&test_user(), &patients_spec());
         let last = pipeline.last().expect("count pipeline must not be empty");
-        assert!(last.contains_key("$count"), "last stage of count pipeline must be $count");
+        assert!(
+            last.contains_key("$count"),
+            "last stage of count pipeline must be $count"
+        );
     }
 
     #[test]
@@ -446,15 +476,24 @@ mod tests {
     #[test]
     fn validate_list_fills_default_columns() {
         let cat = crate::aggregation::catalog::build_hardcoded();
-        let spec = RunList { columns: vec![], ..patients_spec() };
+        let spec = RunList {
+            columns: vec![],
+            ..patients_spec()
+        };
         let validated = validate_list(&spec, &cat).expect("should succeed");
-        assert!(!validated.columns.is_empty(), "default columns must be filled");
+        assert!(
+            !validated.columns.is_empty(),
+            "default columns must be filled"
+        );
     }
 
     #[test]
     fn validate_list_clamps_limit() {
         let cat = crate::aggregation::catalog::build_hardcoded();
-        let spec = RunList { limit: Some(999), ..patients_spec() };
+        let spec = RunList {
+            limit: Some(999),
+            ..patients_spec()
+        };
         let validated = validate_list(&spec, &cat).expect("should succeed");
         assert_eq!(validated.limit, Some(MAX_LIST));
     }

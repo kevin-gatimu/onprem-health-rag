@@ -5,4 +5,5 @@ pub mod conversations;
 pub mod explorer;
 pub mod health;
 pub mod logs;
+pub mod metrics;
 pub mod stats;

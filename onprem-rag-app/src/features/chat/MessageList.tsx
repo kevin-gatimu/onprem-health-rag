@@ -1,44 +1,54 @@
-// Renders the full conversation: persisted messages from the server query, then
-// the optimistic pending pair (user + assistant) when a run is in flight.
-// Auto-scrolls to the bottom on new content and on mount.
-import { useEffect, useMemo, useRef } from 'react';
-import { MessageSquare } from 'lucide-react';
+// Renders persisted messages, concurrent optimistic runs, and queued follow-ups.
+import { useEffect, useRef } from 'react';
+import { MessageSquare, RotateCcw, Square, X, Zap } from 'lucide-react';
 import type { StoredMessage } from '../../lib/bridge';
-import type { PendingRun } from '../../stores/chat';
+import type { PendingRun, QueuedChatPrompt } from '../../stores/chat';
 import MessageBubble from './MessageBubble';
 
 interface MessageListProps {
   persisted: StoredMessage[];
-  pending: PendingRun | null;
+  runs: PendingRun[];
+  queued: QueuedChatPrompt[];
   activeConvId: string | null;
+  onSendQueuedNow: (promptId: string) => void;
+  onRemoveQueued: (promptId: string) => void;
+  onRetry: (runId: string) => void;
+  onStop: (runId: string) => void;
 }
 
-export default function MessageList({ persisted, pending, activeConvId }: MessageListProps) {
+export default function MessageList({
+  persisted,
+  runs,
+  queued,
+  activeConvId,
+  onSendQueuedNow,
+  onRemoveQueued,
+  onRetry,
+  onStop,
+}: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  const pinnedToBottom = useRef(true);
+  const previousConversationId = useRef(activeConvId);
+  const hasContent = persisted.length > 0 || runs.length > 0 || queued.length > 0;
 
-  const showPending = pending !== null && pending.conversationId === activeConvId;
-
-  // Mid-run refetches (e.g. mobile keyboard blur → refetchOnWindowFocus) can already
-  // contain the persisted copy of the in-flight user message — the server saves it at
-  // request start. Drop that trailing duplicate or the bubble renders twice.
-  const visible = useMemo(() => {
-    if (!showPending || pending === null) return persisted;
-    const last = persisted[persisted.length - 1];
-    if (last && last.role === 'user' && last.content === pending.user) {
-      return persisted.slice(0, -1);
-    }
-    return persisted;
-  }, [persisted, showPending, pending]);
-
-  const hasContent = visible.length > 0 || showPending;
-
-  // Scroll to bottom whenever content changes: new persisted messages, new tokens,
-  // or phase transitions (e.g. citations arrive while answer is still empty).
   useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
+    if (previousConversationId.current !== activeConvId) {
+      previousConversationId.current = activeConvId;
+      pinnedToBottom.current = true;
     }
-  }, [visible.length, pending?.answer, pending?.phase]);
+    if (!pinnedToBottom.current) return;
+    const frame = requestAnimationFrame(() => {
+      if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeConvId, persisted.length, runs, queued.length]);
+
+  function handleScroll() {
+    const list = listRef.current;
+    if (list) {
+      pinnedToBottom.current = list.scrollHeight - list.scrollTop - list.clientHeight < 48;
+    }
+  }
 
   if (!hasContent) {
     return (
@@ -57,8 +67,11 @@ export default function MessageList({ persisted, pending, activeConvId }: Messag
   return (
     <div
       ref={listRef}
+      onScroll={handleScroll}
       className="flex-1 overflow-y-auto px-3 py-4 min-h-0"
       aria-label="Conversation messages"
+      aria-live="polite"
+      aria-busy={runs.some((run) => run.phase !== 'done' && run.phase !== 'stopped')}
     >
       {/* Centered cap: keeps message bubbles in a comfortable reading column on wide
           monitors while the scrollbar stays at the pane edge. */}
@@ -67,12 +80,54 @@ export default function MessageList({ persisted, pending, activeConvId }: Messag
           <MessageBubble key={msg.id} kind="persisted" message={msg} />
         ))}
 
-        {showPending && pending !== null && (
-          <>
-            <MessageBubble kind="optimistic-user" text={pending.user} />
-            <MessageBubble kind="optimistic-assistant" pending={pending} />
-          </>
-        )}
+        {runs.map((run) => (
+          <div key={run.runId} className="contents">
+            <MessageBubble kind="optimistic-user" text={run.user} />
+            <MessageBubble kind="optimistic-assistant" pending={run} />
+            {run.phase !== 'done' && run.phase !== 'stopped' && (
+              <button
+                onClick={() => onStop(run.runId)}
+                className="self-start ml-11 inline-flex items-center gap-1 text-xs text-fg-muted hover:text-fg"
+              >
+                <Square size={11} fill="currentColor" aria-hidden="true" />
+                Stop generating
+              </button>
+            )}
+            {(run.error || run.phase === 'stopped') && (
+              <button
+                onClick={() => onRetry(run.runId)}
+                className="self-start ml-11 inline-flex items-center gap-1 text-xs text-accent hover:text-accent-hover"
+              >
+                <RotateCcw size={12} aria-hidden="true" />
+                Retry
+              </button>
+            )}
+          </div>
+        ))}
+
+        {queued.map((prompt, index) => (
+          <div key={prompt.id} className="ml-auto max-w-[85%] rounded-lg border border-border bg-elevated px-3 py-2">
+            <p className="text-sm text-fg">{prompt.user}</p>
+            <div className="mt-1 flex items-center justify-end gap-2 text-xs text-fg-muted">
+              <span>Queued · {index + 1}</span>
+              <button
+                onClick={() => onRemoveQueued(prompt.id)}
+                className="inline-flex items-center gap-1 hover:text-fg"
+                aria-label="Remove queued message"
+              >
+                <X size={12} aria-hidden="true" />
+                Remove
+              </button>
+              <button
+                onClick={() => onSendQueuedNow(prompt.id)}
+                className="inline-flex items-center gap-1 text-accent hover:text-accent-hover"
+              >
+                <Zap size={12} aria-hidden="true" />
+                Send now
+              </button>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

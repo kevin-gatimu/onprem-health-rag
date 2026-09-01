@@ -61,13 +61,19 @@ export default function MessageBubble(props: MessageBubbleProps) {
       : props.pending.citations;
 
   const pendingRun = props.kind === 'optimistic-assistant' ? props.pending : null;
-  const isDone = props.kind === 'persisted' || props.pending.phase === 'done';
+  const isDone = props.kind === 'persisted'
+    || props.pending.phase === 'done'
+    || props.pending.phase === 'stopped';
 
   return (
     <div className="flex flex-col gap-1 max-w-[90%] px-1">
       {/* Activity strip: visible while no tokens have arrived yet */}
       {pendingRun !== null && !isDone && content === '' && (
         <ActivityStrip pending={pendingRun} />
+      )}
+
+      {pendingRun?.phase === 'stopped' && (
+        <p className="text-xs text-fg-muted">Generation stopped</p>
       )}
 
       {/* Error display */}
@@ -80,7 +86,9 @@ export default function MessageBubble(props: MessageBubbleProps) {
       {/* Streamed / persisted answer text */}
       {content && (
         <div className="text-sm text-fg prose-sm">
-          <Markdown content={content} />
+          {isDone
+            ? <Markdown content={content} />
+            : <div className="whitespace-pre-wrap break-words">{content}</div>}
         </div>
       )}
 

@@ -3,6 +3,7 @@
 //! Boots the HTTP API, connects to DocumentDB, and manages Foundry Local,
 //! source connectors, ingestion, and RAG chat.
 
+mod admission;
 mod agents;
 mod aggregation;
 mod answer;
@@ -16,16 +17,13 @@ mod error;
 mod foundry;
 mod ingest;
 mod logstream;
-mod memory;
-mod nl2sql;
 mod rag;
 mod retrieval;
 mod router;
 mod routes;
 mod settings;
 mod state;
-mod system;
-mod verify;
+mod telemetry;
 
 use config::Config;
 use documentdb::DocumentDb;
@@ -96,10 +94,14 @@ async fn rocket() -> _ {
             if let Err(e) = documentdb::ensure_chat_indexes(&db).await {
                 tracing::warn!(error = %e, "chat index creation failed (non-fatal)");
             }
-            // Create nl2sql schema_catalog indexes (idempotent, best-effort).
-            if let Err(e) = nl2sql::catalog::ensure_nl2sql_indexes(&db, config.embedding_dims).await
-            {
-                tracing::warn!(error = %e, "nl2sql index creation failed (non-fatal)");
+            if let Err(e) = documentdb::ensure_records_indexes(&db).await {
+                tracing::warn!(error = %e, "records index creation failed (non-fatal)");
+            }
+            if let Err(e) = documentdb::ensure_ingest_generations(&db).await {
+                tracing::warn!(error = %e, "ingestion generation backfill failed (non-fatal)");
+            }
+            if let Err(e) = documentdb::recover_abandoned_ingestions(&db).await {
+                tracing::warn!(error = %e, "abandoned ingestion recovery failed (non-fatal)");
             }
             // Build catalog from ingested data now that the DB is reachable.
             aggregation::catalog::build_from_store(&db).await
@@ -131,23 +133,38 @@ async fn rocket() -> _ {
         f.spawn_startup_registration();
     }
 
+    let app_state = AppState::new(
+        config.clone(),
+        db,
+        foundry,
+        router_overrides,
+        initial_catalog,
+    );
+
     // Warm start: prime the fastembed embedder and reranker in the background so
     // the first real request does not pay the ONNX model-load latency (~1–3 s).
     if config.warmup_enabled {
         let wc = config.clone();
+        let warmup_state = app_state.warmup_handle();
         tokio::spawn(async move {
-            let _ = crate::embed::embed_query(&wc, "warmup")
+            let embed_ok = crate::embed::embed_query(&wc, "warmup")
                 .await
                 .inspect(|_| tracing::info!("warmup: embedder ready"))
-                .inspect_err(|e| tracing::warn!(error = %e, "warmup: embedder init failed"));
-            let _ = crate::retrieval::rerank::rerank(
+                .inspect_err(|e| tracing::warn!(error = %e, "warmup: embedder init failed"))
+                .is_ok();
+            let rerank_ok = crate::retrieval::rerank::rerank(
                 &wc,
                 "warmup".to_string(),
                 vec!["warmup".to_string()],
             )
             .await
             .inspect(|_| tracing::info!("warmup: reranker ready"))
-            .inspect_err(|e| tracing::warn!(error = %e, "warmup: reranker init failed"));
+            .inspect_err(|e| tracing::warn!(error = %e, "warmup: reranker init failed"))
+            .is_ok();
+            warmup_state.store(
+                if embed_ok && rerank_ok { 1 } else { 3 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
         });
     }
 
@@ -161,18 +178,14 @@ async fn rocket() -> _ {
         .merge(("port", config.port));
 
     rocket::custom(figment)
-        .manage(AppState::new(
-            config,
-            db,
-            foundry,
-            router_overrides,
-            initial_catalog,
-        ))
+        .manage(app_state)
         .mount(
             "/",
             rocket::routes![
                 routes::health::health,
+                routes::health::ready,
                 routes::logs::logs_stream,
+                routes::metrics::summary,
                 routes::stats::stats
             ],
         )
@@ -225,6 +238,7 @@ async fn rocket() -> _ {
             "/",
             rocket::routes![
                 ingest::routes::start_ingest,
+                ingest::routes::resume_ingest,
                 ingest::routes::ingest_stream,
                 ingest::routes::ingest_history,
                 ingest::routes::delete_ingest_table,
@@ -242,7 +256,7 @@ async fn rocket() -> _ {
         )
         .mount(
             "/",
-            rocket::routes![rag::routes::search, rag::routes::chat,],
+            rocket::routes![rag::routes::route, rag::routes::search, rag::routes::chat,],
         )
         .mount(
             "/",
@@ -256,8 +270,4 @@ async fn rocket() -> _ {
             ],
         )
         .mount("/", rocket::routes![agents::routes::agent])
-        .mount(
-            "/",
-            rocket::routes![nl2sql::routes::nl_query, nl2sql::routes::catalog_refresh,],
-        )
 }

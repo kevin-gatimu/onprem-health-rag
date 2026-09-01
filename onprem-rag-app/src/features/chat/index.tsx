@@ -10,17 +10,18 @@
 //   3. On success: await invalidateQueries(['messages']) then clear().
 //   4. On error: setError (rendered inline in the bubble).
 //
-// All controls lock while pending.phase !== 'done' (single in-flight run invariant).
-import { useState, useCallback, useRef } from 'react';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+// Runs are conversation-scoped, so navigation and the composer remain usable while streaming.
+import { useState, useCallback } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { Layers, PanelLeftOpen } from 'lucide-react';
-import {
-  listConversations,
-  createConversation,
-  getMessages,
-  chat,
-} from '../../lib/bridge';
+import { listConversations, getMessages } from '../../lib/bridge';
 import type { RetrievalOpts } from '../../lib/bridge';
+import {
+  retryChatRun,
+  sendQueuedChatNow,
+  stopChatRun,
+  submitChatPrompt,
+} from '../../lib/conversationRuntime';
 import { useChat } from '../../stores/chat';
 import { toast } from '../../stores/ui';
 import { Button, Modal } from '../../components/ui';
@@ -30,17 +31,24 @@ import Composer from './Composer';
 import RetrievalSettings from './RetrievalSettings';
 
 export default function Chat() {
-  const queryClient = useQueryClient();
-
-  // Component-local view state — none of this needs cross-feature persistence.
-  const [activeConvId, setActiveConvId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [opts, setOpts] = useState<RetrievalOpts>({});
-
-  // Derived streaming gate: lock UI while a run is in flight.
-  const pending = useChat((s) => s.pending);
-  const streaming = pending !== null && pending.phase !== 'done';
+  const activeConvId = useChat((state) => state.activeConversationId);
+  const allRuns = useChat((state) => state.runs);
+  const queues = useChat((state) => state.queues);
+  const draftKey = activeConvId ?? '__new__';
+  const draft = useChat((state) => state.drafts[draftKey] ?? '');
+  const runs = Object.values(allRuns)
+    .filter((run) => run.conversationId === activeConvId)
+    .sort((a, b) => a.startedAt - b.startedAt);
+  const queued = activeConvId ? (queues[activeConvId] ?? []) : [];
+  const busyConversationIds = new Set(
+    Object.values(allRuns)
+      .filter((run) => run.phase !== 'done' && run.phase !== 'stopped')
+      .map((run) => run.conversationId),
+  );
+  const busy = activeConvId !== null && busyConversationIds.has(activeConvId);
 
   // ── Queries ─────────────────────────────────────────────────────────────────
   const { data: conversations = [] } = useQuery({
@@ -56,75 +64,24 @@ export default function Chat() {
     staleTime: 30_000,
   });
 
-  // ── Send flow ────────────────────────────────────────────────────────────────
-  // Synchronous re-entry guard: the `streaming` gate only engages after the async
-  // createConversation resolves, so a fast double-tap (mobile ghost clicks) could
-  // otherwise start two concurrent runs.
-  const sendInFlight = useRef(false);
-  const handleSend = useCallback(async (text: string) => {
-    if (sendInFlight.current) return;
-    sendInFlight.current = true;
-    try {
-      await doSend(text);
-    } finally {
-      sendInFlight.current = false;
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeConvId, opts, queryClient]);
+  const handleSend = useCallback((text: string, sendImmediately: boolean) => {
+    void submitChatPrompt(activeConvId, text, opts, sendImmediately).catch((error) => {
+      toast.error(`Failed to start conversation: ${String(error)}`);
+    });
+  }, [activeConvId, opts]);
 
-  async function doSend(text: string) {
-    const runId = crypto.randomUUID();
-
-    // Ensure we have a conversation to attach messages to.
-    let convId: string;
-    if (activeConvId) {
-      convId = activeConvId;
-    } else {
-      try {
-        const c = await createConversation();
-        convId = c.id;
-        setActiveConvId(c.id);
-        void queryClient.invalidateQueries({ queryKey: ['conversations'] });
-      } catch (e) {
-        toast.error(`Failed to start conversation: ${String(e)}`);
-        return;
-      }
-    }
-
-    // Optimistic: register the run before the bridge invoke so the activity strip
-    // appears immediately and the user bubble is visible during the call.
-    useChat.getState().startRun(runId, convId, text);
-
-    try {
-      // Pass history: [] — the server loads history from DB when conversationId is set.
-      await chat(text, [], opts, convId, runId);
-      // Await the messages re-fetch BEFORE clearing pending so the optimistic
-      // bubbles are replaced atomically (no duplicate-bubble flash).
-      await queryClient.invalidateQueries({ queryKey: ['messages', convId] });
-      void queryClient.invalidateQueries({ queryKey: ['conversations'] }); // refresh title/updated_at
-      useChat.getState().clear();
-    } catch (e) {
-      useChat.getState().setError(runId, String(e));
-    }
-  }
-
-  // ── Navigation helpers ───────────────────────────────────────────────────────
   function handleNewChat() {
-    setActiveConvId(null);
-    useChat.getState().clear();
+    useChat.getState().setActiveConversation(null);
     setDrawerOpen(false);
   }
 
   function handleSelectConv(id: string) {
-    if (id === activeConvId) return;
-    setActiveConvId(id);
-    useChat.getState().clear();
+    useChat.getState().setActiveConversation(id);
     setDrawerOpen(false);
   }
 
   function handleActiveDeleted() {
-    setActiveConvId(null);
-    useChat.getState().clear();
+    useChat.getState().setActiveConversation(null);
   }
 
   // ── Active conversation title for the mobile header ──────────────────────────
@@ -142,7 +99,6 @@ export default function Chat() {
           size="sm"
           leftIcon={<PanelLeftOpen size={15} aria-hidden="true" />}
           onClick={() => setDrawerOpen(true)}
-          disabled={streaming}
           className="min-h-[44px]"
         >
           Chats
@@ -167,7 +123,7 @@ export default function Chat() {
             <ConversationList
               conversations={conversations}
               activeConvId={activeConvId}
-              streaming={streaming}
+           busyConversationIds={busyConversationIds}
               onSelect={handleSelectConv}
               onNewChat={handleNewChat}
               onActiveDeleted={handleActiveDeleted}
@@ -179,12 +135,23 @@ export default function Chat() {
         <div className="flex-1 min-h-0 flex flex-col bg-base">
           <MessageList
             persisted={messages}
-            pending={pending}
+            runs={runs}
+            queued={queued}
             activeConvId={activeConvId}
+            onSendQueuedNow={(promptId) => {
+              if (activeConvId) sendQueuedChatNow(activeConvId, promptId);
+            }}
+            onRemoveQueued={(promptId) => {
+              if (activeConvId) useChat.getState().removeQueued(activeConvId, promptId);
+            }}
+            onRetry={retryChatRun}
+            onStop={stopChatRun}
           />
           <Composer
+            text={draft}
+            onTextChange={(text) => useChat.getState().setDraft(draftKey, text)}
             onSend={handleSend}
-            streaming={streaming}
+            busy={busy}
             onOpenSettings={() => setSettingsOpen(true)}
           />
         </div>
@@ -200,7 +167,7 @@ export default function Chat() {
         <ConversationList
           conversations={conversations}
           activeConvId={activeConvId}
-          streaming={streaming}
+          busyConversationIds={busyConversationIds}
           onSelect={handleSelectConv}
           onNewChat={handleNewChat}
           onActiveDeleted={handleActiveDeleted}

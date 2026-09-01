@@ -17,7 +17,11 @@ pub const SETTINGS_DOC_ID: &str = "app_settings";
 /// Load persisted router overrides (role key -> variant id). Empty if the doc is absent.
 pub async fn load_router_overrides(db: &DocumentDb) -> AppResult<HashMap<String, String>> {
     let mut map = HashMap::new();
-    if let Some(d) = db.settings().find_one(doc! { "_id": SETTINGS_DOC_ID }).await? {
+    if let Some(d) = db
+        .settings()
+        .find_one(doc! { "_id": SETTINGS_DOC_ID })
+        .await?
+    {
         if let Ok(ov) = d.get_document("router_overrides") {
             for (k, v) in ov.iter() {
                 if let Some(s) = v.as_str() {
@@ -39,10 +43,17 @@ pub async fn set_router_override(
 ) -> AppResult<()> {
     let field = format!("router_overrides.{role}");
     let update = match variant_id {
-        Some(v) => doc! { "$set": { field: v, "updated_at": DateTime::now(), "updated_by": updated_by } },
-        None => doc! { "$unset": { field: "" }, "$set": { "updated_at": DateTime::now(), "updated_by": updated_by } },
+        Some(v) => {
+            doc! { "$set": { field: v, "updated_at": DateTime::now(), "updated_by": updated_by } }
+        }
+        None => {
+            doc! { "$unset": { field: "" }, "$set": { "updated_at": DateTime::now(), "updated_by": updated_by } }
+        }
     };
-    db.settings().update_one(doc! { "_id": SETTINGS_DOC_ID }, update).upsert(true).await?;
+    db.settings()
+        .update_one(doc! { "_id": SETTINGS_DOC_ID }, update)
+        .upsert(true)
+        .await?;
     Ok(())
 }
 
