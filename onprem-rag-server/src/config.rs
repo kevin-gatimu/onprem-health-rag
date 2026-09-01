@@ -60,6 +60,12 @@ pub struct RouterConfig {
     pub nl2sql_timeout_secs: u64,
     pub nl2sql_plan_timeout_secs: u64,
     pub nl2sql_sample_values: usize,
+    /// Approximate-token (word-count) ceiling on the assembled schema+examples+question
+    /// prompt sent to the text-to-SQL model. Prevents overrunning phi-4-mini's native
+    /// 4224-token context (the observed failure sent ~8,631 tokens): schema cards for a
+    /// wide table plus few-shots can blow well past that budget on their own. Left with
+    /// headroom for the system prompt (~150 tokens) and the model's own generation.
+    pub nl2sql_prompt_token_budget: usize,
 
     pub extract_enabled: bool,
     pub extract_min_words: usize,
@@ -99,6 +105,10 @@ impl RouterConfig {
             nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
             nl2sql_plan_timeout_secs: env_parse("ONPREM_NL2SQL_PLAN_TIMEOUT_SECS", 30_u64),
             nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
+            // Default budget leaves headroom under the 4224-token NPU cap for the
+            // system prompt (~150 tokens) and the model's SQL completion (~256 tokens,
+            // see AgentKind::TextToSql's max_tokens). 3200 is a conservative fit.
+            nl2sql_prompt_token_budget: env_parse("ONPREM_NL2SQL_PROMPT_TOKEN_BUDGET", 3200_usize),
 
             extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
             extract_min_words: env_parse("ONPREM_EXTRACT_MIN_WORDS", 40_usize),

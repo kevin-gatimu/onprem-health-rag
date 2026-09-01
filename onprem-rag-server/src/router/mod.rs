@@ -436,21 +436,39 @@ fn class_from_intent(intent: QueryIntent, config: &Config) -> RouteClass {
 
 /// Map the Tier-2 model output to a route class. Lenient: an unrecognised
 /// `route` label yields `None` so the caller falls open to semantic.
+///
+/// A `structured`/`hybrid` route additionally requires a *structural* intent
+/// (Aggregation/Trend/Enumeration). The classifier is a small model and can
+/// emit `route: "structured"` paired with a non-structural `intent` (e.g.
+/// "lookup") — that combination used to reach `run_structured`, which rejects
+/// non-structural intents outright, so the whole request errored out instead
+/// of falling open to semantic. Route it to `Semantic` instead: the model's
+/// intent label is more informative here than its route label when they
+/// disagree about whether a DB backend can even answer.
 fn class_from_model(out: &RouteToolOutput, config: &Config) -> Option<RouteClass> {
     let intent = out.intent.as_deref().and_then(parse_intent);
+    let is_structural = |i: QueryIntent| {
+        matches!(
+            i,
+            QueryIntent::Aggregation | QueryIntent::Trend | QueryIntent::Enumeration
+        )
+    };
     match out.route.trim().to_ascii_lowercase().as_str() {
         "conversational" => Some(RouteClass::Conversational),
         "semantic" => Some(RouteClass::Semantic),
-        "structured" => Some(RouteClass::Structured {
-            intent: intent.unwrap_or(QueryIntent::Aggregation),
-            backend: if config.router.text2sql_enabled {
-                StructuredBackend::SourceSql
-            } else {
-                StructuredBackend::DocDb
-            },
-        }),
+        "structured" => match intent {
+            Some(i) if !is_structural(i) => Some(RouteClass::Semantic),
+            _ => Some(RouteClass::Structured {
+                intent: intent.unwrap_or(QueryIntent::Aggregation),
+                backend: if config.router.text2sql_enabled {
+                    StructuredBackend::SourceSql
+                } else {
+                    StructuredBackend::DocDb
+                },
+            }),
+        },
         "hybrid" => Some(RouteClass::Hybrid {
-            cohort_intent: intent.unwrap_or(QueryIntent::Aggregation),
+            cohort_intent: intent.filter(|i| is_structural(*i)).unwrap_or(QueryIntent::Aggregation),
         }),
         _ => None,
     }
@@ -643,6 +661,27 @@ mod tests {
             })
         );
         assert_eq!(class_from_model(&mk("gibberish", None), &config), None);
+
+        // Regression: the classifier can emit `route: "structured"` paired with a
+        // non-structural `intent` such as "lookup" (a small-model mismatch between
+        // its two fields). Previously this constructed `Structured { intent: Lookup }`,
+        // which `run_structured` rejects outright — turning a routable question into
+        // a hard error instead of falling open to semantic retrieval.
+        for bad_intent in ["lookup", "narrative", "multi_hop"] {
+            assert_eq!(
+                class_from_model(&mk("structured", Some(bad_intent)), &config),
+                Some(RouteClass::Semantic),
+                "structured route with intent={bad_intent} should fall open to semantic"
+            );
+        }
+        // hybrid with a non-structural cohort intent falls back to Aggregation
+        // rather than carrying an intent run_structured can't execute.
+        assert_eq!(
+            class_from_model(&mk("hybrid", Some("lookup")), &config),
+            Some(RouteClass::Hybrid {
+                cohort_intent: QueryIntent::Aggregation
+            })
+        );
     }
 
     #[tokio::test]

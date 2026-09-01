@@ -502,6 +502,7 @@ async fn prepare_with_cards(
     let spec = state.spec_for(AgentKind::TextToSql);
     let few_shots: Vec<crate::nl2sql::spec::SqlExample> =
         Vec::with_capacity(state.config.router.nl2sql_fewshots);
+    let prompt_token_budget = state.config.router.nl2sql_prompt_token_budget;
     let plan_timeout =
         std::time::Duration::from_secs(state.config.router.nl2sql_plan_timeout_secs.max(1));
     let planning_deadline = tokio::time::Instant::now() + plan_timeout;
@@ -515,6 +516,7 @@ async fn prepare_with_cards(
             &schema_cards,
             &few_shots,
             question,
+            prompt_token_budget,
         ),
     )
     .await
@@ -540,6 +542,7 @@ async fn prepare_with_cards(
                     question,
                     &emit.sql,
                     &error.to_string(),
+                    prompt_token_budget,
                 ),
             )
             .await
@@ -570,6 +573,7 @@ async fn prepare_with_cards(
                         question,
                         &validated.sql,
                         &error.to_string(),
+                        prompt_token_budget,
                     ),
                 )
                 .await

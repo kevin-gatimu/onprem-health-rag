@@ -1209,6 +1209,11 @@ impl FoundryManager {
                       trend. Use 'semantic' when the answer requires reading and summarising \
                       record text. Use 'conversational' only for greetings, thanks, or \
                       questions about the assistant itself. /no_think";
+        // Skip the forced tool-call path: phi-4-mini's ONNX grammar compiler rejects
+        // the classify_route schema outright ("Unsatisfiable schema"), which costs a
+        // full request round-trip (~11s observed) before plan_tool's grammar-error
+        // retry kicks in. Same fix already applied to plan_list — go straight to
+        // validated JSON content instead of paying for a doomed grammar compile.
         self.plan_tool::<RouteToolOutput>(
             spec,
             system,
@@ -1216,7 +1221,7 @@ impl FoundryManager {
             "classify_route",
             classify_route_tool(),
             classify_route_schema(),
-            true,
+            false,
         )
         .await
     }
