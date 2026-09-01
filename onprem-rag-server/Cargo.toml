@@ -48,7 +48,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "reg
 # and keeps inserts local in the B-tree. (v4 random UUIDs would scatter them.)
 uuid = { version = "1.25.0", features = ["v7", "serde"] }
 # SQL AST parsing for the nl2sql policy gate (SELECT-only + dangerous-function checks).
-sqlparser = { version = "0.53", default-features = false }
+sqlparser = { version = "0.53", default-features = false, features = ["std", "visitor"] }
 # LRU cache for repeated embed_query calls (same query text -> cached vector).
 lru = "0.12"
 sysinfo = "0.39.6"

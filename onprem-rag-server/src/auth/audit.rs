@@ -3,7 +3,7 @@
 //! to the caller's request path so the user-visible operation always completes.
 
 use crate::documentdb::{AUDIT_LOG, DocumentDb};
-use chrono::{DateTime, Utc};
+use mongodb::bson::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ pub struct AuditEntry {
     pub resource: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
-    pub timestamp: DateTime<Utc>,
+    pub timestamp: DateTime,
 }
 
 /// Insert one audit entry into `audit_log`. Best-effort: on failure a warning
@@ -37,7 +37,7 @@ pub async fn write_audit(
         action: action.into(),
         resource: resource.into(),
         details,
-        timestamp: Utc::now(),
+        timestamp: DateTime::now(),
     };
     let col = db.collection::<AuditEntry>(AUDIT_LOG);
     if let Err(e) = col.insert_one(entry).await {

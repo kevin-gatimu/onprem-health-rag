@@ -25,7 +25,7 @@ use crate::config::{Config, RetrievalMode};
 use crate::documentdb::DocumentDb;
 use crate::error::AppResult;
 use crate::foundry::{FoundryManager, GuardedChatStream};
-use crate::memory::{load_working_memory, WorkingMemory};
+use crate::memory::{WorkingMemory, load_working_memory};
 use crate::retrieval::{self, Passage};
 use crate::state::AppState;
 use crate::telemetry::{RequestTrace, Stage};
@@ -103,9 +103,9 @@ pub async fn route(
             }),
         ),
         crate::router::RouteClass::Hybrid { cohort_intent } => (Some(*cohort_intent), None),
-        crate::router::RouteClass::Conversational | crate::router::RouteClass::Semantic => {
-            (None, None)
-        }
+        crate::router::RouteClass::Conversational
+        | crate::router::RouteClass::ConversationMeta
+        | crate::router::RouteClass::Semantic => (None, None),
     };
 
     Ok(Json(RouteResponse {
@@ -200,7 +200,18 @@ pub struct ChatRequest {
 enum ChatData {
     /// Conversational (Tier 0): greeting / thanks / identity / out-of-domain.
     /// One cheap streamed reply, no retrieval and no citations.
-    Conversational { reply_stream: ChatCompletionStream },
+    Conversational { reply_stream: GuardedChatStream },
+    /// Deterministic structured answer, emitted without a model narration pass.
+    DirectStructured { answer: String },
+    /// Structured query executed against the selected operational SQL source.
+    SourceSql {
+        source_id: String,
+        sql: String,
+        explanation: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<serde_json::Value>>,
+        answer: String,
+    },
     /// Structured query (Aggregation, Trend, or Enumeration): narrate the exact
     /// DB rows; no semantic retrieval. The `citations_json` is either an empty
     /// array (aggregate path) or a synthesized list of row passages (list path).
@@ -244,18 +255,18 @@ pub async fn chat(
 
     // Conversation persistence (pre-stream, so errors stay clean HTTP errors).
     // When conversation_id is absent, fall back to body.history (stateless path).
-    let history: Vec<ChatTurn> = trace
+    let memory: WorkingMemory = trace
         .time(Stage::History, async {
             if let Some(cid) = body.conversation_id.as_deref() {
-                use crate::routes::conversations::{
-                    load_history, persist_user_message, verify_owned,
-                };
+                use crate::routes::conversations::{persist_user_message, verify_owned};
                 verify_owned(&state.db, cid, &user.id).await?;
-                let history = load_history(&state.db, cid, &user.id, 10).await;
+                let memory = load_working_memory(&state.db, cid, &state.config).await;
                 persist_user_message(&state.db, cid, &user.id, &body.question).await?;
-                Ok::<Vec<ChatTurn>, crate::error::AppError>(history)
+                Ok::<WorkingMemory, crate::error::AppError>(memory)
             } else {
-                Ok::<Vec<ChatTurn>, crate::error::AppError>(body.history.clone())
+                Ok::<WorkingMemory, crate::error::AppError>(WorkingMemory::from_turns(
+                    body.history.clone(),
+                ))
             }
         })
         .await?;
@@ -266,7 +277,7 @@ pub async fn chat(
     // everything else (including hybrid, until its Phase-C executor lands) is semantic.
     // Any structured failure falls back silently to semantic — a correct grounded answer
     // beats an error. See plans/17-intent-router-v2.md.
-    let has_history = !history.is_empty();
+    let has_history = !memory.is_empty();
     let decision = trace
         .time(
             Stage::Route,
@@ -321,75 +332,97 @@ pub async fn chat(
             let user = format!(
                 "Conversation summary: {}\nRecent turns:\n{}\n\nQuestion: {}",
                 memory.summary.as_deref().unwrap_or("(none)"),
-                memory.tail.iter().map(|t| format!("{}: {}", t.role, t.content)).collect::<Vec<_>>().join("\n"),
+                memory
+                    .tail
+                    .iter()
+                    .map(|t| format!("{}: {}", t.role, t.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
                 body.question,
             );
             let reply_stream = foundry.generate_stream_with(&spec, system, &user).await?;
             ChatData::Conversational { reply_stream }
         }
 
-        crate::router::RouteClass::Structured { intent, .. } => {
+        crate::router::RouteClass::Structured { intent, backend } => {
             let intent = *intent;
-            let catalog = state.catalog(); // Arc<Catalog>
-            match run_structured(
-                &state.db,
-                foundry,
-                &user,
-                state,
-                &catalog,
-                intent,
-                &body.question,
-                &trace,
-            )
-            .await
-            {
-                Ok(structured) => {
-                    // Flatten the Structured enum into the simpler ChatData shape.
-                    // The /chat SSE contract is citations then token* then done —
-                    // we never emit spec/rows/pipeline events here (those are agents-only).
-                    let (citations_json, narration_stream, passages_for_persist) = match structured
-                    {
-                        Structured::Aggregate {
-                            narration_stream, ..
-                        } => {
-                            // No passages to cite for aggregations; the numbers are the source.
-                            ("[]".to_string(), narration_stream, Vec::new())
-                        }
+            let sql_data = if *backend == crate::router::StructuredBackend::SourceSql {
+                match crate::nl2sql::routes::prepare_auto_query(state.inner(), &body.question).await
+                {
+                    Ok(Some(prepared)) => Some(ChatData::SourceSql {
+                        source_id: prepared.source_id,
+                        sql: prepared.sql,
+                        explanation: prepared.explanation,
+                        columns: prepared.columns,
+                        rows: prepared.rows,
+                        answer: prepared.answer,
+                    }),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(%error, "live SQL query failed; falling back to ingested records");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            if let Some(data) = sql_data {
+                data
+            } else {
+                let catalog = state.catalog(); // Arc<Catalog>
+                match run_structured(
+                    &state.db,
+                    foundry,
+                    &user,
+                    state,
+                    &catalog,
+                    intent,
+                    &body.question,
+                    &trace,
+                )
+                .await
+                {
+                    Ok(structured) => match structured {
+                        Structured::Direct { answer } => ChatData::DirectStructured { answer },
+                        Structured::Aggregate { narration_stream } => ChatData::Structured {
+                            citations_json: "[]".to_string(),
+                            narration_stream,
+                            passages_for_persist: Vec::new(),
+                        },
                         Structured::List {
                             citations_json,
                             narration_stream,
-                            ..
                         } => {
                             let passages = serde_json::from_str(&citations_json).unwrap_or_else(|error| {
-                                tracing::warn!(%error, "failed to decode list citations for persistence");
-                                Vec::new()
-                            });
-                            (citations_json, narration_stream, passages)
+                            tracing::warn!(%error, "failed to decode list citations for persistence");
+                            Vec::new()
+                        });
+                            ChatData::Structured {
+                                citations_json,
+                                narration_stream,
+                                passages_for_persist: passages,
+                            }
                         }
-                    };
-                    ChatData::Structured {
-                        citations_json,
-                        narration_stream,
-                        passages_for_persist,
+                    },
+                    Err(e) => {
+                        tracing::info!(
+                            intent = ?intent,
+                            error = %e,
+                            "run_structured failed; falling back to semantic retrieval"
+                        );
+                        build_semantic_chat_data(
+                            foundry,
+                            state,
+                            &memory,
+                            &body.question,
+                            mode,
+                            rerank,
+                            top_k,
+                            &trace,
+                        )
+                        .await?
                     }
-                }
-                Err(e) => {
-                    tracing::info!(
-                        intent = ?intent,
-                        error = %e,
-                        "run_structured failed; falling back to semantic retrieval"
-                    );
-                    build_semantic_chat_data(
-                        foundry,
-                        state,
-                        &history,
-                        &body.question,
-                        mode,
-                        rerank,
-                        top_k,
-                        &trace,
-                    )
-                    .await?
                 }
             }
         }
@@ -402,7 +435,7 @@ pub async fn chat(
             build_semantic_chat_data(
                 foundry,
                 state,
-                &history,
+                &memory,
                 &body.question,
                 mode,
                 rerank,
@@ -416,7 +449,7 @@ pub async fn chat(
             build_semantic_chat_data(
                 foundry,
                 state,
-                &history,
+                &memory,
                 &body.question,
                 mode,
                 rerank,
@@ -500,12 +533,89 @@ pub async fn chat(
                                     &uid,
                                     &full_answer,
                                     &[],
+                                    None,
                                 ),
                             )
                             .await
                         {
                             tracing::warn!(error = %e, "failed to persist conversational message");
                         }
+                    }
+                }
+            }
+
+            ChatData::SourceSql {
+                source_id,
+                sql,
+                explanation,
+                columns,
+                rows,
+                answer,
+            } => {
+                yield Event::data("[]".to_string()).event("citations");
+                yield Event::data(serde_json::json!({
+                    "source_id": &source_id,
+                    "sql": &sql,
+                    "explanation": &explanation,
+                }).to_string()).event("sql");
+                yield Event::data(serde_json::to_string(&columns).unwrap_or_else(|_| "[]".to_string())).event("columns");
+                yield Event::data(serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())).event("rows");
+
+                trace.record_output(&answer);
+                full_answer.push_str(&answer);
+                yield token_event(&answer);
+
+                if let Some(cid) = &persist_target {
+                    if !had_error {
+                        use crate::routes::conversations::{SqlResult, persist_sql_assistant_message};
+                        let result = SqlResult {
+                            source_id: source_id.clone(),
+                            sql: sql.clone(),
+                            columns: columns.clone(),
+                            rows: rows.clone(),
+                        };
+                        if let Err(error) = trace
+                            .time(
+                                Stage::Persist,
+                                persist_sql_assistant_message(
+                                    &db,
+                                    cid.as_str(),
+                                    &uid,
+                                    &full_answer,
+                                    &result,
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%error, %source_id, "failed to persist SQL assistant message");
+                        }
+                    }
+                }
+            }
+
+            ChatData::DirectStructured { answer } => {
+                yield Event::data("[]".to_string()).event("citations");
+                trace.record_output(&answer);
+                full_answer.push_str(&answer);
+                yield token_event(&answer);
+
+                if let Some(cid) = &persist_target {
+                    use crate::routes::conversations::persist_assistant_message;
+                    if let Err(e) = trace
+                        .time(
+                            Stage::Persist,
+                            persist_assistant_message(
+                                &db,
+                                cid.as_str(),
+                                &uid,
+                                &full_answer,
+                                &[],
+                                None,
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(error = %e, "failed to persist structured assistant message");
                     }
                 }
             }
@@ -557,6 +667,7 @@ pub async fn chat(
                                     &uid,
                                     &full_answer,
                                     &passages_for_persist,
+                                    None,
                                 ),
                             )
                             .await
@@ -612,39 +723,10 @@ pub async fn chat(
                     }
                 }
 
-                // Persist the assistant reply if a conversation is present and no error.
-                // A persistence failure must not crash the stream — log and continue.
-                if let Some(cid) = &persist_target {
-                    if !had_error {
-                        use crate::routes::conversations::persist_assistant_message;
-                        if let Err(e) = trace
-                            .time(
-                                Stage::Persist,
-                                persist_assistant_message(
-                                    &db,
-                                    cid.as_str(),
-                                    &uid,
-                                    &full_answer,
-                                    &passages_for_persist,
-                                ),
-                            )
-                            .await
-                        {
-                            tracing::warn!(error = %e, "failed to persist assistant message");
-                        }
-                    }
-                }
-
                 // Post-stream safety pass (plan 25). Runs only once the answer has
                 // finished streaming: the user already has every token, so this delays
                 // the verdict badge and nothing else.
-                //
-                // Two independent checks land in one `verify` event:
-                //   - the deterministic marker check ([N] pointing past the citation
-                //     list), which costs nothing and always runs;
-                //   - the model-backed faithfulness check, which is gated on
-                //     ONPREM_VERIFY_ENABLED and falls open to `skipped`.
-                if !had_error && !passages_for_persist.is_empty() {
+                let verification = if !had_error && !passages_for_persist.is_empty() {
                     let n = passages_for_persist.len();
                     let invalid: Vec<usize> = extract_citation_refs(&full_answer)
                         .into_iter()
@@ -664,6 +746,36 @@ pub async fn chat(
                     if report.is_reportable() {
                         if let Ok(json) = serde_json::to_string(&report) {
                             yield Event::data(json).event("verify");
+                        }
+                        Some(report)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Persist the report on this exact assistant message. This remains safe
+                // when multiple runs overlap in one conversation because no later
+                // "update latest message" lookup is needed.
+                if let Some(cid) = &persist_target {
+                    if !had_error {
+                        use crate::routes::conversations::persist_assistant_message;
+                        if let Err(e) = trace
+                            .time(
+                                Stage::Persist,
+                                persist_assistant_message(
+                                    &db,
+                                    cid.as_str(),
+                                    &uid,
+                                    &full_answer,
+                                    &passages_for_persist,
+                                    verification.as_ref(),
+                                ),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %e, "failed to persist assistant message");
                         }
                     }
                 }
@@ -693,10 +805,11 @@ async fn build_semantic_chat_data(
     top_k: usize,
     trace: &RequestTrace,
 ) -> AppResult<ChatData> {
+    let rewrite_turns = memory.rewrite_turns();
     let (standalone, queries) = trace
         .time(
             Stage::RewriteExpand,
-            prepare_queries(foundry, &state.config, history, question),
+            prepare_queries(foundry, &state.config, &rewrite_turns, question),
         )
         .await;
     let _retrieval_permit = state.admission.retrieval().await?;
@@ -734,7 +847,9 @@ async fn build_semantic_chat_data(
     let stream = if refuse {
         None
     } else {
-        let prompt = trace.time_sync(Stage::Prompt, || build_prompt(&passages, &standalone));
+        let prompt = trace.time_sync(Stage::Prompt, || {
+            build_prompt(&passages, memory, &standalone)
+        });
         Some(
             trace
                 .time(
@@ -768,9 +883,14 @@ async fn persist_and_compact(
 ) {
     use crate::routes::conversations::{clip_message_bytes, persist_assistant_message};
     let content = clip_message_bytes(full_answer, cfg.message_max_bytes);
-    match persist_assistant_message(db, cid, uid, &content, passages).await {
+    match persist_assistant_message(db, cid, uid, &content, passages, None).await {
         Ok(()) => {
-            crate::memory::maybe_spawn_compaction(db.clone(), foundry_handle.clone(), cfg.clone(), cid.to_string());
+            crate::memory::maybe_spawn_compaction(
+                db.clone(),
+                foundry_handle.clone(),
+                cfg.clone(),
+                cid.to_string(),
+            );
         }
         Err(e) => tracing::warn!(error = %e, kind, "failed to persist assistant message"),
     }

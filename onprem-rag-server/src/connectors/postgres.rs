@@ -9,7 +9,8 @@ use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 use super::{
-    ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err, make_row_filtered,
+    ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
+    make_row_filtered,
 };
 use crate::error::{AppError, AppResult};
 
@@ -181,10 +182,12 @@ impl SourceConnector for PostgresConnector {
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
                 TableSchema {
                     name,
                     row_count,
                     columns,
+                    fk_edges,
                 }
             })
             .collect();
@@ -259,9 +262,7 @@ impl SourceConnector for PostgresConnector {
 
         // Wrap the user SQL so we get one JSONB object per row with column names as keys.
         // statement_timeout is set per-transaction so it never leaks to subsequent queries.
-        let wrapped = format!(
-            "SELECT to_jsonb(_w) AS _row FROM ({sql}) AS _w LIMIT {max_rows}"
-        );
+        let wrapped = format!("SELECT to_jsonb(_w) AS _row FROM ({sql}) AS _w LIMIT {max_rows}");
         let timeout_ms = timeout_secs * 1_000;
 
         // Read-only transaction with a per-statement timeout so no DML can slip through
@@ -317,8 +318,10 @@ impl SourceConnector for PostgresConnector {
                 .map_err(|e| AppError::Internal(format!("decoding result row {i} failed: {e}")))?;
             match obj {
                 Value::Object(map) => {
-                    let row: Vec<Value> =
-                        columns.iter().map(|k| map.get(k).cloned().unwrap_or(Value::Null)).collect();
+                    let row: Vec<Value> = columns
+                        .iter()
+                        .map(|k| map.get(k).cloned().unwrap_or(Value::Null))
+                        .collect();
                     result_rows.push(row);
                 }
                 other => {

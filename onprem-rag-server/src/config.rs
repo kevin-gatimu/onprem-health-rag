@@ -51,6 +51,26 @@ pub struct RouterConfig {
     pub model_router_enabled: bool, // ONPREM_ROUTER_MODEL_ENABLED
     /// Capacity of the per-process Tier-2 route-decision LRU cache (entries).
     pub router_cache_size: usize, // ONPREM_ROUTER_CACHE_SIZE
+
+    pub text2sql_enabled: bool,
+    pub sql_model: String,
+    pub nl2sql_tables_max: usize,
+    pub nl2sql_fewshots: usize,
+    pub nl2sql_max_rows: i64,
+    pub nl2sql_timeout_secs: u64,
+    pub nl2sql_plan_timeout_secs: u64,
+    pub nl2sql_sample_values: usize,
+
+    pub extract_enabled: bool,
+    pub extract_min_words: usize,
+    pub extract_concurrency: usize,
+    pub extract_timeout_secs: u64,
+    pub extract_max_chars: usize,
+
+    pub verify_enabled: bool,
+    pub verify_timeout_secs: u64,
+    pub verify_passage_chars: usize,
+    pub verify_max_passages: usize,
 }
 
 impl RouterConfig {
@@ -70,6 +90,26 @@ impl RouterConfig {
             npu_ctx_cap: env_parse("ONPREM_NPU_CTX_CAP", 4224_u64),
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
+
+            text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", true),
+            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini"),
+            nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
+            nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
+            nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
+            nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
+            nl2sql_plan_timeout_secs: env_parse("ONPREM_NL2SQL_PLAN_TIMEOUT_SECS", 30_u64),
+            nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
+
+            extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
+            extract_min_words: env_parse("ONPREM_EXTRACT_MIN_WORDS", 40_usize),
+            extract_concurrency: env_parse("ONPREM_EXTRACT_CONCURRENCY", 2_usize),
+            extract_timeout_secs: env_parse("ONPREM_EXTRACT_TIMEOUT_SECS", 30_u64),
+            extract_max_chars: env_parse("ONPREM_EXTRACT_MAX_CHARS", 6000_usize),
+
+            verify_enabled: env_parse("ONPREM_VERIFY_ENABLED", false),
+            verify_timeout_secs: env_parse("ONPREM_VERIFY_TIMEOUT_SECS", 45_u64),
+            verify_passage_chars: env_parse("ONPREM_VERIFY_PASSAGE_CHARS", 1200_usize),
+            verify_max_passages: env_parse("ONPREM_VERIFY_MAX_PASSAGES", 6_usize),
         }
     }
 }
@@ -165,6 +205,14 @@ pub struct Config {
     pub conversation_retention_days: i64,
     /// Byte cap on a stored message's content; longer content is clipped with a marker.
     pub message_max_bytes: usize,
+
+    // Schema metadata maintenance
+    /// Seconds between structural drift checks. Zero disables background polling.
+    pub schema_poll_interval_secs: u64,
+    /// Maximum sources inspected concurrently by the drift poller.
+    pub schema_poll_concurrency: usize,
+    /// Rows sampled per table for bounded aggregate column profiles.
+    pub schema_profile_sample_rows: usize,
 }
 
 impl Config {
@@ -252,6 +300,10 @@ impl Config {
             compact_after_turns: env_parse("ONPREM_COMPACT_AFTER_TURNS", 12_i64),
             conversation_retention_days: env_parse("ONPREM_CONVERSATION_RETENTION_DAYS", 0_i64),
             message_max_bytes: env_parse("ONPREM_MESSAGE_MAX_BYTES", 32768_usize),
+
+            schema_poll_interval_secs: env_parse("ONPREM_SCHEMA_POLL_INTERVAL_SECS", 300_u64),
+            schema_poll_concurrency: env_parse("ONPREM_SCHEMA_POLL_CONCURRENCY", 2_usize).max(1),
+            schema_profile_sample_rows: env_parse("ONPREM_SCHEMA_PROFILE_SAMPLE_ROWS", 256_usize),
         }
     }
 

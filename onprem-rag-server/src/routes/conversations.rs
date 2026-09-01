@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::{AppError, AppResult};
+use crate::rag::ChatTurn;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,14 @@ pub struct StructuredResult {
     pub pipeline: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SqlResult {
+    pub source_id: String,
+    pub sql: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MessageOut {
     pub id: String,
@@ -51,12 +60,18 @@ pub struct MessageOut {
     pub content: String,
     /// Null for user messages; the reranked passages for semantic assistant messages.
     pub citations: Option<Vec<crate::retrieval::Passage>>,
+    /// Post-generation grounding verification for plain chat assistant messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<crate::verify::VerifyReport>,
     /// Routed kind for agent assistant messages; `None` for user messages and plain chat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
     /// Structured aggregation result for structured-path agent assistant messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredResult>,
+    /// Exact operational SQL result used for a text-to-SQL chat answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_result: Option<SqlResult>,
     pub created_at: String,
 }
 
@@ -300,8 +315,35 @@ pub(crate) fn clip_message_bytes(s: &str, max_bytes: usize) -> String {
     if s.len() <= max_bytes {
         return s.to_string();
     }
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &s[..end])
+}
 
-    // Fetch the N most-recent messages (descending), then reverse to ascending.
+/// Load recent messages in ascending order for history-aware generation.
+pub(crate) async fn load_history(
+    db: &DocumentDb,
+    conversation_id: &str,
+    user_id: &str,
+    limit: i64,
+) -> Vec<ChatTurn> {
+    let oid = match parse_oid(conversation_id) {
+        Ok(oid) => oid,
+        Err(_) => return Vec::new(),
+    };
+    let owned = db
+        .chat_conversations()
+        .find_one(doc! { "_id": oid, "user_id": user_id })
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    if !owned {
+        return Vec::new();
+    }
+
     let docs: Vec<Document> = match db
         .chat_messages()
         .find(doc! { "conversation_id": conversation_id })
@@ -315,13 +357,14 @@ pub(crate) fn clip_message_bytes(s: &str, max_bytes: usize) -> String {
 
     let mut turns: Vec<ChatTurn> = docs
         .iter()
-        .filter_map(|d| {
-            let role = d.get_str("role").ok()?.to_string();
-            let content = d.get_str("content").ok()?.to_string();
-            Some(ChatTurn { role, content })
+        .filter_map(|document| {
+            Some(ChatTurn {
+                role: document.get_str("role").ok()?.to_string(),
+                content: document.get_str("content").ok()?.to_string(),
+            })
         })
         .collect();
-    turns.reverse(); // oldest → newest
+    turns.reverse();
     turns
 }
 
@@ -375,6 +418,7 @@ pub(crate) async fn persist_assistant_message(
     user_id: &str,
     content: &str,
     citations: &[crate::retrieval::Passage],
+    verify: Option<&crate::verify::VerifyReport>,
 ) -> AppResult<()> {
     let oid = parse_oid(conversation_id)?;
 
@@ -383,6 +427,40 @@ pub(crate) async fn persist_assistant_message(
     let citations_json = serde_json::to_string(citations).unwrap_or_else(|_| "[]".to_string());
 
     let now = BsonDateTime::now();
+    let mut message = doc! {
+        "_id": ObjectId::new(),
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "role": "assistant",
+        "content": content,
+        "citations_json": citations_json,
+        "created_at": now,
+    };
+    if let Some(report) = verify {
+        let verify_json = serde_json::to_string(report)
+            .map_err(|e| crate::error::AppError::Internal(e.to_string()))?;
+        message.insert("verify_json", verify_json);
+    }
+    db.chat_messages().insert_one(message).await?;
+
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, doc! { "$set": { "updated_at": now } })
+        .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn persist_sql_assistant_message(
+    db: &DocumentDb,
+    conversation_id: &str,
+    user_id: &str,
+    content: &str,
+    result: &SqlResult,
+) -> AppResult<()> {
+    let oid = parse_oid(conversation_id)?;
+    let now = BsonDateTime::now();
+    let sql_result_json = serde_json::to_string(result)
+        .map_err(|error| crate::error::AppError::Internal(error.to_string()))?;
     db.chat_messages()
         .insert_one(doc! {
             "_id": ObjectId::new(),
@@ -390,15 +468,14 @@ pub(crate) async fn persist_assistant_message(
             "user_id": user_id,
             "role": "assistant",
             "content": content,
-            "citations_json": citations_json,
+            "citations_json": "[]",
+            "sql_result_json": sql_result_json,
             "created_at": now,
         })
         .await?;
-
     db.chat_conversations()
         .update_one(doc! { "_id": oid }, doc! { "$set": { "updated_at": now } })
         .await?;
-
     Ok(())
 }
 
@@ -519,6 +596,16 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
         .ok()
         .and_then(|s| serde_json::from_str::<StructuredResult>(s).ok());
 
+    let sql_result = d
+        .get_str("sql_result_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<SqlResult>(s).ok());
+
+    let verify = d
+        .get_str("verify_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<crate::verify::VerifyReport>(s).ok());
+
     let agent_kind = d.get_str("agent_kind").ok().map(str::to_string);
 
     MessageOut {
@@ -529,8 +616,58 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
         role: d.get_str("role").unwrap_or("").to_string(),
         content: d.get_str("content").unwrap_or("").to_string(),
         citations,
+        verify,
         agent_kind,
         structured,
+        sql_result,
         created_at: read_dt_field(d, "created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::verify::VerifyStatus;
+
+    #[test]
+    fn stored_sql_result_is_returned_with_message() {
+        let result = serde_json::json!({
+            "source_id": "source-1",
+            "sql": "SELECT COUNT(*) FROM patients",
+            "columns": ["count"],
+            "rows": [[42]]
+        });
+        let document = doc! {
+            "role": "assistant",
+            "content": "There are 42 patients.",
+            "sql_result_json": result.to_string(),
+        };
+
+        let message = msg_doc_to_out(&document);
+        let sql_result = message.sql_result.expect("SQL result");
+        assert_eq!(sql_result.source_id, "source-1");
+        assert_eq!(sql_result.columns, vec!["count"]);
+        assert_eq!(sql_result.rows[0][0], serde_json::json!(42));
+    }
+
+    #[test]
+    fn stored_verification_is_returned_with_message() {
+        let report = serde_json::json!({
+            "status": "partial",
+            "claims": [],
+            "unsupported": 1,
+            "citation_overflow": [3]
+        });
+        let document = doc! {
+            "role": "assistant",
+            "content": "answer",
+            "verify_json": report.to_string(),
+        };
+
+        let message = msg_doc_to_out(&document);
+        let verification = message.verify.expect("verification report");
+        assert_eq!(verification.status, VerifyStatus::Partial);
+        assert_eq!(verification.unsupported, 1);
+        assert_eq!(verification.citation_overflow, vec![3]);
     }
 }

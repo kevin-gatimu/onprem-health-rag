@@ -529,7 +529,10 @@ pub async fn list_models(bridge: State<'_, Bridge>) -> Result<Vec<ModelSummary>,
 
 /// `POST /models/select` — download (if needed), load, and select a chat model. Admin only.
 #[tauri::command]
-pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<SelectModelResponse, String> {
+pub async fn select_model(
+    model: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SelectModelResponse, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url("/models/select");
     let resp = bridge
@@ -548,7 +551,7 @@ pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<Se
         .json()
         .await
         .map_err(|e| format!("invalid response: {e}"))?;
-    Ok(body.model)
+    Ok(body)
 }
 
 /// `PUT /settings/router` — persist (or clear, when `variant_id` is `None`) a role's
@@ -737,19 +740,28 @@ pub async fn pull_model(
             "progress" => {
                 let _ = app.emit(
                     "model://progress",
-                    ModelEvent { variant_id: variant_id.clone(), data: event.data },
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data,
+                    },
                 );
             }
             "status" => {
                 let _ = app.emit(
                     "model://status",
-                    ModelEvent { variant_id: variant_id.clone(), data: event.data },
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data,
+                    },
                 );
             }
             "error" => {
                 let _ = app.emit(
                     "model://error",
-                    ModelEvent { variant_id: variant_id.clone(), data: event.data.clone() },
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data.clone(),
+                    },
                 );
                 return Err(event.data);
             }
@@ -759,7 +771,10 @@ pub async fn pull_model(
     }
     let _ = app.emit(
         "model://done",
-        ModelEvent { variant_id: variant_id.clone(), data: String::new() },
+        ModelEvent {
+            variant_id: variant_id.clone(),
+            data: String::new(),
+        },
     );
     Ok(())
 }
@@ -903,6 +918,60 @@ pub struct SourceInfo {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogStatus {
+    pub source_id: String,
+    pub active_version: String,
+    pub schema_hash: String,
+    pub captured_at: Option<String>,
+    pub table_count: i64,
+    pub status: String,
+    pub health: String,
+    pub last_check_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub drift_detected: bool,
+    pub consecutive_failures: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogRefresh {
+    pub source_id: String,
+    pub tables_indexed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogHistoryItem {
+    pub checked_at: Option<String>,
+    pub trigger: String,
+    pub outcome: String,
+    pub previous_hash: Option<String>,
+    pub observed_hash: Option<String>,
+    pub table_count: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataAlias {
+    pub table: String,
+    pub column: Option<String>,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataRelationship {
+    pub from_table: String,
+    pub from_column: String,
+    pub to_table: String,
+    pub to_column: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataOverrides {
+    pub aliases: Vec<MetadataAlias>,
+    pub relationships: Vec<MetadataRelationship>,
+}
+
 /// Source definition sent from the add/test form. Mirrors the server's `SourceInput`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInput {
@@ -949,6 +1018,122 @@ pub async fn list_sources(bridge: State<'_, Bridge>) -> Result<Vec<SourceInfo>, 
         return Err(error_body(resp).await);
     }
     resp.json::<Vec<SourceInfo>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `GET /nl2sql/<source_id>/catalog` — inspect active schema metadata. Admin only.
+#[tauri::command]
+pub async fn get_schema_catalog(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SchemaCatalogStatus, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!("/nl2sql/{source_id}/catalog"));
+    let resp = bridge
+        .client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<SchemaCatalogStatus>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `POST /nl2sql/<source_id>/catalog/refresh` — rebuild schema metadata. Admin only.
+#[tauri::command]
+pub async fn refresh_schema_catalog(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SchemaCatalogRefresh, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!("/nl2sql/{source_id}/catalog/refresh"));
+    let resp = bridge
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<SchemaCatalogRefresh>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_schema_catalog_history(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<SchemaCatalogHistoryItem>, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .get(bridge.url(&format!("/nl2sql/{source_id}/catalog/history?limit=25")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_schema_metadata_overrides(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<MetadataOverrides, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .get(bridge.url(&format!("/nl2sql/{source_id}/catalog/overrides")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn save_schema_metadata_overrides(
+    source_id: String,
+    overrides: MetadataOverrides,
+    bridge: State<'_, Bridge>,
+) -> Result<MetadataOverrides, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .put(bridge.url(&format!("/nl2sql/{source_id}/catalog/overrides")))
+        .bearer_auth(token)
+        .json(&overrides)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
         .await
         .map_err(|e| format!("invalid response: {e}"))
 }
@@ -1808,6 +1993,14 @@ pub struct StructuredResult {
     pub pipeline: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlResult {
+    pub source_id: String,
+    pub sql: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+}
+
 /// One stored message in a conversation. Mirrors the server's `MessageOut`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -1816,6 +2009,9 @@ pub struct StoredMessage {
     pub content: String,
     /// `None` for user messages; `Some(passages)` for assistant messages.
     pub citations: Option<Vec<Passage>>,
+    /// Persisted grounding verdict for verified assistant messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<serde_json::Value>,
     pub created_at: String,
     /// Present only for agent messages.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1823,6 +2019,9 @@ pub struct StoredMessage {
     /// Present only for structured-result agent messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredResult>,
+    /// Present for chat answers backed by a live operational SQL query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_result: Option<SqlResult>,
 }
 
 /// Envelope stamped onto every `chat://*` event so the frontend can drop events
@@ -1925,6 +2124,16 @@ pub async fn chat(
                     "citations" => {
                         let _ = app.emit(
                             "chat://citations",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "sql" | "columns" | "rows" => {
+                        let channel = format!("chat://{}", event.event);
+                        let _ = app.emit(
+                            &channel,
                             ChatEvent {
                                 run_id: run_id.clone(),
                                 data: event.data,

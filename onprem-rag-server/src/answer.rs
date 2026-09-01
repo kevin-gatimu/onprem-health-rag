@@ -6,18 +6,17 @@
 //! The route files own their SSE contracts; this module owns the model and DB
 //! work. Keeping it at the crate root avoids a `rag` -> `agents` import cycle.
 
-use foundry_local_sdk::ChatCompletionStream;
-
 use crate::aggregation::catalog::Catalog;
 use crate::aggregation::execute;
 use crate::aggregation::intent::QueryIntent;
 use crate::aggregation::list;
+use crate::aggregation::spec::{Metric, MetricOp, RunAggregation};
 use crate::aggregation::validate;
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::AppResult;
-use crate::foundry::FoundryManager;
 use crate::foundry::router::AgentKind;
+use crate::foundry::{FoundryManager, GuardedChatStream};
 use crate::state::AppState;
 use crate::telemetry::{RequestTrace, Stage};
 
@@ -28,6 +27,8 @@ use crate::telemetry::{RequestTrace, Stage};
 /// Pre-computed structured answer ready to stream from an SSE route.
 #[allow(dead_code)]
 pub enum Structured {
+    /// Exact answer that does not require an LLM narration pass.
+    Direct { answer: String },
     /// Aggregation (Count, Group, Trend) answer.
     Aggregate {
         /// Already-opened narration stream (consumed inside the EventStream!).
@@ -178,6 +179,63 @@ pub fn intent_to_kind(intent: QueryIntent) -> AgentKind {
 // tool call rather than free-text JSON parsing. See `plans/17-intent-router-v2.md`.
 
 // ---------------------------------------------------------------------------
+// Deterministic structured plans
+// ---------------------------------------------------------------------------
+
+fn normalize_question(question: &str) -> String {
+    question
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn simple_patient_count_plan(question: &str, catalog: &Catalog) -> Option<RunAggregation> {
+    let normalized = normalize_question(question);
+    let is_unfiltered_total = matches!(
+        normalized.as_str(),
+        "how many patients"
+            | "how many patients do we have"
+            | "how many patients are there"
+            | "number of patients"
+            | "what is the number of patients"
+            | "total patients"
+            | "total number of patients"
+            | "what is the total number of patients"
+    );
+    if !is_unfiltered_total {
+        return None;
+    }
+
+    let collection = catalog
+        .collections
+        .keys()
+        .find(|name| matches!(name.to_ascii_lowercase().as_str(), "patient" | "patients"))?
+        .clone();
+
+    Some(RunAggregation {
+        collection,
+        filter: serde_json::json!({}),
+        group_by: Vec::new(),
+        metric: Metric {
+            op: MetricOp::Count,
+            field: None,
+        },
+        time_bucket: None,
+        sort: None,
+        top_n: Some(1),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Core plan-to-narrate routine
 // ---------------------------------------------------------------------------
 
@@ -207,32 +265,42 @@ pub async fn run_structured(
             let spec = state.spec_for(kind);
             let planner_system = build_agg_planner_system(catalog, intent);
 
-            // 1. Plan: model emits a RunAggregation tool call.
-            let planned = trace
-                .time(
-                    Stage::Plan,
-                    foundry.plan_aggregation(&spec, &planner_system, question),
-                )
-                .await?;
+            // Exact unfiltered patient totals do not need model planning. Besides
+            // reducing latency, this keeps a basic count available on ORT backends
+            // that cannot compile the aggregation tool grammar.
+            let deterministic_plan = (intent == QueryIntent::Aggregation)
+                .then(|| simple_patient_count_plan(question, catalog))
+                .flatten();
+            let direct_count = deterministic_plan.is_some();
+            let planned = if let Some(plan) = deterministic_plan {
+                plan
+            } else {
+                trace
+                    .time(
+                        Stage::Plan,
+                        foundry.plan_aggregation(&spec, &planner_system, question),
+                    )
+                    .await?
+            };
 
             // 2. Validate + sanitize against the current catalog.
             let validated =
                 trace.time_sync(Stage::Validate, || validate::validate(&planned, catalog))?;
 
             // 3. Execute pipeline against DocumentDB.
-            let (rows, pipeline_docs) = trace
+            let (rows, _pipeline_docs) = trace
                 .time(Stage::Execute, execute::run(db, user, &validated))
                 .await?;
 
-            let spec_json = serde_json::to_string(&validated).unwrap_or_else(|_| "{}".to_string());
-            let rows_json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
-            let pipeline_json = serde_json::to_string(
-                &pipeline_docs
-                    .iter()
-                    .map(|d| mongodb::bson::Bson::Document(d.clone()).into_relaxed_extjson())
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_else(|_| "[]".to_string());
+            if direct_count {
+                let count = rows
+                    .first()
+                    .map(|row| row.value.max(0.0) as u64)
+                    .unwrap_or(0);
+                return Ok(Structured::Direct {
+                    answer: format!("There are {count} patients in the indexed records."),
+                });
+            }
 
             // 4. Open grounded narration stream (no tools — model only summarises).
             let narration_user = build_narration_user(question, &rows);
@@ -278,7 +346,13 @@ pub async fn run_structured(
 
             // 5. Open narration stream.
             let offset = validated.offset;
-            let narration_user = build_list_narration_user(question, &rows, total, offset);
+            let narration_user = build_list_narration_user(
+                question,
+                &rows,
+                total,
+                offset,
+                validated.limit.unwrap_or(list::DEFAULT_LIST_LIMIT),
+            );
             let mut narration_spec = state.spec_for(AgentKind::HealthQuery);
             narration_spec.tools = false;
             let narration_stream = trace
@@ -292,11 +366,7 @@ pub async fn run_structured(
                 )
                 .await?;
 
-            let rows_json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
-
             Ok(Structured::List {
-                rows_json,
-                total,
                 citations_json,
                 narration_stream,
             })

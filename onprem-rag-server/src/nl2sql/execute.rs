@@ -14,6 +14,10 @@ pub async fn run_select(
 ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
     let spec = load_spec(db, config, source_id).await?;
     let conn = connector(&spec);
-    conn.run_select(sql, config.router.nl2sql_max_rows, config.router.nl2sql_timeout_secs)
-        .await
+    conn.run_select(
+        sql,
+        config.router.nl2sql_max_rows,
+        config.router.nl2sql_timeout_secs,
+    )
+    .await
 }

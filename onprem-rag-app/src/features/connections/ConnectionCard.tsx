@@ -2,7 +2,7 @@
 // Mobile-first: content wraps gracefully at 360 px without horizontal overflow.
 import {
   Database, Server, Globe, Clock,
-  AlertCircle, Plug, Download, Pencil, Trash2,
+  AlertCircle, Plug, Download, Pencil, Trash2, DatabaseZap,
 } from 'lucide-react';
 import { Badge, Button } from '../../components/ui';
 import { useUi } from '../../stores/ui';
@@ -13,6 +13,7 @@ export interface ConnectionCardProps {
   onTest: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  onManageMetadata: () => void;
   testing: boolean;
   deleting: boolean;
 }
@@ -38,6 +39,7 @@ export default function ConnectionCard({
   onTest,
   onEdit,
   onDelete,
+  onManageMetadata,
   testing,
   deleting,
 }: ConnectionCardProps) {
@@ -130,6 +132,15 @@ export default function ConnectionCard({
           className="min-h-[44px]"
         >
           Ingest
+        </Button>
+        <Button
+          size="sm"
+          variant="ghost"
+          leftIcon={<DatabaseZap size={14} />}
+          onClick={onManageMetadata}
+          className="min-h-[44px]"
+        >
+          Metadata
         </Button>
         <Button
           size="sm"

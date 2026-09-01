@@ -17,6 +17,7 @@ pub mod routes;
 
 use crate::config::Config;
 use crate::foundry::FoundryManager;
+use crate::memory::WorkingMemory;
 use crate::retrieval::Passage;
 
 /// One prior message in the conversation (for history-aware rewrite).
@@ -235,7 +236,7 @@ pub fn apply_context_budget(
 /// Build the user-message body: numbered context passages followed by the question.
 /// Passage numbering here is 1-based and matches the citation indices the model emits
 /// and the `citations` the route sends to the client.
-pub fn build_prompt(passages: &[Passage], question: &str) -> String {
+pub fn build_prompt(passages: &[Passage], memory: &WorkingMemory, question: &str) -> String {
     let mut ctx = String::new();
     for (i, p) in passages.iter().enumerate() {
         ctx.push_str(&format!("[{}] {}\n\n", i + 1, p.text.trim()));

@@ -396,6 +396,79 @@ export function listSources(): Promise<SourceInfo[]> {
   return authedInvoke<SourceInfo[]>("list_sources");
 }
 
+export interface SchemaCatalogStatus {
+  source_id: string;
+  active_version: string;
+  schema_hash: string;
+  captured_at: string | null;
+  table_count: number;
+  status: string;
+  health: string;
+  last_check_at: string | null;
+  last_success_at: string | null;
+  drift_detected: boolean;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
+export interface SchemaCatalogRefresh {
+  source_id: string;
+  tables_indexed: number;
+}
+
+/** Inspect the active schema metadata generation. Admin only. */
+export function getSchemaCatalog(sourceId: string): Promise<SchemaCatalogStatus> {
+  return authedInvoke<SchemaCatalogStatus>("get_schema_catalog", { sourceId });
+}
+
+/** Rebuild and atomically activate schema metadata. Admin only. */
+export function refreshSchemaCatalog(sourceId: string): Promise<SchemaCatalogRefresh> {
+  return authedInvoke<SchemaCatalogRefresh>("refresh_schema_catalog", { sourceId });
+}
+
+export interface SchemaCatalogHistoryItem {
+  checked_at: string | null;
+  trigger: string;
+  outcome: string;
+  previous_hash: string | null;
+  observed_hash: string | null;
+  table_count: number;
+  error: string | null;
+}
+
+export interface MetadataAlias {
+  table: string;
+  column: string | null;
+  alias: string;
+}
+
+export interface MetadataRelationship {
+  from_table: string;
+  from_column: string;
+  to_table: string;
+  to_column: string;
+}
+
+export interface MetadataOverrides {
+  aliases: MetadataAlias[];
+  relationships: MetadataRelationship[];
+}
+
+export function getSchemaCatalogHistory(sourceId: string): Promise<SchemaCatalogHistoryItem[]> {
+  return authedInvoke<SchemaCatalogHistoryItem[]>("get_schema_catalog_history", { sourceId });
+}
+
+export function getSchemaMetadataOverrides(sourceId: string): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("get_schema_metadata_overrides", { sourceId });
+}
+
+export function saveSchemaMetadataOverrides(
+  sourceId: string,
+  overrides: MetadataOverrides,
+): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("save_schema_metadata_overrides", { sourceId, overrides });
+}
+
 /** Connect and verify a source without saving. Admin only. */
 export function testSource(source: SourceInput): Promise<void> {
   return authedInvoke<void>("test_source", { source });
@@ -801,17 +874,28 @@ export interface Conversation {
 }
 
 /** One stored message in a conversation. Mirrors the server's `MessageOut`. */
+export interface SqlResult {
+  source_id: string;
+  sql: string;
+  columns: string[];
+  rows: unknown[][];
+}
+
 export interface StoredMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   /** `null` for user messages; passage array for assistant messages. */
   citations: Passage[] | null;
+  /** Persisted grounding verdict for verified assistant messages. */
+  verify?: VerifyReport;
   created_at: string;
   /** Present only for agent messages. */
   agent_kind?: string;
   /** Present only for structured-result agent messages. */
   structured?: StructuredResult;
+  /** Present for chat answers backed by a live operational SQL query. */
+  sql_result?: SqlResult;
 }
 
 /**

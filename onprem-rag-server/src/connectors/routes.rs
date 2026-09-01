@@ -136,6 +136,19 @@ pub struct TestResult {
 
 /// Load a saved source by id and decrypt its password into a usable [`SourceSpec`].
 /// Used by ingestion (WS5) to connect to a previously-registered database.
+pub(crate) async fn connected_source_ids(db: &DocumentDb) -> AppResult<Vec<String>> {
+    use futures::TryStreamExt;
+
+    let coll = db.collection::<SourceDoc>(SOURCES);
+    let sources: Vec<SourceDoc> = coll
+        .find(doc! { "status": "connected" })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?
+        .try_collect()
+        .await?;
+    Ok(sources.into_iter().map(|source| source.id).collect())
+}
+
 pub(crate) async fn load_spec(db: &DocumentDb, config: &Config, id: &str) -> AppResult<SourceSpec> {
     let coll = db.collection::<SourceDoc>(SOURCES);
     let doc = coll
@@ -261,6 +274,7 @@ pub async fn create_source(
     }
 
     let password_enc = CredentialCipher::from_config(&state.config).encrypt(&spec.password)?;
+    let catalog_spec = spec.clone();
     let now = Utc::now();
     let source = SourceDoc {
         id: uuid::Uuid::now_v7().to_string(),
@@ -281,6 +295,19 @@ pub async fn create_source(
         error: None,
     };
     coll.insert_one(&source).await?;
+    if state.config.router.text2sql_enabled {
+        if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
+            &state.db,
+            &state.config,
+            &catalog_spec,
+            &source.id,
+            "source_created",
+        )
+        .await
+        {
+            tracing::warn!(source_id = %source.id, %error, "failed to build SQL schema catalog");
+        }
+    }
     // user.id was moved into source.created_by when building the struct; use the
     // stored copy rather than contorting the handler to clone it earlier.
     audit::write_audit(
@@ -376,6 +403,27 @@ pub async fn update_source(
     doc.error = None;
 
     coll.replace_one(doc! { "_id": id }, &doc).await?;
+    state
+        .db
+        .schema_catalog()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_state()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_history()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_metadata_overrides()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    crate::nl2sql::linker::invalidate_source(id);
     audit::write_audit(
         &state.db,
         &user.id,
@@ -410,6 +458,19 @@ pub async fn test_saved_source(
             doc.status = "connected".into();
             doc.last_connected = Some(Utc::now());
             doc.error = None;
+            if state.config.router.text2sql_enabled {
+                if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
+                    &state.db,
+                    &state.config,
+                    &spec,
+                    id,
+                    "connection_test",
+                )
+                .await
+                {
+                    tracing::warn!(source_id = %id, %error, "failed to refresh SQL schema catalog");
+                }
+            }
         }
         Err(e) => {
             doc.status = "error".into();
@@ -441,12 +502,33 @@ pub async fn delete_source(
         .collection::<mongodb::bson::Document>(crate::documentdb::RECORDS)
         .delete_many(doc! { "source_id": id })
         .await?;
-    // Also clear indexed_tables entries for this source.
+    // Also clear indexed tables and NL-to-SQL schema cards for this source.
     state
         .db
         .collection::<mongodb::bson::Document>(INDEXED_TABLES)
         .delete_many(doc! { "source_id": id })
         .await?;
+    state
+        .db
+        .schema_catalog()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_state()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_history()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_metadata_overrides()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    crate::nl2sql::linker::invalidate_source(id);
     audit::write_audit(
         &state.db,
         &user.id,

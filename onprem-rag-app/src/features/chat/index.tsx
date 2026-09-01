@@ -15,7 +15,6 @@ import { useState, useCallback } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { Layers, PanelLeftOpen } from 'lucide-react';
 import { listConversations, getMessages } from '../../lib/bridge';
-import type { RetrievalOpts } from '../../lib/bridge';
 import {
   retryChatRun,
   sendQueuedChatNow,
@@ -28,12 +27,9 @@ import { Button, Modal } from '../../components/ui';
 import ConversationList from './ConversationList';
 import MessageList from './MessageList';
 import Composer from './Composer';
-import RetrievalSettings from './RetrievalSettings';
 
 export default function Chat() {
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [opts, setOpts] = useState<RetrievalOpts>({});
   const activeConvId = useChat((state) => state.activeConversationId);
   const allRuns = useChat((state) => state.runs);
   const queues = useChat((state) => state.queues);
@@ -65,10 +61,11 @@ export default function Chat() {
   });
 
   const handleSend = useCallback((text: string, sendImmediately: boolean) => {
-    void submitChatPrompt(activeConvId, text, opts, sendImmediately).catch((error) => {
+    // Retrieval policy is selected server-side from the routed query class.
+    void submitChatPrompt(activeConvId, text, {}, sendImmediately).catch((error) => {
       toast.error(`Failed to start conversation: ${String(error)}`);
     });
-  }, [activeConvId, opts]);
+  }, [activeConvId]);
 
   function handleNewChat() {
     useChat.getState().setActiveConversation(null);
@@ -152,7 +149,6 @@ export default function Chat() {
             onTextChange={(text) => useChat.getState().setDraft(draftKey, text)}
             onSend={handleSend}
             busy={busy}
-            onOpenSettings={() => setSettingsOpen(true)}
           />
         </div>
       </div>
@@ -174,14 +170,6 @@ export default function Chat() {
           onClose={() => setDrawerOpen(false)}
         />
       </Modal>
-
-      {/* Retrieval settings bottom-sheet */}
-      <RetrievalSettings
-        open={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        opts={opts}
-        onOptsChange={setOpts}
-      />
     </div>
   );
 }

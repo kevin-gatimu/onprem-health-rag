@@ -20,9 +20,10 @@ pub fn system_prompt(dialect: SourceKind) -> String {
          Rules:\n\
          - Only SELECT statements. No INSERT, UPDATE, DELETE, DDL, or multi-statement batches.\n\
          - Use only the tables and columns listed in the schema below.\n\
-         - Do not include a LIMIT or TOP clause; the system adds one.\n\
+         - If the user requests a row count, use LIMIT/TOP for that count; otherwise omit it.\n\
          - Use table aliases when joining more than one table.\n\
-         - Return the query by calling the `emit_sql` tool. Do not write SQL in prose."
+         - Return exactly the SQL statement as plain text or in one ```sql code block.\n\
+         - Do not return JSON, commentary, or an explanation."
     )
 }
 
@@ -55,6 +56,21 @@ fn format_schema(cards: &[TableCard]) -> String {
                         c.sample_values[..c.sample_values.len().min(3)].join(", ")
                     ));
                 }
+                if let Some(distinct) = c.profile.approximate_distinct_count {
+                    if distinct <= 100 {
+                        flags.push(format!("approx distinct: {distinct}"));
+                    }
+                }
+                if c.profile.sampled_rows > 0 {
+                    if let Some(null_ratio) = c.profile.null_ratio {
+                        if null_ratio > 0.0 {
+                            flags.push(format!("approx nulls: {:.1}%", null_ratio * 100.0));
+                        }
+                    }
+                }
+                if let (Some(min), Some(max)) = (&c.profile.min, &c.profile.max) {
+                    flags.push(format!("approx range: {min} to {max}"));
+                }
                 format!("  {} ({})", c.name, flags.join(", "))
             })
             .collect();
@@ -66,6 +82,17 @@ fn format_schema(cards: &[TableCard]) -> String {
                 .map(|e| format!("  {} -> {}.{}", e.column, e.ref_table, e.ref_column))
                 .collect();
             lines.push(format!("Foreign keys:\n{}", fk_lines.join("\n")));
+        }
+        let aliases: Vec<&str> = card
+            .card_text
+            .split(" Alias: ")
+            .skip(1)
+            .filter_map(|part| part.split(" Alias: ").next())
+            .map(|alias| alias.trim().trim_end_matches('.'))
+            .filter(|alias| !alias.is_empty())
+            .collect();
+        if !aliases.is_empty() {
+            lines.push(format!("Business aliases: {}", aliases.join("; ")));
         }
         lines.push(String::new());
     }
@@ -85,8 +112,8 @@ fn format_examples(examples: &[SqlExample]) -> String {
     lines.join("\n")
 }
 
-/// Call phi-4-mini to generate SQL for `question`. Returns the raw `EmitSqlOutput`
-/// (sql field may still violate safety rules; caller runs validate_sql next).
+/// Call the local SQL model to generate SQL for `question`. Plain or fenced SQL
+/// is accepted; the caller must still run the mandatory AST validator.
 pub async fn plan_sql(
     foundry: &FoundryManager,
     spec: &ModelSpec,
@@ -99,9 +126,7 @@ pub async fn plan_sql(
     let schema_block = format_schema(schema_cards);
     let examples_block = format_examples(few_shots);
 
-    let user = format!(
-        "{schema_block}{examples_block}\n## Question\n{question}"
-    );
+    let user = format!("{schema_block}{examples_block}\n## Question\n{question}");
 
     foundry.plan_sql(spec, &system, &user).await
 }
@@ -129,4 +154,44 @@ pub async fn plan_sql_repair(
     );
 
     foundry.plan_sql(spec, &system, &user).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nl2sql::spec::{CardColumn, ColumnProfile};
+
+    #[test]
+    fn schema_prompt_includes_curated_aliases_and_useful_profiles() {
+        let card = TableCard {
+            source_id: "source-1".into(),
+            table_name: "patients".into(),
+            row_count: 1_000,
+            columns: vec![CardColumn {
+                name: "county_id".into(),
+                type_: "integer".into(),
+                nullable: true,
+                is_primary_key: false,
+                is_foreign_key: true,
+                sample_values: vec![],
+                profile: ColumnProfile {
+                    approximate_distinct_count: Some(47),
+                    null_ratio: Some(0.025),
+                    min: Some("1".into()),
+                    max: Some("47".into()),
+                    sampled_rows: 200,
+                },
+            }],
+            fk_edges: vec![],
+            card_vector: None,
+            card_text: "Table: patients Alias: home county means patients.county_id.".into(),
+        };
+
+        let prompt = format_schema(&[card]);
+
+        assert!(prompt.contains("approx distinct: 47"));
+        assert!(prompt.contains("approx nulls: 2.5%"));
+        assert!(prompt.contains("approx range: 1 to 47"));
+        assert!(prompt.contains("Business aliases: home county means patients.county_id"));
+    }
 }

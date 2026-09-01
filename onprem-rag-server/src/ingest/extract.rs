@@ -168,7 +168,9 @@ impl Extractor {
         let clipped: String = text.chars().take(self.max_chars).collect();
         let user = format!("Record text:\n{clipped}");
 
-        let call = self.foundry.plan_extraction(&self.spec, EXTRACT_SYSTEM, &user);
+        let call = self
+            .foundry
+            .plan_extraction(&self.spec, EXTRACT_SYSTEM, &user);
         let mut out = match tokio::time::timeout(self.timeout, call).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
@@ -221,7 +223,11 @@ impl Extractor {
                 None => empty += 1,
             }
         }
-        ExtractBatch { annotated, skipped, empty }
+        ExtractBatch {
+            annotated,
+            skipped,
+            empty,
+        }
     }
 }
 
@@ -274,8 +280,16 @@ mod tests {
     fn stamp_systems_drops_blank_terms() {
         let mut e = ExtractedClinical {
             conditions: vec![
-                CodedTerm { text: "  ".into(), code: "E11".into(), system: String::new() },
-                CodedTerm { text: "asthma".into(), code: String::new(), system: String::new() },
+                CodedTerm {
+                    text: "  ".into(),
+                    code: "E11".into(),
+                    system: String::new(),
+                },
+                CodedTerm {
+                    text: "asthma".into(),
+                    code: String::new(),
+                    system: String::new(),
+                },
             ],
             ..Default::default()
         };

@@ -28,9 +28,13 @@ use crate::connectors::{self, connector};
 use crate::documentdb::{DocumentDb, RECORDS, vector};
 use crate::embed;
 use crate::error::{AppError, AppResult};
+use crate::foundry::FoundryManager;
+use crate::foundry::router::{AgentKind, ModelSpec};
+use crate::ingest::extract::{ExtractedClinical, Extractor};
 
 /// Emit a log line every this many rows so large tables aren't silent.
 const LOG_ROW_INTERVAL: i64 = 2500;
+const EXTRACT_BATCH: usize = 16;
 
 #[derive(Clone, Default)]
 pub struct IngestProgressHub {
@@ -86,6 +90,8 @@ struct RecordDoc {
     content_vector: Vec<f32>,
     ingest_generation: String,
     active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extracted: Option<ExtractedClinical>,
     ingested_at: chrono::DateTime<Utc>,
 }
 
@@ -300,8 +306,14 @@ pub async fn run(
     excluded_columns: HashMap<String, Vec<String>>,
     limit: Option<i64>,
     resume: Option<ResumeCheckpoint>,
+    foundry: Option<Arc<FoundryManager>>,
 ) {
-    if let Err(e) = execute(
+    let extractor = Extractor::new(
+        &config,
+        foundry,
+        ModelSpec::for_kind(AgentKind::Extract, &config),
+    );
+    let result = execute(
         &db,
         &config,
         &progress_hub,
@@ -311,9 +323,10 @@ pub async fn run(
         &excluded_columns,
         limit,
         resume.as_ref(),
+        extractor.as_ref(),
     )
-    .await
-    {
+    .await;
+    if let Err(e) = result {
         tracing::error!(job = %job_id, error = %e, "ingestion pipeline failed");
         let mut log = vec![];
         push_log(&mut log, "error", &format!("Job failed: {e}"));
@@ -329,6 +342,25 @@ pub async fn run(
             )
             .await;
         progress_hub.publish(&job_id);
+    } else if config.router.text2sql_enabled {
+        match connectors::routes::load_spec(&db, &config, &source_id).await {
+            Ok(spec) => {
+                if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
+                    &db,
+                    &config,
+                    &spec,
+                    &source_id,
+                    "ingestion",
+                )
+                .await
+                {
+                    tracing::warn!(job = %job_id, %source_id, %error, "post-ingestion schema metadata refresh failed");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(job = %job_id, %source_id, %error, "could not load source for post-ingestion metadata refresh");
+            }
+        }
     }
     progress_hub.publish(&job_id);
     progress_hub.remove(&job_id);
@@ -348,6 +380,7 @@ async fn execute(
     excluded_columns: &HashMap<String, Vec<String>>,
     limit: Option<i64>,
     resume: Option<&ResumeCheckpoint>,
+    extractor: Option<&Extractor>,
 ) -> AppResult<()> {
     // 1. Ensure vector + full-text indexes exist before writing any records.
     vector::ensure_indexes(db, config.embedding_dims).await?;
@@ -545,8 +578,22 @@ async fn execute(
                 })
                 .await?;
             vector_count = vector_count.saturating_sub(deleted.deleted_count as i64);
+            let mut annotations: HashMap<String, ExtractedClinical> = HashMap::new();
+            if let Some(extractor) = extractor {
+                let candidates: Vec<(String, String)> = rows
+                    .iter()
+                    .map(|row| (row.pk.clone(), row.text.clone()))
+                    .collect();
+                for batch in candidates.chunks(EXTRACT_BATCH) {
+                    let result = extractor.extract_batch(batch.to_vec()).await;
+                    extracted_rows += result.annotated.len() as i64;
+                    annotations.extend(result.annotated);
+                }
+            }
+
             let mut chunks = Vec::new();
             for row in rows {
+                let extracted = annotations.remove(&row.pk);
                 let texts = if config.chunk_enabled {
                     chunk_text(
                         &row.text,
@@ -565,6 +612,7 @@ async fn execute(
                             fields: fields.clone(),
                             text,
                             table: table.clone(),
+                            extracted: extracted.clone(),
                         });
                     }
                 }
@@ -600,6 +648,7 @@ async fn execute(
                         content_vector: vector,
                         ingest_generation: generation.clone(),
                         active: false,
+                        extracted: chunk.extracted.clone(),
                         ingested_at: Utc::now(),
                     })
                     .collect();

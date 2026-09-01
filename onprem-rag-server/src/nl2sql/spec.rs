@@ -3,6 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 /// One column inside a schema card, as stored in `schema_catalog`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ColumnProfile {
+    /// Sample-based cardinality estimate, capped by the table's estimated row count.
+    pub approximate_distinct_count: Option<i64>,
+    pub null_ratio: Option<f64>,
+    /// Aggregate bounds are captured only for numeric and date/time columns.
+    pub min: Option<String>,
+    pub max: Option<String>,
+    pub sampled_rows: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardColumn {
     pub name: String,
@@ -14,6 +25,9 @@ pub struct CardColumn {
     /// Representative values sampled at catalog-refresh time (empty when sampling is off).
     #[serde(default)]
     pub sample_values: Vec<String>,
+    /// Bounded aggregate profile. It never contains unrestricted row-level values.
+    #[serde(default)]
+    pub profile: ColumnProfile,
 }
 
 /// A FK relationship stored on the table card (mirrors `connectors::FkEdge`).
@@ -54,21 +68,12 @@ pub struct SqlExample {
     pub question_vector: Option<Vec<f32>>,
 }
 
-/// Output type for the `emit_sql` tool call.
+/// Internal representation of a generated SQL statement.
 ///
-/// phi-4-mini is forced to call this tool rather than emit free text, so the
-/// SQL string arrives already isolated in a typed field. The planner retries
-/// once on a parse failure before surfacing an error.
+/// The local model returns plain or fenced SQL; the Foundry adapter isolates it
+/// into this type before the mandatory AST validation step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmitSqlOutput {
     /// The generated SELECT statement.
     pub sql: String,
-    /// Tables the SQL references (self-reported; used to seed `sql_examples`).
-    #[serde(default)]
-    pub tables: Vec<String>,
-    /// Brief natural-language explanation of what the query does (shown to the user
-    /// before results arrive, in the `sql` SSE event).
-    #[serde(default)]
-    pub explanation: String,
 }
-
