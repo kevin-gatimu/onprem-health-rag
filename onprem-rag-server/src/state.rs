@@ -16,7 +16,9 @@ pub struct AppState {
     pub db: DocumentDb,
     /// `None` when Foundry Local failed to initialise (e.g. not installed). The
     /// server still boots and serves `/health`; Foundry routes report unavailable.
-    foundry: Option<FoundryManager>,
+    /// `Arc`-wrapped so `foundry_handle()` can hand a background task (compaction,
+    /// `memory.rs`) an owned, `'static` handle without cloning the manager itself.
+    foundry: Option<Arc<FoundryManager>>,
     /// In-memory cache of persisted per-role model routing overrides (role key ->
     /// variant id), mirroring the `settings` collection. Read on every routed request
     /// via `spec_for`, so it's cached here rather than hitting DocumentDB per call;
@@ -49,7 +51,7 @@ impl AppState {
         AppState {
             config,
             db,
-            foundry,
+            foundry: foundry.map(Arc::new),
             router_overrides: RwLock::new(router_overrides),
             login_throttle: crate::auth::throttle::LoginThrottle::new(),
             catalog: Arc::new(RwLock::new(Arc::new(initial_catalog))),
@@ -60,8 +62,15 @@ impl AppState {
     /// Access the Foundry manager, or a clean 503 if it is not available.
     pub fn foundry(&self) -> AppResult<&FoundryManager> {
         self.foundry
-            .as_ref()
+            .as_deref()
             .ok_or_else(|| AppError::Unavailable("Foundry Local is not available on the server".into()))
+    }
+
+    /// An owned, cheaply-cloneable handle to the Foundry manager, for detached
+    /// background tasks (e.g. `memory::maybe_spawn_compaction`) that outlive the
+    /// request and can't borrow `&AppState`. `None` when Foundry is unavailable.
+    pub fn foundry_handle(&self) -> Option<Arc<FoundryManager>> {
+        self.foundry.clone()
     }
 
     /// The persisted override variant for a role key, if one is set.

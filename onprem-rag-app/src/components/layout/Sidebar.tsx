@@ -9,6 +9,7 @@ import { useEffectiveRole } from "../../hooks/useEffectiveRole";
 import { canAccess } from "../../lib/permissions";
 import { NAV_ITEMS, NAV_SECTIONS } from "../../app/navigation";
 import { logout } from "../../lib/bridge";
+import { queryClient } from "../../lib/queryClient";
 import { cn } from "../ui/cn";
 
 export function Sidebar() {
@@ -30,6 +31,9 @@ export function Sidebar() {
       await logout();
     } finally {
       clearUser();
+      // Drop the React Query cache — it holds persisted chat messages (PHI).
+      // Never leave transcripts around for the next signed-in user.
+      queryClient.clear();
     }
   }
 

@@ -27,6 +27,21 @@ function levelClass(level: string): string {
   }
 }
 
+// HH:MM:SS in the viewer's local time — enough to place a line in time without
+// the visual weight of a full date in a compact, monospace panel.
+function formatTime(ts: string): string {
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour12: false });
+}
+
+// Our own module paths ("onprem_server::foundry::mod") are the overwhelming
+// majority of lines here; the crate prefix is implied and just adds width.
+// Third-party targets (rocket::…) are left as-is — they're already short and
+// the prefix is the useful part (it's what tells them apart from our own).
+function shortTarget(target: string): string {
+  return target.replace(/^onprem_server::/, '');
+}
+
 export default function ServiceConsole({ title = 'Activity', className }: ServiceConsoleProps) {
   const serverLog   = useStream((s) => s.serverLog);
   const clearServerLog = useStream((s) => s.clearServerLog);
@@ -80,9 +95,11 @@ export default function ServiceConsole({ title = 'Activity', className }: Servic
               key={line.seq}
               className={cn('flex gap-1.5 leading-relaxed', levelClass(line.level))}
             >
+              <span className="shrink-0 tabular-nums text-fg-subtle">{formatTime(line.ts)}</span>
+              <span className="shrink-0 w-9 font-semibold">{line.level}</span>
               {/* target is the Rust module path; break-words keeps long ids inside the panel */}
               <span className="break-words min-w-0">
-                <span className="text-fg-subtle">[{line.target}]</span> {line.message}
+                <span className="text-fg-subtle">[{shortTarget(line.target)}]</span> {line.message}
               </span>
             </div>
           ))

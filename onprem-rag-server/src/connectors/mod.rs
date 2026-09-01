@@ -52,6 +52,18 @@ pub struct SourceSpec {
     pub table: Option<String>,
 }
 
+/// A foreign-key relationship from a column in this table to another table.
+/// Used to expand schema cards in the nl2sql prompt (the join keys must be in context).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FkEdge {
+    /// Column in this table that holds the foreign key.
+    pub column: String,
+    /// Referenced (parent) table.
+    pub ref_table: String,
+    /// Referenced column in the parent table (usually a PK).
+    pub ref_column: String,
+}
+
 /// One column in a database table, as returned by `get_schema`.
 /// `likely_pii` is always `false` here; `POST /schema/analyze` fills it in from the
 /// deterministic keyword pass (and optionally the LLM pass).
@@ -77,6 +89,10 @@ pub struct TableSchema {
     /// not an exact count. Use `count_table` at ingest time for the exact value.
     pub row_count: i64,
     pub columns: Vec<ColumnSchema>,
+    /// FK relationships from this table to other tables. Populated only when the
+    /// enhanced FK query succeeds (non-empty only after nl2sql catalog refresh).
+    #[serde(default)]
+    pub fk_edges: Vec<FkEdge>,
 }
 
 /// One row pulled from a source, ready for chunking + embedding.
@@ -116,6 +132,19 @@ pub trait SourceConnector: Send + Sync {
         excluded: &[String],
         limit: Option<i64>,
     ) -> AppResult<Vec<FetchedRow>>;
+
+    /// Execute a **pre-validated, read-only SELECT** and return `(column_names, rows)`.
+    ///
+    /// The caller MUST validate `sql` with `nl2sql::validate::validate_sql` before
+    /// calling this — the connector enforces `max_rows` and `timeout_secs` but relies
+    /// on the validation gate to reject DDL/DML. Each row is a `Vec<Value>` aligned to
+    /// `column_names`. Returns `([], [])` when the query produces no rows.
+    async fn run_select(
+        &self,
+        sql: &str,
+        max_rows: i64,
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)>;
 }
 
 /// Build the connector for a spec's engine.

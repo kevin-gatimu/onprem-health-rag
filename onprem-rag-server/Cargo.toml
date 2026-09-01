@@ -51,6 +51,7 @@ uuid = { version = "1.25.0", features = ["v7", "serde"] }
 sqlparser = { version = "0.53", default-features = false }
 # LRU cache for repeated embed_query calls (same query text -> cached vector).
 lru = "0.12"
+sysinfo = "0.39.6"
 
 # Windows uses the WinML-backed native engine loader for Foundry Local.
 [target.'cfg(windows)'.dependencies]

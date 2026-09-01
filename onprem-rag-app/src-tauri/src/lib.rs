@@ -10,8 +10,27 @@ const DEFAULT_SERVER_URL: &str = "http://localhost:8000";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Desktop-only: single-instance must be the FIRST registered plugin so a second
+    // launch is intercepted before anything else initializes; window-state restores
+    // size/position from the previous run.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }))
+            .plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+
+    builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(Bridge::new(DEFAULT_SERVER_URL.to_string()))
         .setup(|app| {

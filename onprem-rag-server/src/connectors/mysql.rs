@@ -12,7 +12,7 @@ use sqlx::types::BigDecimal;
 use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::{Column, Row, ValueRef};
 
-use super::{ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err,
+use super::{ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
             make_row_filtered};
 use crate::error::AppResult;
 
@@ -98,9 +98,9 @@ impl SourceConnector for MysqlConnector {
         .await
         .map_err(|e| conn_err("MySQL column query failed", e))?;
 
-        // Precise FK detection via key_column_usage.
+        // FK columns with referenced table + column (for schema cards).
         let fk_rows = sqlx::query(
-            "SELECT TABLE_NAME, COLUMN_NAME \
+            "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
              FROM information_schema.key_column_usage \
              WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL",
         )
@@ -111,10 +111,20 @@ impl SourceConnector for MysqlConnector {
         pool.close().await;
 
         let mut fk_set: HashSet<(String, String)> = HashSet::new();
+        let mut fk_edges_map: HashMap<String, Vec<FkEdge>> = HashMap::new();
         for row in &fk_rows {
             let t: String = row.try_get(0).unwrap_or_default();
             let c: String = row.try_get(1).unwrap_or_default();
-            fk_set.insert((t, c));
+            let ref_t: String = row.try_get(2).unwrap_or_default();
+            let ref_c: String = row.try_get(3).unwrap_or_default();
+            fk_set.insert((t.clone(), c.clone()));
+            if !ref_t.is_empty() {
+                fk_edges_map.entry(t).or_default().push(FkEdge {
+                    column: c,
+                    ref_table: ref_t,
+                    ref_column: ref_c,
+                });
+            }
         }
 
         let mut table_columns: HashMap<String, Vec<ColumnSchema>> = HashMap::new();
@@ -138,7 +148,8 @@ impl SourceConnector for MysqlConnector {
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns }
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
+                TableSchema { name, row_count, columns, fk_edges }
             })
             .collect();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
@@ -196,6 +207,52 @@ impl SourceConnector for MysqlConnector {
             })
             .collect();
         Ok(out)
+    }
+
+    async fn run_select(
+        &self,
+        sql: &str,
+        max_rows: i64,
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+        let pool = self.pool(1).await?;
+        // max_execution_time is milliseconds; 0 = disabled (reset for the next caller).
+        let timeout_ms = timeout_secs * 1_000;
+
+        sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+            .execute(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL set max_execution_time failed", e))?;
+
+        // The sql already carries LIMIT {max_rows} injected by validate_sql; the
+        // subquery wrap adds a hard safety cap in case validate_sql is bypassed.
+        let capped = format!("SELECT * FROM ({sql}) AS _q LIMIT {max_rows}");
+
+        let rows = sqlx::query(&capped)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL run_select query failed", e))?;
+
+        // Reset so the pool's lingering connection doesn't timeout unrelated queries.
+        sqlx::query("SET SESSION max_execution_time = 0")
+            .execute(&pool)
+            .await
+            .ok();
+
+        pool.close().await;
+
+        if rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let columns: Vec<String> =
+            rows[0].columns().iter().map(|c| c.name().to_string()).collect();
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let values = (0..columns.len()).map(|i| cell_to_json(row, i)).collect();
+            result_rows.push(values);
+        }
+        Ok((columns, result_rows))
     }
 }
 

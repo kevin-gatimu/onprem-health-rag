@@ -56,7 +56,10 @@ pub struct RouterConfig {
     /// Master switch: when false the router never selects `SourceSql` and the
     /// `/nl2sql/<id>` endpoints still work but are direct-call only (no routing).
     pub text2sql_enabled: bool,      // ONPREM_TEXT2SQL_ENABLED
-    /// Model alias for SQL generation (phi-4-mini-instruct works well).
+    /// Model alias for SQL generation (phi-4-mini works well). Note: Foundry
+    /// Local's catalog alias is "phi-4-mini" — "phi-4-mini-instruct" is only
+    /// the variant *id* prefix (e.g. "phi-4-mini-instruct-openvino-npu:4"),
+    /// not a valid alias; using it silently drops the NPU variant.
     pub sql_model: String,           // ONPREM_MODEL_TEXT2SQL
     /// Maximum schema cards (table cards) injected into the generation prompt.
     pub nl2sql_tables_max: usize,    // ONPREM_NL2SQL_TABLES_MAX
@@ -68,6 +71,41 @@ pub struct RouterConfig {
     pub nl2sql_timeout_secs: u64,    // ONPREM_NL2SQL_TIMEOUT_SECS
     /// Per-column sample-value count for schema cards (0 disables sampling).
     pub nl2sql_sample_values: usize, // ONPREM_NL2SQL_SAMPLE_VALUES
+
+    // --- Ingestion extractor (plan 25, AgentKind::Extract) ---
+    /// Master switch for the clinical extractor. **Off by default**: it adds one
+    /// small-model call per eligible row, which multiplies ingest wall-clock on a
+    /// large source. Turn on when phi-4-mini is downloaded and the annotations are
+    /// wanted for filtering.
+    pub extract_enabled: bool,        // ONPREM_EXTRACT_ENABLED
+    /// A row is only sent to the extractor when its text projection has at least this
+    /// many words. Short rows are structured column dumps, not free-text notes —
+    /// running a model over them costs time and yields nothing.
+    pub extract_min_words: usize,     // ONPREM_EXTRACT_MIN_WORDS
+    /// How many rows may be in the extractor concurrently. The NPU serves one request
+    /// at a time in practice; >1 mainly hides per-call overhead. Keep small.
+    pub extract_concurrency: usize,   // ONPREM_EXTRACT_CONCURRENCY
+    /// Per-row wall-clock budget. A row that exceeds it is abandoned (counted as a
+    /// skip, never an ingest failure) so one pathological note cannot stall a table.
+    pub extract_timeout_secs: u64,    // ONPREM_EXTRACT_TIMEOUT_SECS
+    /// Characters of row text handed to the extractor. Guards the NPU context cap
+    /// (`npu_ctx_cap`) — the extractor reads a note, not a whole chart.
+    pub extract_max_chars: usize,     // ONPREM_EXTRACT_MAX_CHARS
+
+    // --- Faithfulness verifier (plan 25, AgentKind::Verify) ---
+    /// Master switch for the post-answer grounding check. **Off by default**: it adds
+    /// a second model round-trip after every semantic answer. The check runs *after*
+    /// the answer has finished streaming, so it never delays the user's first token —
+    /// only the verdict badge.
+    pub verify_enabled: bool,         // ONPREM_VERIFY_ENABLED
+    /// Wall-clock budget for the verification call. On timeout the verdict is
+    /// reported as `skipped` and the answer stands unannotated.
+    pub verify_timeout_secs: u64,     // ONPREM_VERIFY_TIMEOUT_SECS
+    /// Characters of each passage handed to the verifier. Passages are truncated so
+    /// answer + evidence fit the NPU context cap.
+    pub verify_passage_chars: usize,  // ONPREM_VERIFY_PASSAGE_CHARS
+    /// Maximum passages included as evidence, in citation order.
+    pub verify_max_passages: usize,   // ONPREM_VERIFY_MAX_PASSAGES
 }
 
 impl RouterConfig {
@@ -79,8 +117,8 @@ impl RouterConfig {
             summarize: env_or("ONPREM_MODEL_SUMMARIZE", "mistral-nemo-12b-instruct"),
             lookup: env_or("ONPREM_MODEL_LOOKUP", "qwen3-4b"),
             fast: env_or("ONPREM_MODEL_FAST", "qwen3-4b"),
-            classify: env_or("ONPREM_MODEL_CLASSIFY", "phi-4-mini-instruct"),
-            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "phi-4-mini-instruct"),
+            classify: env_or("ONPREM_MODEL_CLASSIFY", "phi-4-mini"),
+            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "phi-4-mini"),
             verifier: env_or("ONPREM_MODEL_VERIFIER", "phi-4-mini-reasoning"),
             max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 2_usize),
             npu_enabled: env_parse("ONPREM_NPU_ENABLED", true),
@@ -88,12 +126,23 @@ impl RouterConfig {
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
             text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", false),
-            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini-instruct"),
+            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini"),
             nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
             nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
             nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
             nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
             nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
+
+            extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
+            extract_min_words: env_parse("ONPREM_EXTRACT_MIN_WORDS", 40_usize),
+            extract_concurrency: env_parse("ONPREM_EXTRACT_CONCURRENCY", 2_usize),
+            extract_timeout_secs: env_parse("ONPREM_EXTRACT_TIMEOUT_SECS", 30_u64),
+            extract_max_chars: env_parse("ONPREM_EXTRACT_MAX_CHARS", 6000_usize),
+
+            verify_enabled: env_parse("ONPREM_VERIFY_ENABLED", false),
+            verify_timeout_secs: env_parse("ONPREM_VERIFY_TIMEOUT_SECS", 45_u64),
+            verify_passage_chars: env_parse("ONPREM_VERIFY_PASSAGE_CHARS", 1200_usize),
+            verify_max_passages: env_parse("ONPREM_VERIFY_MAX_PASSAGES", 6_usize),
         }
     }
 }
@@ -161,6 +210,23 @@ pub struct Config {
 
     // Model router (task-aware model selection + device placement)
     pub router: RouterConfig,
+
+    // Chat memory: working-memory assembly, compaction, hygiene (plan 22)
+    /// Ceiling on tail turns loaded per request, before the token budget below
+    /// trims further.
+    pub history_tail_max_turns: i64,
+    /// Word-approximate budget for the assembled tail (same convention as chunking).
+    pub history_tail_max_tokens: usize,
+    /// Word cap applied to an assistant message's content when it enters the tail —
+    /// old full answers add tokens, not signal.
+    pub history_msg_clip: usize,
+    /// Un-summarized turn count that triggers write-behind compaction.
+    pub compact_after_turns: i64,
+    /// Delete conversations (and their messages) whose `updated_at` is older than
+    /// this many days. `0` = keep forever (default).
+    pub conversation_retention_days: i64,
+    /// Byte cap on a stored message's content; longer content is clipped with a marker.
+    pub message_max_bytes: usize,
 }
 
 impl Config {
@@ -229,6 +295,13 @@ impl Config {
             chunk_overlap_tokens: env_parse("ONPREM_CHUNK_OVERLAP_TOKENS", 64),
 
             router: RouterConfig::from_env(),
+
+            history_tail_max_turns: env_parse("ONPREM_HISTORY_TAIL_MAX_TURNS", 8_i64),
+            history_tail_max_tokens: env_parse("ONPREM_HISTORY_TAIL_MAX_TOKENS", 1200_usize),
+            history_msg_clip: env_parse("ONPREM_HISTORY_MSG_CLIP", 200_usize),
+            compact_after_turns: env_parse("ONPREM_COMPACT_AFTER_TURNS", 12_i64),
+            conversation_retention_days: env_parse("ONPREM_CONVERSATION_RETENTION_DAYS", 0_i64),
+            message_max_bytes: env_parse("ONPREM_MESSAGE_MAX_BYTES", 32768_usize),
         }
     }
 

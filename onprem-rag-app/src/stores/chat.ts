@@ -4,7 +4,7 @@
 // Every setter guards on runId so a stale run's late events are silently dropped.
 // The boot-time listeners in bridgeEvents.ts write here; the Chat screen reads it.
 import { create } from 'zustand';
-import type { Passage } from '../lib/bridge';
+import type { Passage, VerifyReport } from '../lib/bridge';
 
 export type ChatPhase = 'searching' | 'generating' | 'done';
 
@@ -16,6 +16,9 @@ export interface PendingRun {
   /** Accumulated streamed answer text. */
   answer: string;
   citations: Passage[];
+  /** Faithfulness verdict, or null until the post-stream `verify` event arrives
+   *  (which it may never do — the check is opt-in server-side). */
+  verify: VerifyReport | null;
   error: string | null;
   phase: ChatPhase;
 }
@@ -27,6 +30,8 @@ interface ChatState {
   appendAnswer(runId: string, batch: string[]): void;
   /** Set the retrieved passages and advance phase to 'generating'. Ignores stale runId. */
   setCitations(runId: string, c: Passage[]): void;
+  /** Attach the post-stream faithfulness report. Ignores stale runId. */
+  setVerify(runId: string, report: VerifyReport): void;
   /** Record an error and set phase to 'done'. Ignores stale runId. */
   setError(runId: string, msg: string): void;
   /** Mark phase 'done' (stream completed normally). Ignores stale runId. */
@@ -46,6 +51,7 @@ export const useChat = create<ChatState>((set, get) => ({
         user,
         answer: '',
         citations: [],
+        verify: null,
         error: null,
         phase: 'searching',
       },
@@ -67,6 +73,13 @@ export const useChat = create<ChatState>((set, get) => ({
       pending: s.pending
         ? { ...s.pending, citations: c, phase: 'generating' }
         : null,
+    }));
+  },
+
+  setVerify(runId, report) {
+    if (get().pending?.runId !== runId) return;
+    set((s) => ({
+      pending: s.pending ? { ...s.pending, verify: report } : null,
     }));
   },
 

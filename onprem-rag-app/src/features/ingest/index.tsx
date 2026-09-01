@@ -4,6 +4,7 @@
 import { RefreshCw } from 'lucide-react';
 import { useIngestion } from '../../stores/ingestion';
 import { Button } from '../../components/ui';
+import { cn } from '../../components/ui/cn';
 import { PageContainer } from '../../components/layout/PageContainer';
 import PickConnection from './PickConnection';
 import LoadingSchema from './LoadingSchema';
@@ -19,9 +20,21 @@ export default function Ingest() {
   const showReset =
     step === 'select-tables' || step === 'ingesting' || step === 'complete';
 
+  // The live-run view is a dashboard — counters, progress bars and a streaming
+  // log — not a form, so it gets the board width and stretches to the full height
+  // of the shell instead of sitting in a narrow column with dead space beneath it.
+  // The earlier steps stay capped: they are forms and a table list, which read
+  // worse when a wide monitor pulls their labels and values metres apart.
+  // Height only takes over at md+ — on a phone the page keeps flowing and
+  // scrolling normally.
+  const dashboard = step === 'ingesting' || step === 'complete';
+
   return (
-    <PageContainer variant="flow">
-    <div className="flex flex-col gap-5">
+    <PageContainer
+      variant={dashboard ? 'board' : 'flow'}
+      className={cn(dashboard && 'md:flex md:h-full md:min-h-0 md:flex-col')}
+    >
+    <div className={cn('flex flex-col gap-5', dashboard && 'md:min-h-0 md:flex-1')}>
 
       {/* ── Page header ── */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">

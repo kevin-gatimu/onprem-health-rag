@@ -28,6 +28,9 @@ function BridgeEvents() {
       const { authStatus, clearUser } = useSession.getState();
       const wasAuthed = authStatus === "authenticated";
       clearUser();
+      // Drop the React Query cache — it holds persisted chat messages (PHI);
+      // a forced logout must not leave transcripts around for the next user.
+      queryClient.clear();
       // Only toast when we were actually signed in. Concurrent 401s dedupe
       // naturally: clearUser() flips authStatus before the next handler runs, so
       // the second and later handlers see a non-authenticated status and stay quiet.

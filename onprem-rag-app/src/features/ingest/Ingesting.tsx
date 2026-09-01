@@ -1,5 +1,7 @@
 // Ingesting — live progress view shown during and after a job.
-// Two-column split on md+: RunSummary left, ProgressPanel right. Stacks on phones.
+// Summary rail + live progress panel. On md+ the two sit side by side and the
+// panel stretches to the full page height so the log fills a big screen rather
+// than sitting in a 256px box under half a viewport of dead space.
 import { useEffect, useRef } from 'react';
 import {
   Database, CheckCircle2, AlertTriangle, RefreshCw,
@@ -58,7 +60,7 @@ function RunSummary({
   onNew: () => void;
 }) {
   return (
-    <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-4">
+    <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-4 md:self-start">
       <div className="flex items-center gap-2">
         <Database size={16} className="text-accent flex-shrink-0" />
         <span className="font-semibold text-fg text-sm truncate">{sourceName}</span>
@@ -116,7 +118,7 @@ function ProgressPanel({
     : 'Ingesting…';
 
   return (
-    <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-4">
+    <div className="rounded-lg border border-border bg-surface p-4 flex flex-col gap-4 md:min-h-0">
 
       {/* Title + "Table X of Y" sub-line */}
       <div className="flex flex-col gap-1">
@@ -184,10 +186,18 @@ function ProgressPanel({
           label="DB size"
           value={progress && progress.db_size_bytes > 0 ? fmtBytes(progress.db_size_bytes) : '—'}
         />
+        {/* Clinical extractor (plan 25). Hidden entirely when the server has it off,
+            which is the default — a permanent "Annotated 0" would read as a fault. */}
+        {(progress?.extracted_rows ?? 0) > 0 && (
+          <Stat
+            label="Annotated"
+            value={(progress?.extracted_rows ?? 0).toLocaleString()}
+          />
+        )}
       </div>
 
       {/* Live log panel */}
-      <div className="overflow-y-auto max-h-48 sm:max-h-64 rounded-md bg-elevated p-2 font-mono text-xs">
+      <div className="overflow-y-auto max-h-48 sm:max-h-64 md:max-h-none md:min-h-48 md:flex-1 rounded-md bg-elevated p-2 font-mono text-xs">
         {(progress?.log ?? []).map((entry: LogEntry, i: number) =>
           entry.level === 'divider' ? (
             <hr key={i} className="border-border my-1" />
@@ -258,8 +268,9 @@ export default function Ingesting() {
   }, [progress?.log]);
 
   return (
-    // Two-column split on md+, stacked on phones.
-    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+    // Stacked and free-flowing on phones; a fixed summary rail plus a
+    // full-height progress panel from md up.
+    <div className="flex flex-col gap-4 md:grid md:min-h-0 md:flex-1 md:grid-cols-[18rem_minmax(0,1fr)] xl:grid-cols-[22rem_minmax(0,1fr)]">
       <RunSummary
         sourceName={sourceName}
         progress={progress}

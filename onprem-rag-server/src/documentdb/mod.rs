@@ -14,6 +14,8 @@ pub const JOBS: &str = "jobs";
 pub const SETTINGS: &str = "settings";
 /// Append-only security audit log (login, logout, admin actions, etc.).
 pub const AUDIT_LOG: &str = "audit_log";
+/// nl2sql: one doc per (source_id, table) with embedded schema card + cardVector.
+pub const SCHEMA_CATALOG: &str = "schema_catalog";
 /// Per-table ingestion state: one doc per `{source_id}:{table}`, tracking status,
 /// row/vector counts, and timestamps. Read by `GET /ingest/history`.
 pub const INDEXED_TABLES: &str = "indexed_tables";
@@ -80,6 +82,11 @@ impl DocumentDb {
     pub fn chat_messages(&self) -> Collection<Document> {
         self.collection(CHAT_MESSAGES)
     }
+
+    pub fn schema_catalog(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG)
+    }
+
 }
 
 /// Ensure the chat collections have the indexes they need. Call once at boot

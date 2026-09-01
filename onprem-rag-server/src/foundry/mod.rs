@@ -10,29 +10,45 @@ pub mod router;
 pub mod routes;
 pub mod think_filter;
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use async_openai::types::chat::ChatCompletionTool;
 use foundry_local_sdk::{
     ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage, ChatCompletionStream,
-    ChatCompletionTools, ChatResponseFormat, ChatToolChoice, FoundryLocalConfig,
-    FoundryLocalError, FoundryLocalManager, FunctionObject, Model,
+    ChatCompletionTools, ChatResponseFormat, ChatToolChoice, FoundryLocalConfig, FoundryLocalError,
+    FoundryLocalManager, FunctionObject, Model,
 };
 use serde::Serialize;
 
-use crate::aggregation::spec::RunList;
 use crate::aggregation::RunAggregation;
+use crate::aggregation::spec::RunList;
 use crate::config::Config;
 use crate::error::{AppError, AppResult};
+use crate::ingest::extract::ExtractedClinical;
+use crate::nl2sql::spec::EmitSqlOutput;
 use crate::router::RouteToolOutput;
+use crate::verify::VerifyToolOutput;
 use router::{Device, ModelSpec};
 
 /// Map an SDK error to our error type. Foundry problems are "service unavailable"
 /// (the model host is down / a model op failed) rather than internal server faults.
 fn map_err(e: FoundryLocalError) -> AppError {
     AppError::Unavailable(format!("Foundry Local: {e}"))
+}
+
+/// Whether an SDK error came from the constrained-decoding grammar compiler rather
+/// than from generation itself.
+///
+/// Matched on the message because the SDK surfaces the .NET exception as an opaque
+/// `command execution error` string — there is no typed variant to match. Kept
+/// deliberately narrow so an unrelated failure never triggers the retry in
+/// `plan_tool`; the text comes from ORT-GenAI's `Error creating grammar:
+/// Unsatisfiable schema: ...`.
+fn is_grammar_error(e: &FoundryLocalError) -> bool {
+    let msg = e.to_string();
+    msg.contains("creating grammar") || msg.contains("Unsatisfiable schema")
 }
 
 /// An execution provider (GPU/NPU/CPU backend) as reported by Foundry Local, enriched
@@ -74,7 +90,12 @@ impl ExecutionProvider {
 
     fn new(name: String, registered: bool) -> Self {
         let (device_kind, label) = Self::classify(&name);
-        Self { name, registered, device_kind: device_kind.to_string(), label }
+        Self {
+            name,
+            registered,
+            device_kind: device_kind.to_string(),
+            label,
+        }
     }
 }
 
@@ -136,6 +157,74 @@ pub enum PullMsg {
     Error(String),
 }
 
+/// Serialises native `load()`/`unload()` calls process-wide: the native core
+/// (OpenVINO/ONNX) segfaults (STATUS_ACCESS_VIOLATION) when two loads run
+/// concurrently, e.g. two "Load" clicks in the UI. Downloads stay parallel.
+static LOAD_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Models with an in-flight generation (variant id → active request count).
+/// Unloading a model mid-generation fail-fasts the native core
+/// (STATUS_STACK_BUFFER_OVERRUN, 0xc0000409), so LRU eviction and manual
+/// unload/delete consult this before touching a model.
+static BUSY_MODELS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Whether a variant currently has at least one in-flight generation.
+fn is_busy(variant_id: &str) -> bool {
+    BUSY_MODELS
+        .lock()
+        .expect("busy-models lock poisoned")
+        .get(variant_id)
+        .is_some_and(|n| *n > 0)
+}
+
+/// RAII marker for an in-flight generation: increments the model's busy count on
+/// creation and decrements on drop. Held by `GuardedChatStream` so the count
+/// stays accurate for the full lifetime of a streamed response, including when
+/// the client disconnects and the stream is dropped early.
+struct BusyGuard(String);
+
+impl BusyGuard {
+    fn new(variant_id: String) -> Self {
+        *BUSY_MODELS
+            .lock()
+            .expect("busy-models lock poisoned")
+            .entry(variant_id.clone())
+            .or_insert(0) += 1;
+        Self(variant_id)
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        let mut map = BUSY_MODELS.lock().expect("busy-models lock poisoned");
+        if let Some(n) = map.get_mut(&self.0) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// A chat completion stream that keeps its model marked busy until dropped, so
+/// eviction/unload can't rip the weights out from under an active generation.
+pub struct GuardedChatStream {
+    inner: ChatCompletionStream,
+    _busy: BusyGuard,
+}
+
+impl futures::Stream for GuardedChatStream {
+    type Item = <ChatCompletionStream as futures::Stream>::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
 /// Wraps the process-global Foundry Local singleton and tracks the selected chat model.
 pub struct FoundryManager {
     /// `&'static` because `FoundryLocalManager::create` returns a reference to an
@@ -178,7 +267,9 @@ impl FoundryManager {
                 providers = ?eps.iter().map(|e| &e.name).collect::<Vec<_>>(),
                 "Foundry Local ready; execution providers discovered"
             ),
-            Err(e) => tracing::warn!(error = %e, "Foundry Local: could not discover execution providers"),
+            Err(e) => {
+                tracing::warn!(error = %e, "Foundry Local: could not discover execution providers")
+            }
         }
         Ok(Self {
             manager,
@@ -192,13 +283,19 @@ impl FoundryManager {
 
     /// The chat model the server will generate with.
     pub fn current_model(&self) -> String {
-        self.current_chat_model.lock().expect("chat-model lock poisoned").clone()
+        self.current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned")
+            .clone()
     }
 
     /// Directly set the current chat model id without downloading/loading — used when
     /// persisting a "chat" role override that was already loaded via `spawn_pull`.
     pub fn set_current_model(&self, id: String) {
-        *self.current_chat_model.lock().expect("chat-model lock poisoned") = id;
+        *self
+            .current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned") = id;
     }
 
     /// Download (if needed) and register all execution providers available for this
@@ -207,7 +304,11 @@ impl FoundryManager {
     /// but scoped to our core (the Foundry CLI service is a separate instance).
     pub async fn register_eps(&self) -> AppResult<EpRegistration> {
         tracing::info!("registering Foundry execution providers (downloading plugins if needed)…");
-        let r = self.manager.download_and_register_eps(None).await.map_err(map_err)?;
+        let r = self
+            .manager
+            .download_and_register_eps(None)
+            .await
+            .map_err(map_err)?;
         if r.failed_eps.is_empty() {
             tracing::info!(registered = ?r.registered_eps, "execution providers registered");
         } else {
@@ -231,7 +332,9 @@ impl FoundryManager {
                 Ok(r) if r.failed_eps.is_empty() => {
                     tracing::info!(registered = ?r.registered_eps, "startup: execution providers registered");
                 }
-                Ok(r) => tracing::warn!(registered = ?r.registered_eps, failed = ?r.failed_eps, "startup: some execution providers failed to register"),
+                Ok(r) => {
+                    tracing::warn!(registered = ?r.registered_eps, failed = ?r.failed_eps, "startup: some execution providers failed to register")
+                }
                 Err(e) => tracing::warn!(error = %e, "startup: EP registration failed"),
             }
         });
@@ -297,7 +400,9 @@ impl FoundryManager {
         let mut out: Vec<VariantInfo> = Vec::new();
         let mut seen_ids = HashSet::new();
         for alias in &deduped_aliases {
-            let Ok(model) = catalog.get_model(alias).await else { continue };
+            let Ok(model) = catalog.get_model(alias).await else {
+                continue;
+            };
             for v in model.variants() {
                 let id = v.id().to_string();
                 if !seen_ids.insert(id.clone()) {
@@ -320,7 +425,12 @@ impl FoundryManager {
     /// back over `tx`. Runs detached (`tokio::spawn`) so the SSE route can start
     /// yielding events immediately. Only `&'static` / owned values cross the spawn
     /// boundary — no `&self` or borrowed `Arc<Model>` from the caller.
-    pub fn spawn_pull(&self, variant_id: String, load: bool, tx: tokio::sync::mpsc::UnboundedSender<PullMsg>) {
+    pub fn spawn_pull(
+        &self,
+        variant_id: String,
+        load: bool,
+        tx: tokio::sync::mpsc::UnboundedSender<PullMsg>,
+    ) {
         let manager = self.manager; // &'static, Copy
         tokio::spawn(async move {
             let model = match manager.catalog().get_model_variant(&variant_id).await {
@@ -352,9 +462,31 @@ impl FoundryManager {
 
             if load {
                 let _ = tx.send(PullMsg::Status("loading".into()));
-                if let Err(e) = model.load().await {
-                    let _ = tx.send(PullMsg::Error(format!("Foundry Local: {e}")));
-                    return;
+                let mut corrupt = false;
+                {
+                    let _gate = LOAD_GATE.lock().await;
+                    if !model.is_loaded().await.unwrap_or(false) {
+                        if let Err(e) = model.load().await {
+                            if is_corrupt_weights_error(&e.to_string()) {
+                                tracing::warn!(model = %variant_id, error = %e, "load hit corrupt cached weights; purging and re-downloading");
+                                corrupt = true;
+                            } else {
+                                let _ = tx.send(PullMsg::Error(format!("Foundry Local: {e}")));
+                                return;
+                            }
+                        }
+                    }
+                } // gate released during the re-download
+                if corrupt {
+                    let _ = tx.send(PullMsg::Status("cache corrupt — re-downloading".into()));
+                    let txp = tx.clone();
+                    let cb = move |pct: f64| {
+                        let _ = txp.send(PullMsg::Progress(pct));
+                    };
+                    if let Err(e) = heal_and_load(&model, Some(cb)).await {
+                        let _ = tx.send(PullMsg::Error(format!("Foundry Local: {e}")));
+                        return;
+                    }
                 }
                 tracing::info!(model = %variant_id, "model variant loaded");
                 let _ = tx.send(PullMsg::Status("loaded".into()));
@@ -373,10 +505,19 @@ impl FoundryManager {
     /// invalidates its own catalog cache on removal, so the next `list_models` /
     /// `variants_for` reports the variant as not downloaded.
     pub async fn delete_model(&self, variant_id: &str) -> AppResult<()> {
+        if is_busy(variant_id) {
+            return Err(AppError::Unavailable(format!(
+                "{variant_id} is currently generating a response — try again in a moment"
+            )));
+        }
         let catalog = self.manager.catalog();
-        let model = catalog.get_model_variant(variant_id).await.map_err(map_err)?;
+        let model = catalog
+            .get_model_variant(variant_id)
+            .await
+            .map_err(map_err)?;
 
         if model.is_loaded().await.unwrap_or(false) {
+            let _gate = LOAD_GATE.lock().await;
             if let Err(e) = model.unload().await {
                 tracing::warn!(model = %variant_id, error = %e, "delete: unload failed (continuing to cache removal)");
             }
@@ -398,10 +539,19 @@ impl FoundryManager {
     /// resident is a no-op success, and a failed unload is logged and still returns Ok
     /// — matching how `delete_model` treats unload failures as non-fatal.
     pub async fn unload_model(&self, variant_id: &str) -> AppResult<()> {
+        if is_busy(variant_id) {
+            return Err(AppError::Unavailable(format!(
+                "{variant_id} is currently generating a response — try again in a moment"
+            )));
+        }
         let catalog = self.manager.catalog();
-        let model = catalog.get_model_variant(variant_id).await.map_err(map_err)?;
+        let model = catalog
+            .get_model_variant(variant_id)
+            .await
+            .map_err(map_err)?;
 
         if model.is_loaded().await.unwrap_or(false) {
+            let _gate = LOAD_GATE.lock().await;
             if let Err(e) = model.unload().await {
                 tracing::warn!(model = %variant_id, error = %e, "unload failed (treated as no-op success)");
             }
@@ -442,14 +592,17 @@ impl FoundryManager {
     }
 
     /// Download (if needed) and load a chat model, making it the current selection.
-    /// Returns the resolved variant id.
-    pub async fn select_model(&self, name: &str) -> AppResult<String> {
+    /// Returns the resolved variant id and whether a corrupt cache was healed en route.
+    pub async fn select_model(&self, name: &str) -> AppResult<(String, bool)> {
         let model = self.resolve(name).await?;
-        ensure_loaded(&model).await?;
+        let repaired = ensure_loaded(&model).await?;
         let id = model.id().to_string();
-        *self.current_chat_model.lock().expect("chat-model lock poisoned") = id.clone();
+        *self
+            .current_chat_model
+            .lock()
+            .expect("chat-model lock poisoned") = id.clone();
         tracing::info!(model = %id, "chat model selected and loaded");
-        Ok(id)
+        Ok((id, repaired))
     }
 
     // -------------------------------------------------------------------------
@@ -523,13 +676,29 @@ impl FoundryManager {
 
         if is_gpu {
             let victim = {
-                let mut lru = self.lru_residents.lock().expect("lru-residents lock poisoned");
+                let mut lru = self
+                    .lru_residents
+                    .lock()
+                    .expect("lru-residents lock poisoned");
                 // Remove existing entry so we can re-insert at MRU position regardless
                 // of whether the model is already loaded (this also updates recency).
                 lru.retain(|x| x != &id);
                 // Only evict if we're still at or over the cap after removing ourselves.
                 let victim = if lru.len() >= self.max_resident_models && !lru.is_empty() {
-                    Some(lru.remove(0)) // pop LRU (oldest, front of vec)
+                    // Never evict a model with an in-flight generation — the native
+                    // core fail-fasts (0xc0000409) if weights vanish mid-generate.
+                    // Prefer the oldest non-busy resident; if every resident is busy,
+                    // temporarily exceed the cap instead of crashing.
+                    match lru.iter().position(|x| !is_busy(x)) {
+                        Some(i) => Some(lru.remove(i)),
+                        None => {
+                            tracing::warn!(
+                                "resident cap reached but every GPU resident is mid-generation; \
+                                 skipping eviction (cap temporarily exceeded)"
+                            );
+                            None
+                        }
+                    }
                 } else {
                     None
                 };
@@ -541,6 +710,7 @@ impl FoundryManager {
                 let catalog = self.manager.catalog();
                 match catalog.get_model_variant(&victim_id).await {
                     Ok(victim_model) => {
+                        let _gate = LOAD_GATE.lock().await;
                         if let Err(e) = victim_model.unload().await {
                             tracing::warn!(model = %victim_id, error = %e, "LRU eviction: unload failed (continuing anyway)");
                         } else {
@@ -555,7 +725,7 @@ impl FoundryManager {
             }
         }
         // Proceed with download-if-needed + load regardless of GPU/NPU/CPU class.
-        ensure_loaded(model).await
+        ensure_loaded(model).await.map(|_| ())
     }
 
     // -------------------------------------------------------------------------
@@ -574,7 +744,7 @@ impl FoundryManager {
         spec: &ModelSpec,
         system: &str,
         user: &str,
-    ) -> AppResult<ChatCompletionStream> {
+    ) -> AppResult<GuardedChatStream> {
         let model = self.resolve_variant(&spec.alias, &spec.device_pref).await?;
 
         // NPU load-failure fallback: if we resolved an NPU variant but loading it fails,
@@ -599,15 +769,38 @@ impl FoundryManager {
 
         let msgs = build_messages(system, user, spec.thinking);
         let client = {
-            let c = model.create_chat_client().temperature(spec.temperature as f64);
-            if let Some(mt) = spec.max_tokens { c.max_tokens(mt) } else { c }
+            let c = model
+                .create_chat_client()
+                .temperature(spec.temperature as f64);
+            if let Some(mt) = spec.max_tokens {
+                c.max_tokens(mt)
+            } else {
+                c
+            }
         };
-        // Phase-3 tool seam: when the spec declares tools (HealthQuery, Trends,
-        // PatientLookup, Extract, Verify, MultiHop), expose the run_aggregation tool
-        // so the model can invoke structured data operations mid-stream.
-        let tools = if spec.tools { Some(vec![run_aggregation_tool()]) } else { None };
-        let tools_ref: Option<&[ChatCompletionTools]> = tools.as_deref();
-        client.complete_streaming_chat(&msgs, tools_ref).await.map_err(map_err)
+        // No tools are offered here, whatever `spec.tools` says.
+        //
+        // Every caller of this function streams the model's *content* straight to the
+        // user: narration of already-executed rows, or grounded semantic generation.
+        // None of them parse or execute a tool call. Offering `run_aggregation` anyway
+        // invited exactly the failure it promised to enable — a model that answered
+        // "list 5 patients" by emitting a literal
+        // `<tool_call>{"name":"run_aggregation",...}</tool_call>` block, which is
+        // content, so `ThinkFilter` (which only strips `<think>`) streamed it verbatim
+        // into the chat transcript.
+        //
+        // Tool calls belong to `plan_tool`, which forces the call, parses the arguments,
+        // validates them, and executes them. `spec.tools` still gates that path.
+        let tools_ref: Option<&[ChatCompletionTools]> = None;
+        // Mark the model busy *before* opening the stream so eviction/unload can't
+        // slip in between; the guard rides inside the returned stream and clears
+        // on drop (including early client disconnects).
+        let busy = BusyGuard::new(model.id().to_string());
+        let inner = client
+            .complete_streaming_chat(&msgs, tools_ref)
+            .await
+            .map_err(map_err)?;
+        Ok(GuardedChatStream { inner, _busy: busy })
     }
 
     /// Non-streaming completion against a fully-resolved `ModelSpec`. Drains
@@ -635,7 +828,7 @@ impl FoundryManager {
     /// Open a streaming chat completion against the current model with a system + user
     /// message pair. Backward-compatible wrapper over `generate_stream_with` using a
     /// default GPU spec — callers in `rag/routes.rs` are unchanged.
-    pub async fn generate_stream(&self, system: &str, user: &str) -> AppResult<ChatCompletionStream> {
+    pub async fn generate_stream(&self, system: &str, user: &str) -> AppResult<GuardedChatStream> {
         let spec = ModelSpec {
             alias: self.current_model(),
             thinking: false,
@@ -823,12 +1016,57 @@ pub fn run_list_schema() -> serde_json::Value {
     })
 }
 
+/// Build the `emit_sql` tool descriptor for the NL-to-SQL generation step.
+///
+/// Forces phi-4-mini to return a typed SQL + metadata object rather than free text,
+/// so the pipeline can extract the SELECT statement without string parsing.
+pub fn emit_sql_tool() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "emit_sql".to_string(),
+            description: Some(
+                "Emit a single read-only SELECT statement that answers the user's question \
+                 using the provided schema. Include the referenced table names and a brief \
+                 explanation of what the query does."
+                    .to_string(),
+            ),
+            parameters: Some(emit_sql_schema()),
+            strict: Some(true),
+        },
+    })
+}
+
+/// JSON Schema for `EmitSqlOutput` — used as the tool parameter schema and as the
+/// `response_format: JsonSchema(…)` constraint in `plan_sql`.
+pub fn emit_sql_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["sql"],
+        "properties": {
+            "sql": {
+                "type": "string",
+                "description": "A single read-only SELECT statement answering the question."
+            },
+            "tables": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Table names referenced by the SQL."
+            },
+            "explanation": {
+                "type": "string",
+                "description": "One sentence describing what the query does."
+            }
+        }
+    })
+}
+
 /// Build the `classify_route` tool descriptor — the intent router's Tier-2 call.
 ///
-/// Forces the small model (phi-4-mini) to emit exactly one routing label plus
-/// optional intent + entity hints, rather than free-text the router would have to
-/// parse loosely. `strict: true` is best-effort on small models; the router maps
-/// the string fields leniently and falls open to semantic on any surprise.
+/// Forces the small model (phi-4-mini) to emit exactly one routing label plus an
+/// optional intent, rather than free-text the router would have to parse
+/// loosely. `strict: true` is best-effort on small models; the router maps the
+/// string fields leniently and falls open to semantic on any surprise.
 pub fn classify_route_tool() -> ChatCompletionTools {
     ChatCompletionTools::Function(ChatCompletionTool {
         function: FunctionObject {
@@ -850,10 +1088,9 @@ pub fn classify_route_tool() -> ChatCompletionTools {
 }
 
 /// JSON Schema for the `classify_route` tool output. Mirrors
-/// `router::RouteToolOutput`: a required `route` label, an optional coarse
-/// `intent`, and optional schema-linking `entities` (a hint for the future
-/// text-to-SQL backend, plan 18). All-string fields — the router parses them
-/// into enums leniently so a stray label can never break routing.
+/// `router::RouteToolOutput`: a required `route` label plus an optional coarse
+/// `intent`. Both string fields — the router parses them into enums leniently
+/// so a stray label can never break routing.
 pub fn classify_route_schema() -> serde_json::Value {
     serde_json::json!({
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -869,23 +1106,126 @@ pub fn classify_route_schema() -> serde_json::Value {
                 "type": "string",
                 "enum": ["lookup", "narrative", "aggregation", "trend", "enumeration", "multi_hop"],
                 "description": "Finer-grained shape of a structured or hybrid query (optional)."
+            }
+        }
+    })
+}
+
+/// Build the `extract_clinical` tool descriptor - the ingestion extractor's forced call.
+///
+/// The three arrays are split by vocabulary rather than carrying a `system` field per
+/// term: which codeset applies is a property of the array, so the model never has to
+/// choose one and cannot get it wrong. `ExtractedClinical::stamp_systems` fills the
+/// field in afterwards.
+pub fn extract_clinical_tool() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "extract_clinical".to_string(),
+            description: Some(
+                "Record the clinical entities that literally appear in a health record's \
+                 text: conditions (ICD-10), medications (RxNorm), and labs or observations \
+                 (LOINC). Only report entities the text actually states."
+                    .to_string(),
+            ),
+            parameters: Some(extract_clinical_schema()),
+            strict: Some(true),
+        },
+    })
+}
+
+/// JSON Schema for `ExtractedClinical`. Each entity is `{text, code}` - `text` is the
+/// wording from the note, `code` the standard code or an empty string when the model
+/// is unsure. An empty code is a correct answer; a guessed one is a defect.
+pub fn extract_clinical_schema() -> serde_json::Value {
+    // One shared item shape for all three arrays, inlined per array rather than shared
+    // via `$ref` because small models handle a flat schema far more reliably.
+    let term = |code_desc: &str| {
+        serde_json::json!({
+            "type": "object",
+            "required": ["text", "code"],
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The entity exactly as it is worded in the record text."
+                },
+                "code": { "type": "string", "description": code_desc }
+            }
+        })
+    };
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["conditions", "medications", "labs"],
+        "properties": {
+            "conditions": {
+                "type": "array",
+                "description": "Diagnoses and problems stated in the text.",
+                "items": term("ICD-10 code, or an empty string if not known with confidence.")
             },
-            "entities": {
-                "type": "object",
-                "description": "Optional schema-linking hints extracted from the question.",
-                "properties": {
-                    "tables": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Likely relevant table/collection names."
-                    },
-                    "metric": {
-                        "type": "string",
-                        "description": "The measure asked for (e.g. 'count', 'average age')."
-                    },
-                    "time_bucket": {
-                        "type": "string",
-                        "description": "Calendar unit for a trend (e.g. 'month'), if any."
+            "medications": {
+                "type": "array",
+                "description": "Drugs stated in the text.",
+                "items": term("RxNorm code, or an empty string if not known with confidence.")
+            },
+            "labs": {
+                "type": "array",
+                "description": "Laboratory results, vitals, and observations stated in the text.",
+                "items": term("LOINC code, or an empty string if not known with confidence.")
+            }
+        }
+    })
+}
+
+/// Build the `verify_claims` tool descriptor - the faithfulness verifier's forced call.
+///
+/// Asking for a claim list rather than a single verdict is deliberate: a bare pass/fail
+/// from a 3.8B model is noise, whereas per-claim rows with passage numbers can be shown
+/// to the user and checked against the passages they already have.
+pub fn verify_claims_tool() -> ChatCompletionTools {
+    ChatCompletionTools::Function(ChatCompletionTool {
+        function: FunctionObject {
+            name: "verify_claims".to_string(),
+            description: Some(
+                "Record whether each factual clinical claim in an answer is supported by \
+                 the numbered passages retrieved from the patient records. Judge support \
+                 only from the passages, never from outside medical knowledge."
+                    .to_string(),
+            ),
+            parameters: Some(verify_claims_schema()),
+            strict: Some(true),
+        },
+    })
+}
+
+/// JSON Schema for `VerifyToolOutput`. Passage numbers are 1-based to match the
+/// `[1]`-style citation markers the answer itself uses; `VerifyReport::from_claims`
+/// discards any that fall outside the evidence actually supplied.
+pub fn verify_claims_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["claims"],
+        "properties": {
+            "claims": {
+                "type": "array",
+                "description": "One entry per factual clinical claim in the answer.",
+                "items": {
+                    "type": "object",
+                    "required": ["claim", "supported"],
+                    "properties": {
+                        "claim": {
+                            "type": "string",
+                            "description": "The claim, restated in one short sentence."
+                        },
+                        "supported": {
+                            "type": "boolean",
+                            "description": "True only if the passages state this claim."
+                        },
+                        "passages": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "1-based numbers of the passages that state the claim. Empty when unsupported."
+                        }
                     }
                 }
             }
@@ -898,11 +1238,7 @@ impl FoundryManager {
     /// emit a `classify_route` tool call and returns the parsed
     /// [`RouteToolOutput`]. The caller (`router::route`) maps it to a concrete
     /// route and falls open to semantic on any error.
-    pub async fn plan_route(
-        &self,
-        spec: &ModelSpec,
-        question: &str,
-    ) -> AppResult<RouteToolOutput> {
+    pub async fn plan_route(&self, spec: &ModelSpec, question: &str) -> AppResult<RouteToolOutput> {
         let system = "You are the routing classifier for an on-premises health-records \
                       question-answering assistant. Given the user's latest message, call \
                       the classify_route tool with exactly one route. Prefer 'structured' \
@@ -941,6 +1277,26 @@ impl FoundryManager {
         .await
     }
 
+    /// Generate SQL for a natural-language question: ask the model to call `emit_sql`
+    /// with a SELECT statement for the given dialect and schema cards. The caller MUST
+    /// run `nl2sql::validate::validate_sql` on the returned spec before execution.
+    pub async fn plan_sql(
+        &self,
+        spec: &ModelSpec,
+        system: &str,
+        user: &str,
+    ) -> AppResult<EmitSqlOutput> {
+        self.plan_tool::<EmitSqlOutput>(
+            spec,
+            system,
+            user,
+            "emit_sql",
+            emit_sql_tool(),
+            emit_sql_schema(),
+        )
+        .await
+    }
+
     /// Plan a list-records query: ask the model to emit a `RunList` tool call,
     /// parse and return it. The caller MUST run `list::validate_list` on the
     /// returned spec before passing it to `list::run`.
@@ -957,6 +1313,49 @@ impl FoundryManager {
             "run_list_records",
             run_list_tool(),
             run_list_schema(),
+        )
+        .await
+    }
+
+    /// Extract clinical entities from one record's text (`AgentKind::Extract`).
+    ///
+    /// The caller is `ingest::extract`, which stamps the code systems and discards an
+    /// empty result. Errors are expected and handled there - a row that cannot be
+    /// annotated is simply stored without an annotation.
+    pub async fn plan_extraction(
+        &self,
+        spec: &ModelSpec,
+        system: &str,
+        user: &str,
+    ) -> AppResult<ExtractedClinical> {
+        self.plan_tool::<ExtractedClinical>(
+            spec,
+            system,
+            user,
+            "extract_clinical",
+            extract_clinical_tool(),
+            extract_clinical_schema(),
+        )
+        .await
+    }
+
+    /// Check an answer's claims against its retrieved passages (`AgentKind::Verify`).
+    ///
+    /// The caller is `verify::check`, which folds the per-claim verdicts into an
+    /// overall status and falls open to `skipped` on any error.
+    pub async fn plan_verification(
+        &self,
+        spec: &ModelSpec,
+        system: &str,
+        user: &str,
+    ) -> AppResult<VerifyToolOutput> {
+        self.plan_tool::<VerifyToolOutput>(
+            spec,
+            system,
+            user,
+            "verify_claims",
+            verify_claims_tool(),
+            verify_claims_schema(),
         )
         .await
     }
@@ -994,17 +1393,49 @@ impl FoundryManager {
                 Err(e) => return Err(e),
             }
         };
+        // Keep the model marked busy across both completion calls so it can't be
+        // evicted/unloaded mid-generation (native core fail-fasts on that).
+        let _busy = BusyGuard::new(model.id().to_string());
 
         let schema_str = schema.to_string();
         let msgs = build_messages(system, user, spec.thinking);
 
-        let client = model
+        // Forced tool call + a JSON-schema response format describing the *arguments*
+        // are two grammars over the same output, and on some backends they are
+        // intersected rather than layered. ORT-GenAI then has to satisfy the tool-call
+        // envelope (`{name, arguments}`) and the bare argument object at once, which is
+        // impossible, and fails the whole request with:
+        //
+        //   Error creating grammar: Unsatisfiable schema: required item is unsatisfiable
+        //
+        // Observed on the NPU phi-4-mini classify call while the GPU qwen path (which
+        // tolerates the pair) kept working. The schema is the more expendable of the
+        // two — `try_parse_tool` already accepts a plain JSON content response — so on
+        // a grammar failure we retry immediately with `tool_choice` alone.
+        let with_schema = model
             .create_chat_client()
             .temperature(spec.temperature as f64)
             .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
             .response_format(ChatResponseFormat::JsonSchema(schema_str.clone()));
 
-        let resp = client.complete_chat(&msgs, Some(&[tool.clone()])).await.map_err(map_err)?;
+        let resp = match with_schema.complete_chat(&msgs, Some(&[tool.clone()])).await {
+            Ok(r) => r,
+            Err(e) if is_grammar_error(&e) => {
+                tracing::warn!(
+                    tool = tool_name, error = %e,
+                    "backend rejected the combined tool + response_format grammar; \
+                     retrying with the forced tool call alone"
+                );
+                model
+                    .create_chat_client()
+                    .temperature(spec.temperature as f64)
+                    .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
+                    .complete_chat(&msgs, Some(&[tool.clone()]))
+                    .await
+                    .map_err(map_err)?
+            }
+            Err(e) => return Err(map_err(e)),
+        };
 
         match try_parse_tool::<T>(&resp) {
             Ok(result) => return Ok(result),
@@ -1021,8 +1452,10 @@ impl FoundryManager {
                     .temperature(0.0)
                     .tool_choice(ChatToolChoice::Function(tool_name.to_string()))
                     .response_format(ChatResponseFormat::JsonSchema(schema_str));
-                let resp2 =
-                    client2.complete_chat(&msgs2, Some(&[tool])).await.map_err(map_err)?;
+                let resp2 = client2
+                    .complete_chat(&msgs2, Some(&[tool]))
+                    .await
+                    .map_err(map_err)?;
                 try_parse_tool::<T>(&resp2).map_err(|e| {
                     AppError::BadRequest(format!(
                         "{tool_name} planner could not produce a valid spec after retry: {e}"
@@ -1038,7 +1471,10 @@ impl FoundryManager {
 fn try_parse_tool<T: serde::de::DeserializeOwned>(
     resp: &foundry_local_sdk::CreateChatCompletionResponse,
 ) -> Result<T, String> {
-    let first = resp.choices.first().ok_or_else(|| "model returned no choices".to_string())?;
+    let first = resp
+        .choices
+        .first()
+        .ok_or_else(|| "model returned no choices".to_string())?;
 
     // 1. Try tool_calls
     if let Some(tcs) = &first.message.tool_calls {
@@ -1050,7 +1486,7 @@ fn try_parse_tool<T: serde::de::DeserializeOwned>(
                         return Err(format!(
                             "tool_call arguments parse failed: {e}; raw={}",
                             &call.function.arguments
-                        ))
+                        ));
                     }
                 }
             }
@@ -1103,14 +1539,60 @@ fn build_messages(system: &str, user: &str, thinking: bool) -> Vec<ChatCompletio
 }
 
 /// Ensure a model is cached (download if not) and loaded into memory.
-async fn ensure_loaded(model: &Model) -> AppResult<()> {
+/// Returns `true` when a corrupt cache had to be purged and re-downloaded.
+async fn ensure_loaded(model: &Model) -> AppResult<bool> {
     if model.is_loaded().await.map_err(map_err)? {
-        return Ok(());
+        return Ok(false);
     }
     if !model.is_cached().await.map_err(map_err)? {
         tracing::info!(model = model.id(), "downloading model (not cached)");
         model.download(None::<fn(f64)>).await.map_err(map_err)?;
     }
+    {
+        let _gate = LOAD_GATE.lock().await;
+        // Re-check under the gate: a queued waiter may find its model already resident.
+        if model.is_loaded().await.map_err(map_err)? {
+            return Ok(false);
+        }
+        match model.load().await {
+            Ok(()) => return Ok(false),
+            Err(e) if is_corrupt_weights_error(&e.to_string()) => {
+                tracing::warn!(model = model.id(), error = %e, "load hit corrupt cached weights; purging and re-downloading");
+            }
+            Err(e) => return Err(map_err(e)),
+        }
+    } // gate released during the (long) re-download
+    heal_and_load(model, None::<fn(f64)>).await?;
+    Ok(true)
+}
+
+/// Signature of a load failure caused by corrupt/truncated cached weights (e.g. a
+/// crash mid-download that Foundry still counts as "cached") — as opposed to
+/// transient/resource errors, which must NOT trigger a multi-GB re-download.
+fn is_corrupt_weights_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("error parsing")          // OpenVINO IR parse failure
+        || m.contains("pugi::")          // OpenVINO XML reader
+        || m.contains("input_model")     // openvino frontends/ir/input_model.cpp
+        || m.contains("protobuf parsing") // ONNX deserialization failure
+        || m.contains("invalid model")
+        || m.contains("no such file") // partially-written cache dir
+}
+
+/// Recovery path: purge the variant's cached files, re-download (optionally with
+/// progress), and retry the load once under the gate. A second failure surfaces.
+async fn heal_and_load(
+    model: &Model,
+    progress: Option<impl Fn(f64) + Send + Sync + 'static>,
+) -> AppResult<()> {
+    model.remove_from_cache().await.map_err(map_err)?;
+    tracing::info!(model = model.id(), "re-downloading model after cache purge");
+    model.download(progress).await.map_err(map_err)?;
+    let _gate = LOAD_GATE.lock().await;
     model.load().await.map_err(map_err)?;
+    tracing::info!(
+        model = model.id(),
+        "recovered: model re-downloaded and loaded"
+    );
     Ok(())
 }

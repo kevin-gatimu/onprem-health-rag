@@ -4,7 +4,7 @@
 //   md+  : Sidebar (60px rail, expandable to 240px at xl)
 // Enforces route access against the effective role — an admin previewing another
 // role is bounced from routes that role can't reach, just like that role would be.
-import { Suspense } from "react";
+import { Suspense, useEffect } from "react";
 import { ShieldAlert } from "lucide-react";
 import { Sidebar } from "./Sidebar";
 import { TopBar } from "./TopBar";
@@ -15,11 +15,21 @@ import { EmptyState } from "../ui";
 import { useUi, currentRoute } from "../../stores/ui";
 import { useEffectiveRole } from "../../hooks/useEffectiveRole";
 import { canAccess } from "../../lib/permissions";
+import { startLogStream } from "../../lib/bridge";
 
 export function AppShell() {
   const route = useUi(currentRoute);
   const role = useEffectiveRole();
   const allowed = role != null && canAccess(route, role);
+
+  // The boot-time attempt in bridgeEvents fails before login ("not logged in").
+  // AppShell only mounts once authenticated (and remounts after re-login), so this
+  // is the reliable place to (re)start the relay. Idempotent bridge-side.
+  useEffect(() => {
+    startLogStream().catch(() => {
+      /* server unreachable — the next login/reconnect remounts us and retries */
+    });
+  }, []);
 
   return (
     <div className="flex h-full w-full overflow-hidden bg-base text-fg">

@@ -9,6 +9,7 @@ import type { PendingRun } from '../../stores/chat';
 import Markdown from '../../components/Markdown';
 import Citations from './Citations';
 import ActivityStrip from './ActivityStrip';
+import VerifyBadge from './VerifyBadge';
 
 type MessageBubbleProps =
   | { kind: 'persisted'; message: StoredMessage }
@@ -96,6 +97,11 @@ export default function MessageBubble(props: MessageBubbleProps) {
           <span>{copied ? 'Copied' : 'Copy'}</span>
         </button>
       )}
+
+      {/* Faithfulness verdict (plan 25). Live-run only: the report rides on the
+          pending run, not on the persisted message, so it disappears once the
+          conversation is refetched from the DB. */}
+      {pendingRun?.verify && <VerifyBadge report={pendingRun.verify} />}
 
       {/* Citations */}
       {citations.length > 0 && <Citations citations={citations} />}

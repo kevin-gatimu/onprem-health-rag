@@ -2,8 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <!-- viewport-fit=cover lets the WebView extend into the safe areas so
+         env(safe-area-inset-*) is meaningful. On Android those insets are
+         consumed natively in MainActivity.kt (and zeroed here) because WebView
+         only reports them from M144; this keeps the CSS layer correct for any
+         platform where the native path does not apply. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <title>Tauri + React + Typescript</title>
   </head>
 

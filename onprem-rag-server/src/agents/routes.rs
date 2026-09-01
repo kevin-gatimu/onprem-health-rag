@@ -22,7 +22,6 @@
 //! | `error`    | Bare error string                                | On mid-stream failure        |
 //! | `done`     | Empty string                                     | Terminal, always emitted     |
 
-use foundry_local_sdk::ChatCompletionStream;
 use rocket::response::stream::{Event, EventStream};
 use rocket::serde::json::Json;
 use rocket::{State, post};
@@ -37,7 +36,9 @@ use crate::answer::{
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::foundry::router::AgentKind;
-use crate::rag::{SYSTEM_PROMPT, build_prompt, prepare_queries};
+use crate::foundry::GuardedChatStream;
+use crate::memory::{WorkingMemory, load_working_memory};
+use crate::rag::{SYSTEM_PROMPT, build_prompt, prepare_queries, rewrite_query};
 use crate::retrieval;
 use crate::state::AppState;
 
@@ -72,13 +73,13 @@ enum AgentData {
         /// Serialised executed pipeline (provenance).
         pipeline_json: String,
         /// Already-opened narration stream (iterate inside EventStream!).
-        narration_stream: ChatCompletionStream,
+        narration_stream: GuardedChatStream,
     },
     Semantic {
         /// Serialised `Vec<Passage>` for citations.
         citations_json: String,
         /// `None` when the score gate refuses to answer.
-        gen_stream: Option<ChatCompletionStream>,
+        gen_stream: Option<GuardedChatStream>,
     },
 }
 
@@ -112,14 +113,15 @@ pub async fn agent(
 
     // Conversation persistence (pre-stream so errors surface as HTTP status, not
     // mid-stream events).
-    let history: Vec<crate::rag::ChatTurn>;
+    let memory: WorkingMemory;
     if let Some(cid) = req.conversation_id.as_deref() {
-        use crate::routes::conversations::{load_history, persist_user_message, verify_owned};
+        use crate::routes::conversations::{clip_message_bytes, persist_user_message, verify_owned};
         verify_owned(&state.db, cid, &user.id).await?;
-        history = load_history(&state.db, cid, &user.id, 10).await;
-        persist_user_message(&state.db, cid, &user.id, &req.question).await?;
+        memory = load_working_memory(&state.db, cid, &state.config).await;
+        let content = clip_message_bytes(&req.question, state.config.message_max_bytes);
+        persist_user_message(&state.db, cid, &user.id, &content).await?;
     } else {
-        history = Vec::new();
+        memory = WorkingMemory::default();
     }
 
     let kind_str: String = serde_json::to_value(resolved_kind)
@@ -143,9 +145,13 @@ pub async fn agent(
             };
             let planner_system = build_agg_planner_system(&cat, intent);
 
+            // Rewrite against working memory so follow-up aggregations ("and for
+            // females?") plan against a complete question (plan 22.3). No-op (no
+            // model call) when there's no history.
+            let standalone = rewrite_query(foundry, &memory.rewrite_turns(), &req.question).await;
+
             // 1. Plan: model emits a RunAggregation tool call.
-            let planned =
-                foundry.plan_aggregation(&spec, &planner_system, &req.question).await?;
+            let planned = foundry.plan_aggregation(&spec, &planner_system, &standalone).await?;
 
             // 2. Validate + sanitize against the current catalog.
             let validated = validate(&planned, &cat)?;
@@ -170,7 +176,7 @@ pub async fn agent(
             ));
 
             // 4. Open the grounded narration stream.
-            let narration_user = build_narration_user(&req.question, &rows);
+            let narration_user = build_narration_user(&standalone, &rows);
             let mut narration_spec = state.spec_for(resolved_kind);
             narration_spec.tools = false; // narration never calls tools
             let narration_stream = foundry
@@ -189,7 +195,7 @@ pub async fn agent(
             let top_k = state.config.context_top_k;
 
             let (standalone, queries) =
-                prepare_queries(foundry, &state.config, &history, &req.question).await;
+                prepare_queries(foundry, &state.config, &memory.rewrite_turns(), &req.question).await;
             let passages =
                 retrieval::retrieve(&state.db, &state.config, &queries, mode, rerank, top_k)
                     .await?;
@@ -208,7 +214,7 @@ pub async fn agent(
             let gen_stream = if refuse {
                 None
             } else {
-                let prompt = build_prompt(&passages, &standalone);
+                let prompt = build_prompt(&passages, &standalone, &memory);
                 Some(foundry.generate_stream_with(&spec, SYSTEM_PROMPT, &prompt).await?)
             };
 
@@ -219,6 +225,8 @@ pub async fn agent(
     let db = state.db.clone();
     let uid = user.id.clone();
     let persist_cid = req.conversation_id.clone();
+    let foundry_handle = state.foundry_handle();
+    let cfg = state.config.clone();
 
     Ok(EventStream! {
         use futures::StreamExt;
@@ -313,12 +321,13 @@ pub async fn agent(
 
         if let Some(cid) = &persist_cid {
             if !had_error {
-                use crate::routes::conversations::persist_agent_assistant_message;
+                use crate::routes::conversations::{clip_message_bytes, persist_agent_assistant_message};
+                let content = clip_message_bytes(&full_answer, cfg.message_max_bytes);
                 if let Err(e) = persist_agent_assistant_message(
                     &db,
                     cid.as_str(),
                     &uid,
-                    &full_answer,
+                    &content,
                     &kind_str,
                     &persist_passages,
                     persist_structured_json.as_deref(),
@@ -326,6 +335,10 @@ pub async fn agent(
                 .await
                 {
                     tracing::warn!(error = %e, "failed to persist agent assistant message");
+                } else {
+                    crate::memory::maybe_spawn_compaction(
+                        db.clone(), foundry_handle.clone(), cfg.clone(), cid.clone(),
+                    );
                 }
             }
         }

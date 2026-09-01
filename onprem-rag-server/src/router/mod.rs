@@ -59,12 +59,18 @@ pub enum RouteClass {
     /// Greeting / thanks / identity / out-of-domain. No retrieval; one cheap
     /// streamed reply.
     Conversational,
+    /// A question about the conversation itself ("what have I asked so far?",
+    /// "recap our chat"). No retrieval; answered from `WorkingMemory` alone
+    /// (plan 22.5). Only produced when the conversation actually has history —
+    /// with none, there's nothing to recap and the question falls through
+    /// normally.
+    ConversationMeta,
     /// Countable / groupable / rankable — answer with exact numbers. Carries the
-    /// [`QueryIntent`] plus a backend preference.
-    Structured {
-        intent: QueryIntent,
-        backend: StructuredBackend,
-    },
+    /// [`QueryIntent`]. DocumentDB aggregation is the only backend today; a
+    /// backend preference will be reintroduced when plan 18 Phase D (text-to-SQL
+    /// backend selection) actually lands — no point carrying that distinction
+    /// before anything produces or reads a second value for it.
+    Structured { intent: QueryIntent },
     /// Explain / summarise / describe — hybrid retrieval + grounded generation.
     Semantic,
     /// Structured filter + semantic synthesis ("summarise notes of patients with
@@ -72,18 +78,8 @@ pub enum RouteClass {
     Hybrid { cohort_intent: QueryIntent },
 }
 
-/// Which structured backend answers a [`RouteClass::Structured`] query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StructuredBackend {
-    /// DocumentDB aggregation over ingested records — always available.
-    DocDb,
-    /// Text-to-SQL against a live registered source. Phase D (plan 18); never
-    /// produced until the catalog probe and feature flag land.
-    SourceSql,
-}
-
-/// A routing decision plus provenance (which tier decided, cache hit, and any
-/// best-effort entity hints the model extracted).
+/// A routing decision plus provenance (which tier decided it and whether it was
+/// a cache hit).
 #[derive(Debug, Clone)]
 pub struct RouteDecision {
     pub class: RouteClass,
@@ -91,8 +87,6 @@ pub struct RouteDecision {
     pub tier: u8,
     /// True when served from the Tier-2 cache.
     pub cached: bool,
-    /// Best-effort schema-linking hints from the Tier-2 model (Phase 18 input).
-    pub entities: Option<RouteEntities>,
 }
 
 impl RouteDecision {
@@ -100,6 +94,7 @@ impl RouteDecision {
     pub fn route_label(&self) -> &'static str {
         match self.class {
             RouteClass::Conversational => "conversational",
+            RouteClass::ConversationMeta => "conversation_meta",
             RouteClass::Structured { .. } => "structured",
             RouteClass::Semantic => "semantic",
             RouteClass::Hybrid { .. } => "hybrid",
@@ -115,19 +110,9 @@ impl RouteDecision {
         }
     }
 
-    fn backend_label(&self) -> Option<&'static str> {
-        match &self.class {
-            RouteClass::Structured { backend, .. } => Some(match backend {
-                StructuredBackend::DocDb => "doc_db",
-                StructuredBackend::SourceSql => "source_sql",
-            }),
-            _ => None,
-        }
-    }
-
-    /// Serialise to the `routed` SSE event payload:
-    /// `{ "route", "intent", "tier", "cached", "backend" }`. Emitted first by
-    /// `/chat` so the UI activity strip can show the decision.
+    /// Serialise to the `routed` SSE event payload: `{ "route", "intent",
+    /// "tier", "cached" }`. Emitted first by `/chat` so the UI activity strip
+    /// can show the decision.
     pub fn to_sse_json(&self) -> String {
         let intent = self
             .intent()
@@ -138,23 +123,9 @@ impl RouteDecision {
             "intent": intent,
             "tier": self.tier,
             "cached": self.cached,
-            "backend": self.backend_label(),
         })
         .to_string()
     }
-}
-
-/// Best-effort entities extracted by the Tier-2 classifier — a cheap
-/// schema-linking hint for the text-to-SQL backend (plan 18). Carried and
-/// logged today; not yet consumed.
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct RouteEntities {
-    #[serde(default)]
-    pub tables: Vec<String>,
-    #[serde(default)]
-    pub metric: Option<String>,
-    #[serde(default)]
-    pub time_bucket: Option<String>,
 }
 
 /// Raw output of the `classify_route` tool call. Strings are parsed leniently in
@@ -164,8 +135,6 @@ pub struct RouteToolOutput {
     pub route: String,
     #[serde(default)]
     pub intent: Option<String>,
-    #[serde(default)]
-    pub entities: Option<RouteEntities>,
 }
 
 // ---------------------------------------------------------------------------
@@ -280,11 +249,23 @@ pub async fn route(
     foundry_opt: Option<&FoundryManager>,
     cache: &RouterCache,
 ) -> RouteDecision {
+    // Tier 0a — conversation-meta gate: "what have I asked so far?" needs the
+    // transcript, not the small-talk reply or a pointless retrieval pass. Only
+    // fires when there's actually history to recap.
+    if has_history && conversational::is_conversation_meta(question) {
+        cache.metrics.tier0.fetch_add(1, Ordering::Relaxed);
+        return finish(
+            RouteDecision { class: RouteClass::ConversationMeta, tier: 0, cached: false },
+            question,
+            has_history,
+        );
+    }
+
     // Tier 0 — conversational gate (instant, high precision, fail-open).
     if conversational::is_conversational(question) {
         cache.metrics.tier0.fetch_add(1, Ordering::Relaxed);
         return finish(
-            RouteDecision { class: RouteClass::Conversational, tier: 0, cached: false, entities: None },
+            RouteDecision { class: RouteClass::Conversational, tier: 0, cached: false },
             question,
             has_history,
         );
@@ -310,7 +291,7 @@ pub async fn route(
             }
             cache.metrics.tier1.fetch_add(1, Ordering::Relaxed);
             finish(
-                RouteDecision { class: class_from_intent(intent), tier: 1, cached: false, entities: None },
+                RouteDecision { class: class_from_intent(intent), tier: 1, cached: false },
                 question,
                 has_history,
             )
@@ -324,7 +305,7 @@ pub async fn route(
             }
             cache.metrics.fail_open.fetch_add(1, Ordering::Relaxed);
             finish(
-                RouteDecision { class: RouteClass::Semantic, tier: 1, cached: false, entities: None },
+                RouteDecision { class: RouteClass::Semantic, tier: 1, cached: false },
                 question,
                 has_history,
             )
@@ -359,8 +340,7 @@ async fn tier2(
     };
 
     let class = class_from_model(&out)?;
-    let decision =
-        RouteDecision { class, tier: 2, cached: false, entities: out.entities.clone() };
+    let decision = RouteDecision { class, tier: 2, cached: false };
     cache.metrics.tier2.fetch_add(1, Ordering::Relaxed);
     cache.put(key, decision.clone());
     Some(decision)
@@ -371,7 +351,7 @@ async fn tier2(
 fn class_from_intent(intent: QueryIntent) -> RouteClass {
     match intent {
         QueryIntent::Aggregation | QueryIntent::Trend | QueryIntent::Enumeration => {
-            RouteClass::Structured { intent, backend: StructuredBackend::DocDb }
+            RouteClass::Structured { intent }
         }
         QueryIntent::Lookup | QueryIntent::Narrative | QueryIntent::MultiHop => {
             RouteClass::Semantic
@@ -390,7 +370,6 @@ fn class_from_model(out: &RouteToolOutput) -> Option<RouteClass> {
             // Default an unspecified structured intent to Aggregation — the most
             // common analytical shape; validate/execute will still guard it.
             intent: intent.unwrap_or(QueryIntent::Aggregation),
-            backend: StructuredBackend::DocDb,
         }),
         "hybrid" => Some(RouteClass::Hybrid {
             cohort_intent: intent.unwrap_or(QueryIntent::Aggregation),
@@ -418,10 +397,11 @@ fn parse_intent(s: &str) -> Option<QueryIntent> {
 /// via the shared `intent_to_kind`.
 pub fn class_to_agent_kind(class: &RouteClass) -> AgentKind {
     match class {
-        RouteClass::Structured { intent, .. } => crate::answer::intent_to_kind(*intent),
-        RouteClass::Conversational | RouteClass::Semantic | RouteClass::Hybrid { .. } => {
-            AgentKind::Chat
-        }
+        RouteClass::Structured { intent } => crate::answer::intent_to_kind(*intent),
+        RouteClass::Conversational
+        | RouteClass::ConversationMeta
+        | RouteClass::Semantic
+        | RouteClass::Hybrid { .. } => AgentKind::Chat,
     }
 }
 
@@ -455,7 +435,7 @@ mod tests {
     #[test]
     fn lru_evicts_least_recently_used() {
         let cache = RouterCache::new(2);
-        let d = |t| RouteDecision { class: RouteClass::Semantic, tier: t, cached: false, entities: None };
+        let d = |t| RouteDecision { class: RouteClass::Semantic, tier: t, cached: false };
         cache.put("a".into(), d(2));
         cache.put("b".into(), d(2));
         // Touch "a" so "b" becomes the LRU victim.
@@ -471,7 +451,7 @@ mod tests {
         let cache = RouterCache::new(8);
         cache.put(
             "k".into(),
-            RouteDecision { class: RouteClass::Semantic, tier: 2, cached: false, entities: None },
+            RouteDecision { class: RouteClass::Semantic, tier: 2, cached: false },
         );
         let hit = cache.get("k").unwrap();
         assert!(!hit.cached, "raw stored value keeps cached=false");
@@ -479,12 +459,10 @@ mod tests {
     }
 
     #[test]
-    fn structural_intents_map_to_structured_docdb() {
+    fn structural_intents_map_to_structured() {
         for intent in [QueryIntent::Aggregation, QueryIntent::Trend, QueryIntent::Enumeration] {
             match class_from_intent(intent) {
-                RouteClass::Structured { backend, .. } => {
-                    assert_eq!(backend, StructuredBackend::DocDb)
-                }
+                RouteClass::Structured { intent: got } => assert_eq!(got, intent),
                 other => panic!("expected structured, got {other:?}"),
             }
         }
@@ -497,17 +475,16 @@ mod tests {
         let mk = |route: &str, intent: Option<&str>| RouteToolOutput {
             route: route.to_string(),
             intent: intent.map(str::to_string),
-            entities: None,
         };
         assert_eq!(class_from_model(&mk("conversational", None)), Some(RouteClass::Conversational));
         assert_eq!(class_from_model(&mk("SEMANTIC", None)), Some(RouteClass::Semantic));
         assert_eq!(
             class_from_model(&mk("structured", Some("trend"))),
-            Some(RouteClass::Structured { intent: QueryIntent::Trend, backend: StructuredBackend::DocDb })
+            Some(RouteClass::Structured { intent: QueryIntent::Trend })
         );
         assert_eq!(
             class_from_model(&mk("structured", None)),
-            Some(RouteClass::Structured { intent: QueryIntent::Aggregation, backend: StructuredBackend::DocDb })
+            Some(RouteClass::Structured { intent: QueryIntent::Aggregation })
         );
         assert_eq!(
             class_from_model(&mk("hybrid", Some("enumeration"))),
@@ -516,24 +493,35 @@ mod tests {
         assert_eq!(class_from_model(&mk("gibberish", None)), None);
     }
 
+    #[tokio::test]
+    async fn conversation_meta_requires_history() {
+        // "what have I asked" only routes to ConversationMeta when there's
+        // history to recap; with none it falls through to the normal pipeline.
+        let cache = RouterCache::new(8);
+        let cfg = Config::from_env();
+        let with_history = route("what have I asked so far?", true, &cfg, None, &cache).await;
+        assert_eq!(with_history.class, RouteClass::ConversationMeta);
+        assert_eq!(with_history.tier, 0);
+
+        let without_history = route("what have I asked so far?", false, &cfg, None, &cache).await;
+        assert_ne!(without_history.class, RouteClass::ConversationMeta);
+    }
+
     #[test]
     fn sse_json_shape() {
         let d = RouteDecision {
-            class: RouteClass::Structured { intent: QueryIntent::Aggregation, backend: StructuredBackend::DocDb },
+            class: RouteClass::Structured { intent: QueryIntent::Aggregation },
             tier: 2,
             cached: true,
-            entities: None,
         };
         let v: serde_json::Value = serde_json::from_str(&d.to_sse_json()).unwrap();
         assert_eq!(v["route"], "structured");
         assert_eq!(v["intent"], "aggregation");
         assert_eq!(v["tier"], 2);
         assert_eq!(v["cached"], true);
-        assert_eq!(v["backend"], "doc_db");
 
-        let sem = RouteDecision { class: RouteClass::Semantic, tier: 1, cached: false, entities: None };
+        let sem = RouteDecision { class: RouteClass::Semantic, tier: 1, cached: false };
         let v2: serde_json::Value = serde_json::from_str(&sem.to_sse_json()).unwrap();
         assert_eq!(v2["intent"], serde_json::Value::Null);
-        assert_eq!(v2["backend"], serde_json::Value::Null);
     }
 }

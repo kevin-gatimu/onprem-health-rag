@@ -13,8 +13,9 @@ import { Mail, Lock, AlertCircle, WifiOff, Database, Brain, Shield } from 'lucid
 import { login } from '../../lib/bridge';
 import { useSession } from '../../stores/session';
 import { toast } from '../../stores/ui';
-import { Button, Input, EcgLogo } from '../../components/ui';
+import { Button, Input } from '../../components/ui';
 import LoginBackground from './LoginBackground';
+import logo from '../../assets/logo.png';
 
 export default function Login() {
   const serverUrl = useSession((s) => s.serverUrl);
@@ -60,7 +61,7 @@ export default function Login() {
         {/* Brand content — sits above the background */}
         <div className="relative z-10 flex flex-col justify-center h-full px-10 py-12 gap-8">
           <div className="flex flex-col gap-4">
-            <EcgLogo size={48} className="text-accent" />
+            <img src={logo} alt="OnPrem RAG" className="w-12 h-12 rounded-lg object-contain" />
             <h1 className="text-2xl font-bold text-fg leading-tight">
               Health Records Ingest
             </h1>
@@ -103,7 +104,7 @@ export default function Login() {
         <div className="w-full max-w-sm space-y-6">
           {/* Mobile-only: show logo + app name since the brand panel is hidden */}
           <div className="flex flex-col items-center gap-2 md:hidden">
-            <EcgLogo size={32} className="text-accent" />
+            <img src={logo} alt="OnPrem RAG" className="w-8 h-8 rounded-lg object-contain" />
             <span className="text-base font-semibold text-fg">Health Records Ingest</span>
           </div>
 

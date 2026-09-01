@@ -1,0 +1,9 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base application theme. -->
+    <style name="Theme.onprem_rag" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <!-- Shows through in the system-bar bands left by MainActivity's inset
+             padding, and as the pre-WebView launch background. Dark in both
+             variants because the web UI is dark-only. -->
+        <item name="android:windowBackground">@color/app_base</item>
+    </style>
+</resources>

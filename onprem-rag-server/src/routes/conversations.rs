@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::{AppError, AppResult};
-use crate::rag::ChatTurn;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -290,53 +289,18 @@ pub(crate) async fn verify_owned(
     Ok(oid)
 }
 
-/// Load the last `limit` messages of a conversation as `ChatTurn`s in ascending
-/// `created_at` order, for history-aware query rewriting. Returns an empty vec
-/// on any error or if the conversation isn't owned by `user_id`.
-pub(crate) async fn load_history(
-    db: &DocumentDb,
-    conversation_id: &str,
-    user_id: &str,
-    limit: i64,
-) -> Vec<ChatTurn> {
-    let oid = match parse_oid(conversation_id) {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    // Ownership guard — return empty rather than an error.
-    let owned = db
-        .chat_conversations()
-        .find_one(doc! { "_id": oid, "user_id": user_id })
-        .await
-        .ok()
-        .flatten()
-        .is_some();
-    if !owned {
-        return Vec::new();
+/// Clip `s` to at most `max_bytes` (on a char boundary), appending a marker when
+/// truncated. Applied to message content before persisting (plan 22.7 hygiene) —
+/// keeps one runaway generation from bloating a conversation doc indefinitely.
+pub(crate) fn clip_message_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
     }
-
-    // Fetch the N most-recent messages (descending), then reverse to ascending.
-    let docs: Vec<Document> = match db
-        .chat_messages()
-        .find(doc! { "conversation_id": conversation_id })
-        .sort(doc! { "created_at": -1 })
-        .limit(limit)
-        .await
-    {
-        Ok(cursor) => cursor.try_collect().await.unwrap_or_default(),
-        Err(_) => return Vec::new(),
-    };
-
-    let mut turns: Vec<ChatTurn> = docs
-        .iter()
-        .filter_map(|d| {
-            let role = d.get_str("role").ok()?.to_string();
-            let content = d.get_str("content").ok()?.to_string();
-            Some(ChatTurn { role, content })
-        })
-        .collect();
-    turns.reverse(); // oldest → newest
-    turns
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &s[..end])
 }
 
 /// Insert a user message. If this is the conversation's **first** user message,
@@ -469,7 +433,9 @@ pub(crate) async fn persist_agent_assistant_message(
 // ---------------------------------------------------------------------------
 
 /// Parse an ObjectId hex string, returning `AppError::BadRequest` on failure.
-fn parse_oid(id: &str) -> AppResult<ObjectId> {
+/// `pub(crate)` so `memory.rs` can reuse it instead of calling `ObjectId::parse_str`
+/// directly.
+pub(crate) fn parse_oid(id: &str) -> AppResult<ObjectId> {
     ObjectId::parse_str(id)
         .map_err(|_| AppError::BadRequest(format!("invalid conversation id: {id}")))
 }

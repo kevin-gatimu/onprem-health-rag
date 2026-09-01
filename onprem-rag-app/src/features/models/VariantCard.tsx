@@ -11,16 +11,19 @@
 // "Set as default" (per-role router override) is offered whenever the variant is
 // cached. Every mutation is admin-only; non-admins get copy-to-clipboard only.
 //
-// WHY progress state is LOCAL: a download drives a per-card progress bar via the
-// pullModel callbacks. Keeping it in this component (never a shared store) means
-// one variant downloading doesn't spin every other card's UI.
+// WHY progress state is in the models STORE: a download outlives this card —
+// navigating to another tab unmounts it, and the bar must reappear on return.
+// Each card subscribes only to its own variant's entry, so one variant
+// downloading doesn't re-render every other card.
 import { useState } from 'react';
 import { Cpu, Zap, Microchip, Copy, Check, Download, Play, Trash2, Star, StarOff } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
 import {
-  pullModel, selectModel, unloadModel, deleteModel, setRouter,
+  getSetupStatus, unloadModel, deleteModel, setRouter,
 } from '../../lib/bridge';
 import type { VariantInfo } from '../../lib/bridge';
 import { toast } from '../../stores/ui';
+import { useModels } from '../../stores/models';
 import { Button, Badge, Modal } from '../../components/ui';
 
 export interface VariantCardProps {
@@ -48,19 +51,34 @@ function deviceBadge(id: string): { icon: typeof Cpu; label: string } {
 }
 
 export default function VariantCard({ variant, role, isDefault, isAdmin, onChanged }: VariantCardProps) {
-  // Per-card, per-action busy flags + local download progress (see header note).
-  const [downloading, setDownloading] = useState(false);
-  const [progress, setProgress]       = useState(0);
-  const [statusText, setStatusText]   = useState('');
-  const [loading, setLoading]         = useState(false);
+  // Download progress lives in the models store (survives navigation); this card
+  // subscribes to its own variant's entry only. Other busy flags stay local.
+  const download = useModels((s) => s.downloads[variant.id]);
+  const startDownload = useModels((s) => s.startDownload);
+  // Loads are single-flight (concurrent native loads segfault the server core) —
+  // the store holds the ONE in-flight id so every card's Load button locks together.
+  const loadingId = useModels((s) => s.loadingId);
+  const startLoad = useModels((s) => s.startLoad);
+  const downloading = download !== undefined;
+  const loading = loadingId === variant.id;
   const [unloading, setUnloading]     = useState(false);
   const [deleting, setDeleting]       = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [settingDefault, setSettingDefault] = useState(false);
   const [copied, setCopied]           = useState(false);
 
-  // Any in-flight mutation disables the others so the card can't fan out overlapping calls.
-  const busy = downloading || loading || unloading || deleting || settingDefault;
+  // Live loaded flag: the manifest's `variant.loaded` snapshot can go stale between
+  // refetches, so cross-check the shared setup-status poll (same cache as Settings).
+  const { data: status } = useQuery({
+    queryKey: ['setup-status'],
+    queryFn: getSetupStatus,
+    staleTime: 30_000,
+  });
+  const loaded = variant.loaded || (status?.loaded_models.includes(variant.id) ?? false);
+
+  // Any in-flight mutation disables the others so the card can't fan out overlapping
+  // calls; a load ANYWHERE locks this card's Load too (loadingId !== null).
+  const busy = downloading || loadingId !== null || unloading || deleting || settingDefault;
 
   const dev = deviceBadge(variant.id);
   const DeviceIcon = dev.icon;
@@ -74,43 +92,17 @@ export default function VariantCard({ variant, role, isDefault, isAdmin, onChang
 
   // ── Actions (admin only) ──────────────────────────────────────────────────────
 
-  async function handleDownload() {
-    setDownloading(true);
-    setProgress(0);
-    setStatusText('starting…');
-    try {
-      // load:false → pure Download (fetch weights, don't load into memory). Progress
-      // and status stream back through the pullModel callbacks; done/error settle here.
-      await pullModel(variant.id, false, {
-        onProgress: (pct) => setProgress(pct),
-        onStatus:   (s) => setStatusText(s),
-        onError:    (e) => toast.error(e),
-        onDone:     () => {
-          toast.success(`Downloaded ${variant.id}.`);
-          onChanged();
-        },
-      });
-    } catch (err) {
-      toast.error(String(err));
-    } finally {
-      setDownloading(false);
-      setProgress(0);
-      setStatusText('');
-    }
+  function handleDownload() {
+    // Fire-and-forget: the store owns the whole lifecycle (progress events, the
+    // completion toast, query invalidation), so it finishes even if this card
+    // unmounts mid-download. `onChanged` is not needed — the store invalidates.
+    void startDownload(variant.id);
   }
 
   async function handleLoad() {
-    setLoading(true);
-    try {
-      // selectModel = download-if-needed → load → set current, so it can take a while.
-      const resolved = await selectModel(variant.id);
-      toast.success(`Loaded ${resolved}.`);
-      onChanged();
-    } catch (err) {
-      toast.error(String(err));
-    } finally {
-      setLoading(false);
-    }
+    // Fire-and-forget: the store owns the lifecycle (single-flight guard, toast,
+    // query invalidation), so it finishes even if this card unmounts mid-load.
+    void startLoad(variant.id);
   }
 
   async function handleUnload() {
@@ -171,7 +163,7 @@ export default function VariantCard({ variant, role, isDefault, isAdmin, onChang
           {dev.label}
         </span>
         {variant.current && <Badge variant="success" dot>current</Badge>}
-        {variant.loaded && <Badge variant="info">loaded</Badge>}
+        {loaded && <Badge variant="info">loaded</Badge>}
         {variant.cached && <Badge variant="neutral">cached</Badge>}
         {isDefault && <Badge variant="warning">default</Badge>}
       </div>
@@ -195,17 +187,17 @@ export default function VariantCard({ variant, role, isDefault, isAdmin, onChang
         </span>
       )}
 
-      {/* ── Download progress (local, visible only mid-download) ────────────── */}
-      {downloading && (
+      {/* ── Download progress (from the models store — survives navigation) ─── */}
+      {download && (
         <div className="flex flex-col gap-1">
           <div className="h-1.5 w-full overflow-hidden rounded-full bg-elevated">
             <div
               className="h-full bg-accent transition-all duration-200"
-              style={{ width: `${Math.max(0, Math.min(100, progress))}%` }}
+              style={{ width: `${Math.max(0, Math.min(100, download.pct))}%` }}
             />
           </div>
           <span className="text-xs text-fg-subtle">
-            {statusText || 'downloading'} · {Math.round(progress)}%
+            {download.status || 'downloading'} · {Math.round(download.pct)}%
           </span>
         </div>
       )}
@@ -227,21 +219,21 @@ export default function VariantCard({ variant, role, isDefault, isAdmin, onChang
             </Button>
           )}
 
-          {variant.cached && !variant.loaded && (
+          {variant.cached && (
             <Button
               size="sm"
               variant="secondary"
               leftIcon={<Play size={14} />}
               loading={loading}
-              disabled={busy}
+              disabled={busy || loaded}
               onClick={handleLoad}
               className="min-h-[44px]"
             >
-              Load
+              {loaded ? 'Loaded' : 'Load'}
             </Button>
           )}
 
-          {variant.loaded && (
+          {loaded && (
             <>
               <Button
                 size="sm"

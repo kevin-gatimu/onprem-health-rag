@@ -17,7 +17,8 @@ import { Server, AlertCircle } from 'lucide-react';
 import { setServerUrl as bridgeSetServerUrl, health } from '../../lib/bridge';
 import { useSession } from '../../stores/session';
 import { toast } from '../../stores/ui';
-import { Button, Input, EcgLogo } from '../../components/ui';
+import { Button, Input } from '../../components/ui';
+import logo from '../../assets/logo.png';
 
 export default function Connect() {
   const storedUrl  = useSession((s) => s.serverUrl);
@@ -62,7 +63,7 @@ export default function Connect() {
       <div className="w-full max-w-sm space-y-6">
         {/* Header */}
         <div className="flex flex-col items-center gap-3 text-center">
-          <EcgLogo size={40} className="text-accent" />
+          <img src={logo} alt="OnPrem RAG" className="w-10 h-10 rounded-lg object-contain" />
           <div className="space-y-1">
             <h1 className="text-xl font-semibold text-fg">Connect to server</h1>
             <p className="text-sm text-fg-muted">

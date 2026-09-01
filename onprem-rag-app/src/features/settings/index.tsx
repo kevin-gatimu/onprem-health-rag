@@ -15,8 +15,9 @@
 // (`useSession` → 'admin'), never the admin "Preview as" role — previewing as a
 // non-admin must not expose a real admin the ability to actually mutate, and
 // (conversely) preview state must not hide controls the real admin should keep.
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
+import { getVersion } from '@tauri-apps/api/app';
 import {
   Cpu, Zap, RefreshCw, Server, HardDrive, Boxes, ExternalLink,
 } from 'lucide-react';
@@ -40,6 +41,16 @@ function statusTone(status: string): { dot: string; badge: 'success' | 'error' |
     case 'error': return { dot: 'bg-danger',  badge: 'error' };
     default:      return { dot: 'bg-fg-subtle', badge: 'neutral' }; // "unknown"
   }
+}
+
+/** Human-readable byte size (binary units), e.g. 34359738368 → "32 GB". */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, '')} ${units[i]}`;
 }
 
 // A compact labelled value row used inside the Hardware card. Kept local (not a new
@@ -89,6 +100,12 @@ export default function Settings() {
   const [reregistering, setReregistering] = useState(false);
   const [switching, setSwitching]         = useState(false);
   const [unloading, setUnloading]         = useState(false);
+
+  // App (client) version from the Tauri config — static, fetched once.
+  const [appVersion, setAppVersion] = useState('');
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
 
   const { data: status, isLoading, isFetching } = useQuery({
     queryKey: ['setup-status'],
@@ -141,7 +158,10 @@ export default function Settings() {
     setSwitching(true);
     try {
       // select_model downloads-if-needed → loads → sets current, so it can take a while.
-      const resolved = await selectModel(id);
+      const { model: resolved, repaired } = await selectModel(id);
+      if (repaired) {
+        toast.info(`${resolved}: cached weights were corrupt — re-downloaded automatically.`);
+      }
       toast.success(`Active chat model set to ${resolved}.`);
       refreshStatus();
     } catch (err) {
@@ -174,6 +194,7 @@ export default function Settings() {
       : 'CPU-only mode'
     : '—';
   const activeModel = status && status.active_chat_model ? status.active_chat_model : 'none loaded';
+  const specs = status?.server_specs;
   // DocumentDB guidance appears only when its service line reports an error.
   const docDbErrored = status?.services.some((s) => s.name === 'DocumentDB' && s.status === 'error');
 
@@ -220,7 +241,48 @@ export default function Settings() {
               />
             </div>
           </Card>
-
+          {/* ── Server specs ─────────────────────────────────────────────── */}
+          {/* The machine the SERVER runs on (not this device) — from /setup-status. */}
+          {specs && (
+            <Card title="Server specs" actions={<Badge variant="neutral">v{specs.server_version}</Badge>}>
+              <div className="grid gap-4 md:grid-cols-2">
+                <InfoRow icon={<Server size={18} />} label="Machine" value={specs.hostname} />
+                <InfoRow icon={<Server size={18} />} label="Operating system" value={`${specs.os} (${specs.arch})`} />
+                <InfoRow
+                  icon={<Cpu size={18} />}
+                  label="CPU"
+                  value={`${specs.cpu_model} — ${specs.physical_cores ?? '?'}C / ${specs.logical_cores}T`}
+                />
+                <InfoRow icon={<Boxes size={18} />} label="Memory" value={formatBytes(specs.total_memory_bytes)} />
+                <InfoRow
+                  icon={<Zap size={18} />}
+                  label="Accelerators"
+                  value={
+                    specs.accelerators.length > 0 ? (
+                      <span className="flex flex-col gap-0.5">
+                        {specs.accelerators.map((a) => <span key={a}>{a}</span>)}
+                      </span>
+                    ) : 'none detected'
+                  }
+                />
+                <InfoRow
+                  icon={<HardDrive size={18} />}
+                  label="Storage"
+                  value={
+                    specs.disks.length > 0 ? (
+                      <span className="flex flex-col gap-0.5">
+                        {specs.disks.map((d) => (
+                          <span key={d.mount}>
+                            {d.mount} — {formatBytes(d.available_bytes)} free of {formatBytes(d.total_bytes)}
+                          </span>
+                        ))}
+                      </span>
+                    ) : '—'
+                  }
+                />
+              </div>
+            </Card>
+          )}
           {/* ── Service Health ─────────────────────────────────────────────────── */}
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
@@ -364,7 +426,11 @@ export default function Settings() {
 
           {/* ── Activity ───────────────────────────────────────────────────────── */}
           <ServiceConsole />
-        </>
+          {/* ── About ────────────────────────────────────────────────────── */}
+          <p className="text-xs text-fg-subtle text-center">
+            OnPrem RAG{appVersion ? ` v${appVersion}` : ''}
+            {specs ? ` · Server v${specs.server_version}` : ''}
+          </p>        </>
       )}
     </div>
     </PageContainer>
