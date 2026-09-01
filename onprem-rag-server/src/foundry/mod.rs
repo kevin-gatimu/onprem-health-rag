@@ -1216,6 +1216,7 @@ impl FoundryManager {
             "classify_route",
             classify_route_tool(),
             classify_route_schema(),
+            true,
         )
         .await
     }
@@ -1236,6 +1237,7 @@ impl FoundryManager {
             "run_aggregation",
             run_aggregation_tool(),
             run_aggregation_schema(),
+            true,
         )
         .await
     }
@@ -1255,9 +1257,9 @@ impl FoundryManager {
         })
     }
 
-    /// Plan a list-records query: ask the model to emit a `RunList` tool call,
-    /// parse and return it. The caller MUST run `list::validate_list` on the
-    /// returned spec before passing it to `list::run`.
+    /// Plan a list-records query as JSON content, avoiding Foundry's unsupported
+    /// grammar for arbitrary filter properties. The caller MUST run
+    /// `list::validate_list` before passing the result to `list::run`.
     pub async fn plan_list(
         &self,
         spec: &ModelSpec,
@@ -1271,6 +1273,7 @@ impl FoundryManager {
             "run_list_records",
             run_list_tool(),
             run_list_schema(),
+            false,
         )
         .await
     }
@@ -1293,6 +1296,7 @@ impl FoundryManager {
             "extract_clinical",
             extract_clinical_tool(),
             extract_clinical_schema(),
+            true,
         )
         .await
     }
@@ -1314,13 +1318,13 @@ impl FoundryManager {
             "verify_claims",
             verify_claims_tool(),
             verify_claims_schema(),
+            true,
         )
         .await
     }
 
-    /// Generic tool-call planner. Asks the model to call `tool_name` with a JSON
-    /// argument that deserialises to `T`. Uses forced `tool_choice` and
-    /// `response_format: JsonSchema` to maximise compliance from small models.
+    /// Generic structured planner. Uses a forced tool call when its schema is
+    /// compatible with Foundry's grammar compiler, otherwise requests JSON content.
     /// On first parse failure the request is reprompted once; a second failure
     /// returns `AppError::BadRequest`.
     async fn plan_tool<T: serde::de::DeserializeOwned>(
@@ -1331,6 +1335,7 @@ impl FoundryManager {
         tool_name: &str,
         tool: ChatCompletionTools,
         schema: serde_json::Value,
+        prefer_tool_call: bool,
     ) -> AppResult<T> {
         // Resolve + load the model (same logic as generate_stream_with).
         let model = self.resolve_variant(&spec.alias, &spec.device_pref).await?;
@@ -1359,36 +1364,45 @@ impl FoundryManager {
         let msgs = build_messages(system, user, spec.thinking);
 
         // A forced tool and a bare response schema describe incompatible envelopes on
-        // ORT-GenAI, so never combine them. Some models also reject permissive tool
-        // properties such as aggregation filters; in that case validation lets us
-        // safely fall back to unconstrained JSON content.
-        let tool_client = model
-            .create_chat_client()
-            .temperature(spec.temperature as f64)
-            .tool_choice(ChatToolChoice::Function(tool_name.to_string()));
-        let resp = match tool_client
-            .complete_chat(&msgs, Some(&[tool.clone()]))
-            .await
-        {
-            Ok(response) => response,
-            Err(error) if is_grammar_error(&error) => {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = %error,
-                    "backend rejected tool grammar; retrying as validated JSON content"
-                );
-                let fallback = format!(
-                    "{user}\n\nReturn ONLY the JSON object for `{tool_name}`. No markdown or explanation.\nJSON schema: {schema_str}"
-                );
-                let fallback_msgs = build_messages(system, &fallback, spec.thinking);
-                model
-                    .create_chat_client()
-                    .temperature(0.0)
-                    .complete_chat(&fallback_msgs, None)
-                    .await
-                    .map_err(map_err)?
+        // ORT-GenAI, so never combine them. Schemas with arbitrary object properties
+        // (notably list filters) are known to be rejected by its grammar compiler and
+        // go directly through JSON content plus mandatory post-parse validation.
+        let json_prompt = || {
+            format!(
+                "{user}\n\nReturn ONLY the JSON object for `{tool_name}`. No markdown or explanation.\nJSON schema: {schema_str}"
+            )
+        };
+        let resp = if prefer_tool_call {
+            let tool_client = model
+                .create_chat_client()
+                .temperature(spec.temperature as f64)
+                .tool_choice(ChatToolChoice::Function(tool_name.to_string()));
+            match tool_client.complete_chat(&msgs, Some(&[tool])).await {
+                Ok(response) => response,
+                Err(error) if is_grammar_error(&error) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        error = %error,
+                        "backend rejected tool grammar; retrying as validated JSON content"
+                    );
+                    let fallback_msgs = build_messages(system, &json_prompt(), spec.thinking);
+                    model
+                        .create_chat_client()
+                        .temperature(0.0)
+                        .complete_chat(&fallback_msgs, None)
+                        .await
+                        .map_err(map_err)?
+                }
+                Err(error) => return Err(map_err(error)),
             }
-            Err(error) => return Err(map_err(error)),
+        } else {
+            let json_msgs = build_messages(system, &json_prompt(), spec.thinking);
+            model
+                .create_chat_client()
+                .temperature(0.0)
+                .complete_chat(&json_msgs, None)
+                .await
+                .map_err(map_err)?
         };
 
         match try_parse_tool::<T>(&resp) {
@@ -1442,21 +1456,42 @@ fn try_parse_tool<T: serde::de::DeserializeOwned>(
         }
     }
 
-    // 2. Fall back to message content.
+    // 2. Fall back to message content. Qwen3 may emit an empty reasoning block
+    // even under `/no_think`, so normalize that envelope before deserializing.
     let content = first
         .message
         .content
         .as_deref()
         .ok_or_else(|| "no tool_calls and no content in response".to_string())?;
-    let trimmed = content.trim();
-    let json_str = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|s| s.trim_end_matches("```").trim())
-        .unwrap_or(trimmed);
+    let json = normalize_json_content(content)?;
 
-    serde_json::from_str::<T>(json_str)
-        .map_err(|e| format!("content parse failed: {e}; raw={json_str}"))
+    serde_json::from_str::<T>(&json).map_err(|e| format!("content parse failed: {e}; raw={json}"))
+}
+
+fn normalize_json_content(content: &str) -> Result<String, String> {
+    let content = content.trim_start_matches('\u{feff}');
+    let mut think = think_filter::ThinkFilter::new();
+    let mut visible = think.push(content);
+    visible.push_str(&think.finish());
+
+    let trimmed = visible.trim();
+    let json = if let Some(rest) = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```JSON"))
+        .or_else(|| trimmed.strip_prefix("```"))
+    {
+        rest.trim()
+            .strip_suffix("```")
+            .map(str::trim)
+            .ok_or_else(|| "JSON markdown fence is not closed".to_string())?
+    } else {
+        trimmed
+    };
+
+    if !json.starts_with('{') || !json.ends_with('}') {
+        return Err("structured response must contain only one JSON object".to_string());
+    }
+    Ok(json.to_string())
 }
 
 fn extract_sql_statement(raw: &str) -> AppResult<String> {
@@ -1600,7 +1635,40 @@ async fn heal_and_load(
 
 #[cfg(test)]
 mod sql_response_tests {
-    use super::extract_sql_statement;
+    use super::{extract_sql_statement, normalize_json_content};
+
+    #[test]
+    fn normalizes_qwen_thinking_before_json() {
+        let raw = r#"<think>
+
+</think>
+
+{
+  "collection": "patients",
+  "columns": ["id", "first_name"],
+  "limit": 50,
+  "offset": 0
+}"#;
+        let json = normalize_json_content(raw).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["collection"], "patients");
+        assert_eq!(value["limit"], 50);
+    }
+
+    #[test]
+    fn normalizes_fenced_json() {
+        let json = normalize_json_content("```json\n{\"collection\":\"patients\"}\n```").unwrap();
+        assert_eq!(json, r#"{"collection":"patients"}"#);
+    }
+
+    #[test]
+    fn rejects_commentary_and_malformed_json_envelopes() {
+        assert!(
+            normalize_json_content("Here is the result: {\"collection\":\"patients\"}").is_err()
+        );
+        assert!(normalize_json_content("```json\n{\"collection\":\"patients\"}").is_err());
+        assert!(normalize_json_content("{\"collection\":\"patients\"} done").is_err());
+    }
 
     #[test]
     fn accepts_plain_sql() {

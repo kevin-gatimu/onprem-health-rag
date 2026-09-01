@@ -90,7 +90,7 @@ pub fn build_agg_planner_system(catalog: &Catalog, intent: QueryIntent) -> Strin
 pub fn build_list_planner_system(catalog: &Catalog) -> String {
     format!(
         "You are a record-listing query planner for a health-records system.\n\
-         Your job: given a user question, call the `run_list_records` tool with a valid JSON spec.\n\
+         Your job: given a user question, produce a valid `run_list_records` JSON spec.\n\
          Use ONLY the collection and field names listed in the schema below.\n\
          Choose the collection that best matches the question.\n\
          For pagination: use `offset` 0 for the first page; include `limit` (default 50).\n\n\
