@@ -1,5 +1,7 @@
 # Aggregation-aware retrieval
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacements are [Routing, Agents, and Structured Query](routing-agents-and-structured-query.md) and [Deterministic SQL Matcher](deterministic-sql-matcher.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > How the app answers **counting / grouping / trend / top-N** questions correctly, instead of guessing
 > from a handful of retrieved passages. Design note, 2026-08-23. Companion to
 > `plans/01-retrieval-design.md` (semantic pipeline), `plans/docs/model-selection-and-routing.md`

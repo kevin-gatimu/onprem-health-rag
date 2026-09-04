@@ -192,7 +192,11 @@ pub async fn start_ingest(
     let db = state.db.clone();
     let config = state.config.clone();
     let progress_hub = state.ingest_progress.clone();
+    let catalog_handle = state.catalog_handle();
+    let router_cache = state.router_cache_handle();
+    let binding_cache = state.binding_cache();
     let foundry = state.foundry_handle();
+    let extract_spec = state.spec_for(crate::foundry::router::AgentKind::Extract);
     let source_id = req.source_id.clone();
     let job = job_id.clone();
     let tables = req.tables.clone();
@@ -203,6 +207,9 @@ pub async fn start_ingest(
             db,
             config,
             progress_hub,
+            catalog_handle,
+            router_cache,
+            binding_cache,
             source_id,
             job,
             tables,
@@ -210,6 +217,7 @@ pub async fn start_ingest(
             limit,
             None,
             foundry,
+            extract_spec,
         )
         .await
     });
@@ -310,7 +318,11 @@ pub async fn resume_ingest(
     let db = state.db.clone();
     let config = state.config.clone();
     let progress_hub = state.ingest_progress.clone();
+    let catalog_handle = state.catalog_handle();
+    let router_cache = state.router_cache_handle();
+    let binding_cache = state.binding_cache();
     let foundry = state.foundry_handle();
+    let extract_spec = state.spec_for(crate::foundry::router::AgentKind::Extract);
     let job_id = job.to_string();
     let response_job_id = job_id.clone();
     tokio::spawn(async move {
@@ -319,6 +331,9 @@ pub async fn resume_ingest(
             db,
             config,
             progress_hub,
+            catalog_handle,
+            router_cache,
+            binding_cache,
             source_id,
             job_id,
             tables,
@@ -326,6 +341,7 @@ pub async fn resume_ingest(
             limit,
             Some(checkpoint),
             foundry,
+            extract_spec,
         )
         .await
     });
@@ -354,6 +370,7 @@ pub async fn ingest_stream(
     // Clone the catalog handle so the generator can update it after a terminal status.
     // The AppState reference cannot cross the yield boundary, but the Arc handle can.
     let catalog_handle = state.catalog_handle();
+    let router_cache = state.router_cache_handle();
     let progress_hub = state.ingest_progress.clone();
     let mut notifications = progress_hub.subscribe(&job);
 
@@ -369,10 +386,14 @@ pub async fn ingest_stream(
                     // events: completed/partial -> ingest://done, failed -> ingest://error.
                     match status.as_str() {
                         "completed" | "partial" => {
+                            // The pipeline already rebuilt this; repeat it here so a
+                            // watching client is guaranteed a fresh allow-list the
+                            // moment it sees "completed", with no ordering window.
                             let new_cat = crate::aggregation::catalog::build_from_store(&db).await;
                             if let Ok(mut w) = catalog_handle.write() {
                                 *w = std::sync::Arc::new(new_cat);
                             }
+                            router_cache.clear();
                             progress_hub.remove(&job);
                             yield Event::json(&progress).event("done");
                             break;

@@ -352,12 +352,17 @@ pub fn rows_to_citations_json(rows: &[Json], collection: &str) -> String {
             serde_json::json!({
                 "id": format!("{collection}-{i}"),
                 "source_id": source_id,
+                "table": collection,
                 "row_pk": row_pk,
                 "chunk_index": 0,
                 "text": row_pk,
                 "fields": fields,
                 "score": 1.0,
                 "reranked": false,
+                "vector_rank": null,
+                "text_rank": null,
+                "fused_score": 1.0,
+                "rerank_score": null,
             })
         })
         .collect();
@@ -496,5 +501,22 @@ mod tests {
         };
         let validated = validate_list(&spec, &cat).expect("should succeed");
         assert_eq!(validated.limit, Some(MAX_LIST));
+    }
+
+    #[test]
+    fn list_citations_satisfy_persistence_passage_contract() {
+        let rows = vec![serde_json::json!({
+            "source_id": "source-1",
+            "row_pk": "patient-42",
+            "fields": { "name": "Example Patient" }
+        })];
+
+        let json = rows_to_citations_json(&rows, "patients");
+        let passages: Vec<crate::retrieval::Passage> =
+            serde_json::from_str(&json).expect("list citations must persist as passages");
+
+        assert_eq!(passages.len(), 1);
+        assert_eq!(passages[0].table, "patients");
+        assert_eq!(passages[0].row_pk, "patient-42");
     }
 }

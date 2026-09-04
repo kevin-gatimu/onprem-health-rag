@@ -141,6 +141,8 @@ pub struct ModelSummary {
 pub struct VariantInfo {
     pub id: String,
     pub alias: String,
+    pub accelerator: String,
+    pub supports_tool_calling: bool,
     pub cached: bool,
     pub loaded: bool,
     pub current: bool,
@@ -329,12 +331,15 @@ impl FoundryManager {
         if !model.is_cached().await.map_err(map_err)? {
             tracing::info!(
                 model = model.id(),
-                "startup: SQL model is not cached; skipping preload"
+                "startup: core LLM is not cached; skipping preload"
             );
             return Ok(false);
         }
         self.ensure_loaded_lru(&model).await?;
-        tracing::info!(model = model.id(), "startup: SQL model loaded");
+        // Sync the legacy current-model slot so `/generate` and un-routed callers
+        // use the same model the router warmed — divergence here causes LRU thrash.
+        self.set_current_model(model.id().to_string());
+        tracing::info!(model = model.id(), "startup: core LLM loaded");
         Ok(true)
     }
 
@@ -419,6 +424,9 @@ impl FoundryManager {
             let Ok(model) = catalog.get_model(alias).await else {
                 continue;
             };
+            let supports_tool_calling = model
+                .capabilities()
+                .is_some_and(|value| value.split(',').any(|item| item.trim() == "tool-calling"));
             for v in model.variants() {
                 let id = v.id().to_string();
                 if !seen_ids.insert(id.clone()) {
@@ -430,6 +438,8 @@ impl FoundryManager {
                     current: id == current,
                     context_length: v.context_length(),
                     alias: v.alias().to_string(),
+                    accelerator: crate::foundry::routes::accelerator_label(&id).to_string(),
+                    supports_tool_calling,
                     id,
                 });
             }
@@ -847,21 +857,6 @@ impl FoundryManager {
         };
         self.generate_stream_with(&spec, system, user).await
     }
-
-    /// Non-streaming completion against the current model. Backward-compatible wrapper
-    /// over `complete_with` — callers in `rag/mod.rs` (query rewrite, multi-query
-    /// expansion) are unchanged.
-    pub async fn complete(&self, system: &str, user: &str) -> AppResult<String> {
-        let spec = ModelSpec {
-            alias: self.current_model(),
-            thinking: false,
-            temperature: 0.2,
-            tools: false,
-            device_pref: vec![Device::Gpu, Device::Cpu],
-            max_tokens: None,
-        };
-        self.complete_with(&spec, system, user).await
-    }
 }
 
 /// Collect variant ids into a set for cheap membership tests.
@@ -1226,9 +1221,10 @@ impl FoundryManager {
         .await
     }
 
-    /// Plan an aggregation: ask the model to emit a `RunAggregation` tool call,
-    /// parse and return it. The caller MUST run `aggregation::validate` on the
-    /// returned spec before passing it to `execute::run`.
+    /// Plan an aggregation as validated JSON content. Foundry Local's ONNX grammar
+    /// compiler cannot compile this tool schema and may leave the native runtime
+    /// unstable after rejecting it, so this path must never attempt a tool call.
+    /// The caller MUST validate the returned spec before passing it to execution.
     pub async fn plan_aggregation(
         &self,
         spec: &ModelSpec,
@@ -1242,7 +1238,7 @@ impl FoundryManager {
             "run_aggregation",
             run_aggregation_tool(),
             run_aggregation_schema(),
-            true,
+            false,
         )
         .await
     }

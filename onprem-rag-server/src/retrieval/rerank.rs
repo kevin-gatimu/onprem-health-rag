@@ -18,6 +18,11 @@ static RERANKER: OnceLock<Mutex<TextRerank>> = OnceLock::new();
 /// Serialises initialisation so two concurrent first-callers don't both download.
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Whether the reranker is resident in this server process.
+pub fn is_loaded() -> bool {
+    RERANKER.get().is_some()
+}
+
 /// Map the configured reranker name to a fastembed variant. Defaults to BGE-reranker-v2-m3.
 fn resolve_model(name: &str) -> RerankerModel {
     match name.trim().to_ascii_lowercase().as_str() {
@@ -62,6 +67,14 @@ fn get_or_init(model: RerankerModel) -> AppResult<&'static Mutex<TextRerank>> {
     RERANKER
         .get()
         .ok_or_else(|| AppError::Internal("reranker disappeared after init".into()))
+}
+
+/// Download the configured weights when needed and load the reranker.
+pub async fn initialize(config: &Config) -> AppResult<()> {
+    let model = resolve_model(&config.rerank_model);
+    tokio::task::spawn_blocking(move || get_or_init(model).map(|_| ()))
+        .await
+        .map_err(|e| AppError::Internal(format!("reranker setup task panicked: {e}")))?
 }
 
 /// Rerank `documents` against `query`. Returns `(original_index, score)` pairs sorted

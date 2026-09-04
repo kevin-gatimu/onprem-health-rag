@@ -1,6 +1,15 @@
 // Models — model management screen (Stage 8, Layer 3b) of the mobile-first rebuild.
-// Mobile-first: single column at 360 px; role sections stack; the variant grids
-// inside them scale up (md:2 / xl:3). Tap targets ≥ 44 px. Dark theme only.
+// Mobile-first: single column at 360 px; sections stack; the variant grid inside the
+// manage-variants disclosure scales up (md:2 / xl:3). Tap targets ≥ 44 px. Dark theme only.
+//
+// Shape: ONE shared local LLM now drives every generative role (chat, health_query,
+// trends, summarize, lookup, fast, classify, extractor, verifier) plus nl2sql — there
+// is no per-role model choice left. The page renders:
+//   - SharedLlmCard (the "chat" role)  → picks + downloads/loads/applies the one LLM,
+//     with live progress when the chosen variant isn't cached yet.
+//   - a collapsible "Manage downloaded variants" admin grid (VariantCard, fed by the
+//     chat role's variants) for unloading/deleting/inspecting what's on disk.
+//   - RoleSection for the remaining NON-managed (fastembed) roles: embeddings, reranker.
 //
 // Two queries back the page:
 //   ['model-roles']   → getModelRoles(): the REAL role→variant manifest (catalog).
@@ -17,7 +26,7 @@
 // Gating rule: every mutating control is gated on the user's REAL role (useSession →
 // 'admin'), never the admin "Preview as" role.
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { RefreshCw, Cpu, AlertTriangle } from 'lucide-react';
+import { RefreshCw, Cpu, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { getModelRoles, getSetupStatus, registerEps } from '../../lib/bridge';
 import { toast } from '../../stores/ui';
 import { useSession } from '../../stores/session';
@@ -25,6 +34,8 @@ import { Button, Badge, cn } from '../../components/ui';
 import { PageContainer } from '../../components/layout/PageContainer';
 import ServiceConsole from '../../components/ServiceConsole';
 import RoleSection from './RoleSection';
+import SharedLlmCard from './SharedLlmCard';
+import VariantCard from './VariantCard';
 import { useState } from 'react';
 
 export default function Models() {
@@ -34,6 +45,8 @@ export default function Models() {
   const isAdmin = useSession((s) => s.user?.role) === 'admin';
 
   const [reregistering, setReregistering] = useState(false);
+  const [manageOpen, setManageOpen] = useState(false);
+
 
   const rolesQuery = useQuery({
     queryKey: ['model-roles'],
@@ -79,6 +92,14 @@ export default function Models() {
   }
 
   const roles = rolesQuery.data ?? [];
+  const sharedLlmRole = roles.find((role) => role.role === 'chat');
+  // Every other managed role is now served by the shared LLM — only fastembed
+  // (non-managed) roles still get their own section.
+  const remainingRoles = roles.filter((role) => !role.managed);
+  const manageableVariants = (sharedLlmRole?.variants ?? []).filter(
+    (variant) => variant.cached || variant.loaded,
+  );
+
 
   return (
     <PageContainer variant="board">
@@ -100,7 +121,7 @@ export default function Models() {
               leftIcon={<RefreshCw size={16} />}
               loading={reregistering}
               onClick={handleReregister}
-              className="w-full sm:w-auto min-h-[44px]"
+              className="min-h-11 w-full sm:w-auto"
             >
               Re-register EPs
             </Button>
@@ -109,7 +130,7 @@ export default function Models() {
             variant="secondary"
             leftIcon={<RefreshCw size={16} className={isFetching ? 'animate-spin' : undefined} />}
             onClick={refreshAll}
-            className="w-full sm:w-auto min-h-[44px]"
+            className="min-h-11 w-full sm:w-auto"
           >
             Refresh
           </Button>
@@ -121,12 +142,12 @@ export default function Models() {
         'flex items-center gap-3 rounded-lg border px-4 py-3',
         foundryReady ? 'border-border bg-surface' : 'border-warning/25 bg-warning-subtle',
       )}>
-        <span className="flex-shrink-0">
+        <span className="shrink-0">
           {foundryReady ? <Cpu size={18} className="text-fg-muted" /> : <AlertTriangle size={18} className="text-warning" />}
         </span>
         <div className="flex flex-col min-w-0 flex-1">
           <span className="text-sm font-semibold text-fg">Foundry Local core</span>
-          <span className="text-xs text-fg-muted break-words">
+          <span className="wrap-break-word text-xs text-fg-muted">
             {foundryReady
               ? 'In-process (native SDK) — ready.'
               : 'Foundry Local core unavailable. Roles below come from config; variant actions are limited until it recovers.'}
@@ -142,7 +163,48 @@ export default function Models() {
         <p className="text-sm text-fg-muted">Loading model roles…</p>
       ) : (
         <div className="flex flex-col gap-4">
-          {roles.map((role) => (
+          {sharedLlmRole && (
+            <SharedLlmCard
+              role={sharedLlmRole}
+              isAdmin={isAdmin}
+              executionProviders={statusQuery.data?.execution_providers ?? []}
+              onChanged={refreshAll}
+            />
+          )}
+
+          {/* ── Manage downloaded variants (admin only) ─────────────────────── */}
+          {/* Downloading a NEW variant happens via the Core LLM card above; this
+              disclosure is only for managing what's already on disk (unload/delete/
+              inspect), so it's filtered to cached-or-loaded and collapsed by default
+              to keep the page compact. */}
+          {isAdmin && sharedLlmRole && manageableVariants.length > 0 && (
+            <div className="flex flex-col gap-3">
+              <button
+                type="button"
+                onClick={() => setManageOpen((v) => !v)}
+                className="flex min-h-11 items-center gap-2 self-start rounded-md px-1 text-sm font-medium text-fg-muted hover:text-fg transition-colors"
+              >
+                {manageOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                Manage downloaded variants
+              </button>
+              {manageOpen && (
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  {manageableVariants.map((variant) => (
+                    <VariantCard
+                      key={variant.id}
+                      variant={variant}
+                      role="chat"
+                      isDefault={sharedLlmRole.override_variant === variant.id}
+                      isAdmin={isAdmin}
+                      onChanged={refreshAll}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {remainingRoles.map((role) => (
             <RoleSection
               key={role.role}
               role={role}
@@ -152,6 +214,7 @@ export default function Models() {
           ))}
         </div>
       )}
+
 
       {/* ── Activity ────────────────────────────────────────────────────────── */}
       <ServiceConsole />

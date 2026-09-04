@@ -93,6 +93,67 @@ impl Passage {
 // quoted in $text queries so the server matches the exact token rather than stemming it.
 static RE_ICD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap());
 static RE_DRUG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]{4,}\b").unwrap());
+static RE_PATIENT_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z]{2,}-\d{4}-\d{2,}\b").unwrap());
+static RE_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap());
+static RE_NAME_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z][a-z]{1,}\s+[A-Z][a-z]{1,}\b").unwrap());
+
+/// Return whether a standalone question asks for a broad overview or enumeration.
+///
+/// This is deliberately conservative: broad-intent language is necessary but any
+/// patient id, clinical code, quoted term, all-caps token, or likely person-name pair
+/// makes the question pointed. Pointed questions retain cross-encoder reranking and
+/// its anti-hallucination score gate.
+pub fn is_broad_question(question: &str) -> bool {
+    let trimmed = question.trim();
+    if trimmed.is_empty()
+        || RE_PATIENT_ID.is_match(trimmed)
+        || RE_CODE.is_match(trimmed)
+        || RE_DRUG.is_match(trimmed)
+        || contains_quoted_term(trimmed)
+        || RE_NAME_PAIR.is_match(trimmed)
+    {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let words: Vec<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "all" | "every" | "list" | "overview" | "recent" | "latest"
+        ) || word.starts_with("summar")
+    }) || normalized.contains("show me the")
+        || (normalized.starts_with("what ") && normalized.contains(" are there"))
+}
+
+/// Apply the semantic relevance gate using the score scale appropriate to the query.
+/// Broad questions use RRF scores, which are not comparable with reranker scores, so
+/// they are refused only when retrieval returned no passages.
+pub fn should_refuse_semantic(
+    standalone_question: &str,
+    top_score: Option<f64>,
+    score_gate: Option<f64>,
+) -> bool {
+    match top_score {
+        None => true,
+        Some(_) if is_broad_question(standalone_question) => false,
+        Some(score) => score_gate.is_some_and(|floor| score < floor),
+    }
+}
+
+fn contains_quoted_term(text: &str) -> bool {
+    ['"', '\''].into_iter().any(|quote| {
+        let mut parts = text.split(quote);
+        let _before = parts.next();
+        parts.next().is_some_and(|inside| !inside.trim().is_empty()) && parts.next().is_some()
+    })
+}
 
 /// Wrap ICD codes and all-caps drug tokens with double quotes so the MongoDB $text
 /// operator matches them exactly. Other query words are left unchanged.
@@ -375,4 +436,56 @@ fn collect(by_id: &mut HashMap<String, Hit>, hits: Vec<Hit>) -> Vec<String> {
         by_id.entry(hit.id.clone()).or_insert(hit);
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_broad_question, should_refuse_semantic};
+
+    #[test]
+    fn broad_question_heuristic_accepts_overviews_and_enumerations() {
+        for question in [
+            "Give me an overview of the most recent encounters.",
+            "how about all encounters",
+            "List all prescriptions",
+            "What diagnoses are there?",
+        ] {
+            assert!(is_broad_question(question), "question: {question}");
+        }
+    }
+
+    #[test]
+    fn broad_question_heuristic_rejects_specific_anchors() {
+        for question in [
+            "Summarize the medical history of patient SYN-2024-0001.",
+            "Does Jane Chebet have any allergies?",
+            "Which patients have E11.9?",
+            "Tell me about Jane Chebet",
+        ] {
+            assert!(!is_broad_question(question), "question: {question}");
+        }
+    }
+
+    #[test]
+    fn broad_question_with_passages_skips_score_gate_refusal() {
+        assert!(!should_refuse_semantic(
+            "how about all encounters",
+            Some(0.002),
+            Some(0.30),
+        ));
+        assert!(should_refuse_semantic(
+            "how about all encounters",
+            None,
+            Some(0.30),
+        ));
+    }
+
+    #[test]
+    fn pointed_question_retains_score_gate_refusal() {
+        assert!(should_refuse_semantic(
+            "Which patients have E11.9?",
+            Some(0.02),
+            Some(0.30),
+        ));
+    }
 }

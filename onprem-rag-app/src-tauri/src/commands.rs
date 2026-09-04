@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use crate::state::Bridge;
 use eventsource_stream::Eventsource;
 use futures_util::{
-    future::{AbortHandle, Abortable},
     StreamExt,
+    future::{AbortHandle, Abortable},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -457,6 +457,8 @@ pub struct EpRegistration {
 pub struct VariantInfo {
     pub id: String,
     pub alias: String,
+    pub accelerator: String,
+    pub supports_tool_calling: bool,
     pub cached: bool,
     pub loaded: bool,
     pub current: bool,
@@ -478,6 +480,8 @@ pub struct ModelRole {
     pub status: String,
     /// Whether this role is served by Foundry Local (downloadable/loadable variants).
     pub managed: bool,
+    /// Whether this role's model is currently resident in the server process.
+    pub loaded: bool,
     /// Downloadable/loadable variants for this role (empty for non-managed roles).
     pub variants: Vec<VariantInfo>,
     /// The persisted routing override for this role, if one has been saved. `None`
@@ -579,6 +583,30 @@ pub async fn set_role_model(
     Ok(())
 }
 
+/// `PUT /settings/router/shared` — route chat, classification, rewrite,
+/// extraction, and SQL through one concrete model variant. Admin only.
+#[tauri::command]
+pub async fn set_shared_model(
+    variant_id: Option<String>,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url("/settings/router/shared");
+    let resp = bridge
+        .client
+        .put(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "role": "shared_llm", "variant_id": variant_id }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    Ok(())
+}
+
 /// Mirrors the server's `DeleteModelResponse` — roles whose saved override named the
 /// deleted variant and was therefore cleared.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,6 +682,27 @@ pub async fn model_roles(bridge: State<'_, Bridge>) -> Result<Vec<ModelRole>, St
     resp.json::<Vec<ModelRole>>()
         .await
         .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `POST /models/specialized/load` — download missing weights and initialize one
+/// fastembed model. The server accepts only the embeddings and reranker role keys.
+#[tauri::command]
+pub async fn load_specialized_model(role: String, bridge: State<'_, Bridge>) -> Result<(), String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url("/models/specialized/load");
+    let resp = bridge
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    Ok(())
 }
 
 /// `POST /generate` — stream a test completion. Consumes the server SSE and
@@ -2084,6 +2133,16 @@ pub async fn chat(
     let url = bridge.url("/chat");
     let (abort_handle, abort_registration) = AbortHandle::new_pair();
     bridge.register_run(run_id.clone(), abort_handle);
+    // Start watching stages before the POST, so none are missed while the server
+    // routes, retrieves and plans — the whole opaque part of the request.
+    let stage_relay = spawn_stage_relay(
+        bridge.client.clone(),
+        bridge.url(&format!("/runs/{}/progress", encode_path_segment(&run_id))),
+        token.clone(),
+        run_id.clone(),
+        "chat",
+        app.clone(),
+    );
     let result = Abortable::new(
         async {
             let resp = bridge
@@ -2097,6 +2156,7 @@ pub async fn chat(
                     "rerank": opts.rerank,
                     "top_k": opts.top_k,
                     "conversation_id": conversation_id,
+                    "run_id": run_id,
                 }))
                 .send()
                 .await
@@ -2175,6 +2235,7 @@ pub async fn chat(
         abort_registration,
     )
     .await;
+    stage_relay.abort();
     bridge.remove_run(&run_id);
     result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
 }
@@ -2358,6 +2419,15 @@ pub async fn agent(
     let url = bridge.url(&format!("/agents/{}", encode_path_segment(&kind)));
     let (abort_handle, abort_registration) = AbortHandle::new_pair();
     bridge.register_run(run_id.clone(), abort_handle);
+    // Subscribed before the POST so the strip sees every stage; see `spawn_stage_relay`.
+    let stage_relay = spawn_stage_relay(
+        bridge.client.clone(),
+        bridge.url(&format!("/runs/{}/progress", encode_path_segment(&run_id))),
+        token.clone(),
+        run_id.clone(),
+        "agent",
+        app.clone(),
+    );
     let result = Abortable::new(
         async {
             let resp = bridge
@@ -2367,6 +2437,7 @@ pub async fn agent(
                 .json(&serde_json::json!({
                     "question": question,
                     "conversation_id": conversation_id,
+                    "run_id": run_id,
                 }))
                 .send()
                 .await
@@ -2466,8 +2537,51 @@ pub async fn agent(
         abort_registration,
     )
     .await;
+    stage_relay.abort();
     bridge.remove_run(&run_id);
     result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
+}
+
+/// Subscribe to the server's live pipeline stages for `run_id` and relay them to
+/// the frontend as `<prefix>://stage`.
+///
+/// This is a second connection on purpose: the server publishes stages while it is
+/// still assembling the answer, which is *before* the answer stream opens, so they
+/// cannot ride along with it (see the server's `progress.rs`). Best-effort — if it
+/// fails, the user loses the activity strip detail, never the answer.
+fn spawn_stage_relay(
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    run_id: String,
+    prefix: &'static str,
+    app: tauri::AppHandle,
+) -> tauri::async_runtime::JoinHandle<()> {
+    let channel = format!("{prefix}://stage");
+    tauri::async_runtime::spawn(async move {
+        let Ok(resp) = client.get(&url).bearer_auth(token).send().await else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let mut events = resp.bytes_stream().eventsource();
+        while let Some(Ok(event)) = events.next().await {
+            match event.event.as_str() {
+                "stage" => {
+                    let _ = app.emit(
+                        &channel,
+                        ChatEvent {
+                            run_id: run_id.clone(),
+                            data: event.data,
+                        },
+                    );
+                }
+                "done" => break,
+                _ => {}
+            }
+        }
+    })
 }
 
 /// The server JSON-encodes `token` payloads so SSE doesn't strip their leading

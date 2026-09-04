@@ -88,3 +88,7 @@ On-premise-Rag-system-for-Health-Records/
 Appimages/
 
 .agents
+.playwright-mcp
+
+plans/*
+blogs/*

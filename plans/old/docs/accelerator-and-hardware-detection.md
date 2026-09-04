@@ -1,5 +1,7 @@
 # Accelerator & Hardware Detection
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Models, Accelerators, and Lifecycle](models-accelerators-and-lifecycle.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > How the system discovers and reports physical hardware (CPU, GPU, NPU) and manages Foundry execution providers (EPs) for optimal model selection. Companion docs: [`architecture-overview.md`](architecture-overview.md), [`model-selection-and-routing.md`](model-selection-and-routing.md).
 
 ## Problem Solved

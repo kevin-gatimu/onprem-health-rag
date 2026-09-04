@@ -210,15 +210,12 @@ fn select_with_relationships(scored: Vec<(f32, TableCard)>, top_k: usize) -> Vec
         .collect();
     let mut required = seed_names.clone();
 
-    // Include both ends of every one-hop FK connected to a selected table. This
-    // prevents a semantically low-ranked lookup table from making a valid join fail
-    // validation (for example patients.county_id -> counties.id).
-    for (_, card) in &scored {
+    // Include only each seed's one-hop FK targets so required lookup joins validate.
+    for (_, card) in scored.iter().take(top_k) {
         let card_name = card.table_name.to_ascii_lowercase();
         for edge in &card.fk_edges {
             let ref_name = edge.ref_table.to_ascii_lowercase();
-            if seed_names.contains(&card_name) || seed_names.contains(&ref_name) {
-                required.insert(card_name.clone());
+            if seed_names.contains(&card_name) {
                 required.insert(ref_name);
             }
         }
@@ -306,7 +303,7 @@ fn extract_vector(doc: &Document) -> Vec<f32> {
         .unwrap_or_default()
 }
 
-fn doc_to_card(doc: Document) -> Result<TableCard, mongodb::bson::de::Error> {
+pub(crate) fn doc_to_card(doc: Document) -> Result<TableCard, mongodb::bson::de::Error> {
     let source_id = doc.get_str("source_id").unwrap_or_default().to_string();
     let table_name = doc.get_str("table_name").unwrap_or_default().to_string();
     let row_count = doc.get_i64("row_count").unwrap_or_default();
@@ -409,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_tables_include_one_hop_foreign_key_neighbors() {
+    fn seed_own_foreign_key_target_is_included() {
         let mut patients = card("patients");
         patients.fk_edges.push(CardFkEdge {
             column: "county_id".into(),
@@ -419,8 +416,8 @@ mod tests {
         let selected = select_with_relationships(
             vec![
                 (0.9, patients),
-                (0.1, card("counties")),
-                (0.05, card("facilities")),
+                (0.1, card("facilities")),
+                (0.05, card("counties")),
             ],
             1,
         );
@@ -429,5 +426,25 @@ mod tests {
             .map(|card| card.table_name.as_str())
             .collect();
         assert_eq!(names, vec!["patients", "counties"]);
+    }
+
+    #[test]
+    fn seeded_hub_does_not_include_tables_that_reference_it() {
+        let patients = card("patients");
+        let mut encounters = card("encounters");
+        encounters.fk_edges.push(CardFkEdge {
+            column: "patient_id".into(),
+            ref_table: "patients".into(),
+            ref_column: "id".into(),
+        });
+        let selected = select_with_relationships(
+            vec![(0.9, patients), (0.2, encounters), (0.1, card("counties"))],
+            1,
+        );
+        let names: Vec<&str> = selected
+            .iter()
+            .map(|card| card.table_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["patients"]);
     }
 }

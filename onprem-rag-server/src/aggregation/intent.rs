@@ -181,6 +181,16 @@ const LOOKUP_MARKERS: &[&str] = &[
     "records for patient",
     "details for patient",
     "patient profile",
+    // Entity-info phrasings ("share information about patient Jane Chebet").
+    // Without these the question escalates to the Tier-2 model, which can
+    // misread it as an aggregation and narrate a useless row count.
+    "information about",
+    "information on",
+    "info about",
+    "info on",
+    "details about",
+    "details on",
+    "profile of",
 ];
 
 const NARRATIVE_MARKERS: &[&str] = &[
@@ -261,6 +271,25 @@ mod tests {
         assert_eq!(
             classify_lexical("list all patients and how many there are"),
             Some(QueryIntent::Enumeration)
+        );
+    }
+
+    #[test]
+    fn patient_info_questions_are_lookup() {
+        // These must classify at the lexical tier — escalating to the Tier-2
+        // model risks a "structured aggregation" misread that narrates a row
+        // count instead of the patient's actual fields.
+        assert_eq!(
+            classify_lexical("share information about patient Jane Chebet"),
+            Some(QueryIntent::Lookup)
+        );
+        assert_eq!(
+            classify_lexical("give me details on John Otieno"),
+            Some(QueryIntent::Lookup)
+        );
+        assert_eq!(
+            classify_lexical("show the profile of patient 42"),
+            Some(QueryIntent::Lookup)
         );
     }
 

@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 use chrono::Utc;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, doc};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::config::Config;
 use crate::connectors::{self, connector};
@@ -29,12 +29,138 @@ use crate::documentdb::{DocumentDb, RECORDS, vector};
 use crate::embed;
 use crate::error::{AppError, AppResult};
 use crate::foundry::FoundryManager;
-use crate::foundry::router::{AgentKind, ModelSpec};
+use crate::foundry::router::ModelSpec;
 use crate::ingest::extract::{ExtractedClinical, Extractor};
 
 /// Emit a log line every this many rows so large tables aren't silent.
 const LOG_ROW_INTERVAL: i64 = 2500;
 const EXTRACT_BATCH: usize = 16;
+const MAX_PATIENT_IDENTITIES: usize = 500_000;
+const AUDIT_COLUMNS: [&str; 7] = [
+    "created_at",
+    "updated_at",
+    "deleted_at",
+    "inserted_at",
+    "modified_at",
+    "row_version",
+    "last_modified",
+];
+
+fn exclude_from_chunk_text(column: &str) -> bool {
+    let column = column.to_ascii_lowercase();
+    if column.ends_with("_no") || column.ends_with("_number") || column.ends_with("_code") {
+        return false;
+    }
+
+    AUDIT_COLUMNS.contains(&column.as_str())
+        || column == "id"
+        || column.ends_with("_id")
+        || column == "uuid"
+        || column.ends_with("_uuid")
+}
+
+fn row_chunk_text(fields: &Map<String, Value>) -> String {
+    // Audit fields and opaque IDs add noise, but remain in `fields` for filtering and citations.
+    fields
+        .iter()
+        .filter(|(key, _)| !exclude_from_chunk_text(key))
+        .filter_map(|(key, value)| {
+            connectors::value_to_plain(value).map(|plain| format!("{key}: {plain}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn patient_identity_line(fields: &Map<String, Value>) -> Option<String> {
+    let names = ["first_name", "middle_name", "last_name"]
+        .into_iter()
+        .filter_map(|key| fields.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let patient_no = fields
+        .get("patient_no")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    match (names.is_empty(), patient_no) {
+        (false, Some(number)) => Some(format!("patient: {names} ({number})")),
+        (false, None) => Some(format!("patient: {names}")),
+        (true, Some(number)) => Some(format!("patient: {number}")),
+        (true, None) => None,
+    }
+}
+
+fn enrich_patient_row(
+    fields: &mut Map<String, Value>,
+    text: &str,
+    identities: &HashMap<String, String>,
+) -> Option<String> {
+    let identity = fields
+        .get("patient_id")
+        .and_then(Value::as_str)
+        .and_then(|patient_id| identities.get(patient_id))?
+        .clone();
+    fields.insert("patient_ref".to_string(), Value::String(identity.clone()));
+    Some(format!("{identity}\n{text}"))
+}
+
+async fn load_patient_identities(
+    conn: &dyn connectors::SourceConnector,
+    schema: &[connectors::TableSchema],
+    page_size: i64,
+) -> AppResult<(HashMap<String, String>, bool)> {
+    let Some(patient_schema) = schema.iter().find(|table| table.name == "patients") else {
+        return Ok((HashMap::new(), false));
+    };
+    let Some(pk_column) = patient_schema
+        .columns
+        .iter()
+        .find(|column| column.is_primary_key)
+        .map(|column| column.name.as_str())
+    else {
+        return Ok((HashMap::new(), false));
+    };
+    if !patient_schema.columns.iter().any(|column| {
+        matches!(
+            column.name.as_str(),
+            "patient_no" | "first_name" | "middle_name" | "last_name"
+        )
+    }) {
+        return Ok((HashMap::new(), false));
+    }
+
+    let mut identities = HashMap::new();
+    let mut offset = 0;
+    loop {
+        let rows = conn
+            .fetch_table_page("patients", &[], Some(pk_column), offset, page_size)
+            .await?;
+        if rows.is_empty() {
+            break;
+        }
+        let fetched = rows.len() as i64;
+        for row in rows {
+            let Some(patient_id) = row.fields.get(pk_column).and_then(Value::as_str) else {
+                continue;
+            };
+            let Some(identity) = patient_identity_line(&row.fields) else {
+                continue;
+            };
+            if !identities.contains_key(patient_id) && identities.len() >= MAX_PATIENT_IDENTITIES {
+                return Ok((HashMap::new(), true));
+            }
+            identities.insert(patient_id.to_string(), identity);
+        }
+        offset += fetched;
+        if fetched < page_size {
+            break;
+        }
+    }
+    Ok((identities, false))
+}
 
 #[derive(Clone, Default)]
 pub struct IngestProgressHub {
@@ -296,10 +422,22 @@ pub struct ResumeCheckpoint {
 /// Background entry point: run the pipeline and record the outcome on the job doc.
 /// Never panics the task — any error is written back as a failed job.
 #[allow(clippy::too_many_arguments)]
+/// Run one ingestion job to completion.
+///
+/// `catalog_handle` / `router_cache` are the live `AppState` handles: on success this
+/// rebuilds the aggregation catalog itself. It used to be rebuilt only inside the
+/// `/ingest/stream` SSE generator, so an ingest nobody watched to the end left the
+/// running server with a stale (often empty) allow-list — every structured question
+/// then failed validation with "ingest data first" against a fully ingested store,
+/// until the next restart.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     db: DocumentDb,
     config: Config,
     progress_hub: IngestProgressHub,
+    catalog_handle: Arc<std::sync::RwLock<Arc<crate::aggregation::catalog::Catalog>>>,
+    router_cache: Arc<crate::router::RouterCache>,
+    binding_cache: crate::state::BindingCache,
     source_id: String,
     job_id: String,
     tables: Vec<String>,
@@ -307,12 +445,9 @@ pub async fn run(
     limit: Option<i64>,
     resume: Option<ResumeCheckpoint>,
     foundry: Option<Arc<FoundryManager>>,
+    extract_spec: ModelSpec,
 ) {
-    let extractor = Extractor::new(
-        &config,
-        foundry,
-        ModelSpec::for_kind(AgentKind::Extract, &config),
-    );
+    let extractor = Extractor::new(&config, foundry, extract_spec);
     let result = execute(
         &db,
         &config,
@@ -326,7 +461,7 @@ pub async fn run(
         extractor.as_ref(),
     )
     .await;
-    if let Err(e) = result {
+    if let Err(e) = &result {
         tracing::error!(job = %job_id, error = %e, "ingestion pipeline failed");
         let mut log = vec![];
         push_log(&mut log, "error", &format!("Job failed: {e}"));
@@ -342,7 +477,20 @@ pub async fn run(
             )
             .await;
         progress_hub.publish(&job_id);
-    } else if config.router.text2sql_enabled {
+    } else {
+        // Records are active now, so the allow-list can see them. Do this before
+        // the terminal publish so a client that reacts to "completed" by asking a
+        // question finds the new tables already accepted.
+        let new_catalog = crate::aggregation::catalog::build_from_store(&db).await;
+        if let Ok(mut writer) = catalog_handle.write() {
+            *writer = Arc::new(new_catalog);
+        }
+        // A new schema can flip a cached semantic decision to structured.
+        router_cache.clear();
+        tracing::info!(job = %job_id, "catalog rebuilt after ingestion");
+    }
+
+    if result.is_ok() && config.router.text2sql_enabled {
         match connectors::routes::load_spec(&db, &config, &source_id).await {
             Ok(spec) => {
                 if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
@@ -351,6 +499,7 @@ pub async fn run(
                     &spec,
                     &source_id,
                     "ingestion",
+                    &binding_cache,
                 )
                 .await
                 {
@@ -412,6 +561,37 @@ async fn execute(
     let mut log: Vec<LogEntry> = Vec::new();
 
     let records_coll = db.collection::<RecordDoc>(RECORDS);
+
+    let patient_identities = match load_patient_identities(
+        conn.as_ref(),
+        &schema,
+        config.ingest_page_size as i64,
+    )
+    .await
+    {
+        Ok((identities, false)) => identities,
+        Ok((_, true)) => {
+            let message = format!(
+                "Patient identity enrichment disabled: source exceeds {MAX_PATIENT_IDENTITIES} patients"
+            );
+            tracing::warn!(job = %job_id, "{message}");
+            push_log(&mut log, "warn", &message);
+            HashMap::new()
+        }
+        Err(error) => {
+            let message = format!("Patient identity enrichment unavailable: {error}");
+            tracing::warn!(job = %job_id, "{message}");
+            push_log(&mut log, "warn", &message);
+            HashMap::new()
+        }
+    };
+    if !patient_identities.is_empty() {
+        tracing::info!(
+            job = %job_id,
+            patients = patient_identities.len(),
+            "loaded patient identities for ingest enrichment"
+        );
+    }
 
     if let Some(ex) = extractor {
         push_log(
@@ -594,16 +774,26 @@ async fn execute(
             let mut chunks = Vec::new();
             for row in rows {
                 let extracted = annotations.remove(&row.pk);
-                let texts = if config.chunk_enabled {
-                    chunk_text(
-                        &row.text,
-                        config.chunk_size_tokens,
-                        config.chunk_overlap_tokens,
-                    )
+                let mut fields = row.fields;
+                let projected_text = row_chunk_text(&fields);
+                let enriched_text = (table != "patients")
+                    .then(|| enrich_patient_row(&mut fields, &projected_text, &patient_identities))
+                    .flatten();
+                let text = enriched_text.as_deref().unwrap_or(&projected_text);
+                let patient_ref = fields.get("patient_ref").and_then(Value::as_str);
+                let mut texts = if config.chunk_enabled {
+                    chunk_text(text, config.chunk_size_tokens, config.chunk_overlap_tokens)
                 } else {
-                    vec![row.text.clone()]
+                    vec![text.to_string()]
                 };
-                let fields = Value::Object(row.fields);
+                if let Some(identity) = patient_ref {
+                    for chunk in &mut texts {
+                        if !chunk.starts_with(identity) {
+                            *chunk = format!("{identity}\n{chunk}");
+                        }
+                    }
+                }
+                let fields = Value::Object(fields);
                 for (ci, text) in texts.into_iter().enumerate() {
                     if !text.trim().is_empty() {
                         chunks.push(Chunk {
@@ -852,4 +1042,169 @@ fn chunk_text(text: &str, size: usize, overlap: usize) -> Vec<String> {
         start += step;
     }
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enrich_patient_row, patient_identity_line, row_chunk_text};
+    use serde_json::{Map, Value, json};
+    use std::collections::HashMap;
+
+    fn object(value: Value) -> Map<String, Value> {
+        value.as_object().expect("test value is an object").clone()
+    }
+
+    #[test]
+    fn builds_patient_identity_without_middle_name() {
+        let fields = object(json!({
+            "patient_no": "SYN-2024-0001",
+            "first_name": "Jane",
+            "last_name": "Chebet"
+        }));
+
+        assert_eq!(
+            patient_identity_line(&fields).as_deref(),
+            Some("patient: Jane Chebet (SYN-2024-0001)")
+        );
+    }
+
+    #[test]
+    fn builds_patient_identity_with_middle_name() {
+        let fields = object(json!({
+            "patient_no": "SYN-2024-0001",
+            "first_name": "Jane",
+            "middle_name": "Wanjiku",
+            "last_name": "Chebet"
+        }));
+
+        assert_eq!(
+            patient_identity_line(&fields).as_deref(),
+            Some("patient: Jane Wanjiku Chebet (SYN-2024-0001)")
+        );
+    }
+
+    #[test]
+    fn falls_back_to_patient_number_when_names_are_missing() {
+        let fields = object(json!({"patient_no": "SYN-2024-0001"}));
+
+        assert_eq!(
+            patient_identity_line(&fields).as_deref(),
+            Some("patient: SYN-2024-0001")
+        );
+    }
+
+    #[test]
+    fn prepends_patient_identity_and_adds_patient_ref_field() {
+        let mut fields = object(json!({"patient_id": "patient-1", "icd10_code": "I25.1"}));
+        let identities = HashMap::from([(
+            "patient-1".to_string(),
+            "patient: Jane Chebet (SYN-2024-0001)".to_string(),
+        )]);
+
+        let text = enrich_patient_row(&mut fields, "icd10_code: I25.1", &identities);
+
+        assert_eq!(
+            text.as_deref(),
+            Some("patient: Jane Chebet (SYN-2024-0001)\nicd10_code: I25.1")
+        );
+        assert_eq!(
+            fields.get("patient_ref").and_then(Value::as_str),
+            Some("patient: Jane Chebet (SYN-2024-0001)")
+        );
+    }
+
+    #[test]
+    fn ignores_non_string_patient_id() {
+        let mut fields = object(json!({"patient_id": 42, "icd10_code": "I25.1"}));
+        let identities = HashMap::from([("42".to_string(), "patient: Jane Chebet".to_string())]);
+
+        assert_eq!(
+            enrich_patient_row(&mut fields, "icd10_code: I25.1", &identities),
+            None
+        );
+        assert!(!fields.contains_key("patient_ref"));
+    }
+
+    #[test]
+    fn excludes_audit_columns_from_chunk_text_but_keeps_clinical_dates_and_metadata() {
+        let fields = object(json!({
+            "encounter_date": "2023-01-23",
+            "created_at": "2026-08-25T10:30:00Z",
+            "UPDATED_AT": "2026-08-26T11:00:00Z",
+            "diagnosis": "Appendicitis"
+        }));
+
+        let text = row_chunk_text(&fields);
+
+        assert!(text.contains("encounter_date: 2023-01-23"));
+        assert!(text.contains("diagnosis: Appendicitis"));
+        assert!(!text.to_ascii_lowercase().contains("created_at"));
+        assert!(!text.to_ascii_lowercase().contains("updated_at"));
+        assert!(fields.contains_key("created_at"));
+        assert!(fields.contains_key("UPDATED_AT"));
+    }
+
+    #[test]
+    fn excludes_opaque_identifiers_from_chunk_text_but_keeps_business_ids_and_metadata() {
+        let row_id = "72d9e10e-d76f-465b-9093-ee9a2f6661d5";
+        let patient_id = "c21a8c53-5981-4cab-88ee-ee79ea28d721";
+        let fields = object(json!({
+            "id": row_id,
+            "PATIENT_ID": patient_id,
+            "allergen_id": 1,
+            "uuid": "24b219a0-6a56-4732-9f4a-94971cc68024",
+            "visit_uuid": "a2c6af54-09d7-4f75-bcf7-4c27c8c73aec",
+            "patient_no": "SYN-2024-0001",
+            "icd10_code": "T78.40XA",
+            "encounter_date": "2023-01-23"
+        }));
+
+        let text = row_chunk_text(&fields);
+
+        assert!(!text.contains(row_id));
+        assert!(!text.contains(patient_id));
+        assert!(!text.to_ascii_lowercase().contains("allergen_id"));
+        assert!(!text.to_ascii_lowercase().contains("allergen id"));
+        assert!(!text.contains("24b219a0-6a56-4732-9f4a-94971cc68024"));
+        assert!(!text.contains("a2c6af54-09d7-4f75-bcf7-4c27c8c73aec"));
+        assert!(text.contains("patient_no: SYN-2024-0001"));
+        assert!(text.contains("icd10_code: T78.40XA"));
+        assert!(text.contains("encounter_date: 2023-01-23"));
+        assert_eq!(fields.get("id").and_then(Value::as_str), Some(row_id));
+        assert_eq!(
+            fields.get("PATIENT_ID").and_then(Value::as_str),
+            Some(patient_id)
+        );
+        assert_eq!(fields.get("allergen_id").and_then(Value::as_i64), Some(1));
+    }
+
+    #[test]
+    fn patient_identity_enrichment_survives_audit_column_filtering() {
+        let mut fields = object(json!({
+            "patient_id": "patient-1",
+            "encounter_date": "2023-01-23",
+            "created_at": "2026-08-25T10:30:00Z"
+        }));
+        let identities = HashMap::from([(
+            "patient-1".to_string(),
+            "patient: Jane Chebet (SYN-2024-0001)".to_string(),
+        )]);
+
+        let projected = row_chunk_text(&fields);
+        let text = enrich_patient_row(&mut fields, &projected, &identities)
+            .expect("patient identity should be available");
+
+        assert!(text.starts_with("patient: Jane Chebet (SYN-2024-0001)\n"));
+        assert!(text.contains("encounter_date: 2023-01-23"));
+        assert!(!text.contains("created_at"));
+        assert!(!text.contains("patient_id"));
+        assert_eq!(
+            fields.get("created_at").and_then(Value::as_str),
+            Some("2026-08-25T10:30:00Z")
+        );
+        assert_eq!(
+            fields.get("patient_ref").and_then(Value::as_str),
+            Some("patient: Jane Chebet (SYN-2024-0001)")
+        );
+    }
 }

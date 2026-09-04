@@ -302,6 +302,7 @@ pub async fn create_source(
             &catalog_spec,
             &source.id,
             "source_created",
+            &state.binding_cache(),
         )
         .await
         {
@@ -465,6 +466,7 @@ pub async fn test_saved_source(
                     &spec,
                     id,
                     "connection_test",
+                    &state.binding_cache(),
                 )
                 .await
                 {
@@ -701,7 +703,14 @@ pub async fn analyze_schema(
              for ingestion, and data quality issues:\n\n{table_desc}"
         );
 
-        if let Ok(raw) = foundry.complete(system, &user).await {
+        if let Ok(raw) = foundry
+            .complete_with(
+                &state.spec_for(crate::foundry::router::AgentKind::Extract),
+                system,
+                &user,
+            )
+            .await
+        {
             // Parse the LLM JSON response; fall back to deterministic on any failure.
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(s) = parsed.get("summary").and_then(|v| v.as_str()) {

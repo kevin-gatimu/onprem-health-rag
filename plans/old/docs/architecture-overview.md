@@ -1,5 +1,7 @@
 # Architecture Overview
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Architecture and Data Model](architecture-and-data-model.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > Complete system topology: components, traffic flow, stack, data model, and API surface. Reference for new engineers joining the project. Companion docs: [`app-feature-surface-and-requirements.md`](app-feature-surface-and-requirements.md), [`retrieval-pipeline.md`](retrieval-pipeline.md), [`accelerator-and-hardware-detection.md`](accelerator-and-hardware-detection.md).
 
 ## System Context

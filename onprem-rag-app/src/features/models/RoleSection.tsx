@@ -1,19 +1,14 @@
-// RoleSection — one model role from the manifest (Stage 8, Layer 3b).
-// Mobile-first: role meta stacks at 360 px, the variant grid is single-column and
-// scales to md:2 / xl:3. Dark theme only.
+// RoleSection — one NON-managed (fastembed) role from the manifest (Stage 8, Layer 3b).
+// Mobile-first: role meta stacks at 360 px. Dark theme only.
 //
-// Catalog source is getModelRoles() — our REAL role→variant config — not a
-// reinvented family catalog. Two render shapes:
-//   managed === true  → a grid of VariantCards (downloadable/loadable Foundry variants)
-//   managed === false → a single read-only status row (fastembed embeddings/reranker,
-//                        which are not Foundry-managed and have no variant actions)
-// The role's persisted `override_variant` is shown as its current default; each cached
-// variant offers "Set as default", and the section header offers "Clear default" when
-// an override is set (both admin-only, wired via setRouter in VariantCard).
-import { Layers } from 'lucide-react';
+// One shared LLM now serves every managed (Foundry) role, so those are rendered by
+// SharedLlmCard + the manage-variants grid in index.tsx instead. This component only
+// ever receives `managed === false` roles (embeddings, reranker): a meta strip plus
+// SpecializedModelControl, which downloads/loads the fastembed model in one step (no
+// variant catalog, no router override).
 import type { ModelRole } from '../../lib/bridge';
-import { Badge, Card, EmptyState, cn } from '../../components/ui';
-import VariantCard from './VariantCard';
+import { Badge, Card } from '../../components/ui';
+import SpecializedModelControl from './SpecializedModelControl';
 
 export interface RoleSectionProps {
   role: ModelRole;
@@ -55,40 +50,14 @@ export default function RoleSection({ role, isAdmin, onChanged }: RoleSectionPro
           />
         </div>
 
-        {/* ── Variants (managed) or read-only status (non-managed) ─────────── */}
-        {role.managed ? (
-          role.variants.length > 0 ? (
-            <div className={cn('grid gap-3 md:grid-cols-2 xl:grid-cols-3 3xl:grid-cols-4')}>
-              {role.variants.map((v) => (
-                <VariantCard
-                  key={v.id}
-                  variant={v}
-                  role={role.role}
-                  isDefault={role.override_variant === v.id}
-                  isAdmin={isAdmin}
-                  onChanged={onChanged}
-                />
-              ))}
-            </div>
-          ) : (
-            // Managed but empty — typically because the Foundry core is down (variants
-            // that need `state.foundry()` come back empty). Keep the role visible.
-            <EmptyState
-              icon={<Layers size={26} />}
-              title="No variants available"
-              description="Variants load from the Foundry core. If it is unavailable, they'll appear once it's ready."
-            />
-          )
-        ) : (
-          // Non-managed roles (fastembed embeddings/reranker): read-only, no actions.
-          <div className="rounded-lg border border-border bg-elevated px-4 py-3">
-            <p className="text-xs text-fg-subtle">
-              Served locally by <span className="text-fg-muted">{role.engine}</span> — not Foundry-managed,
-              so there are no download/load actions.
-            </p>
-          </div>
-        )}
+        {/* ── Read-only status + load control (non-managed / fastembed) ────── */}
+        <SpecializedModelControl
+          role={role}
+          isAdmin={isAdmin}
+          onChanged={onChanged}
+        />
       </div>
     </Card>
   );
 }
+

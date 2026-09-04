@@ -176,6 +176,8 @@ export function generate(prompt: string): Promise<void> {
 export interface VariantInfo {
   id: string;
   alias: string;
+  accelerator: string;
+  supports_tool_calling: boolean;
   cached: boolean;
   loaded: boolean;
   current: boolean;
@@ -202,6 +204,8 @@ export interface ModelRole {
   status: string;
   /** Whether this role is served by Foundry Local (downloadable/loadable variants). */
   managed: boolean;
+  /** Whether this role's model is currently resident in the server process. */
+  loaded: boolean;
   /** Downloadable/loadable variants for this role (empty for non-managed roles). */
   variants: VariantInfo[];
   /** The persisted routing override for this role, if an admin has saved one; `null` otherwise. */
@@ -213,9 +217,19 @@ export function getModelRoles(): Promise<ModelRole[]> {
   return authedInvoke<ModelRole[]>("model_roles");
 }
 
+/** Download missing weights and initialize an embeddings or reranker model. Admin only. */
+export function loadSpecializedModel(role: string): Promise<void> {
+  return authedInvoke<void>("load_specialized_model", { role });
+}
+
 /** Persist (or clear, when `variantId` is `null`) a role's model routing override. Admin only. */
 export function setRoleModel(role: string, variantId: string | null): Promise<void> {
   return authedInvoke<void>("set_role_model", { role, variantId });
+}
+
+/** Route chat, classification, rewrite, extraction, and SQL through one variant. */
+export function setSharedModel(variantId: string | null): Promise<void> {
+  return authedInvoke<void>("set_shared_model", { variantId });
 }
 
 /** Result of `deleteModel` — the roles whose saved default named the deleted variant. */
@@ -935,6 +949,29 @@ export interface ClaimCheck {
   supported: boolean;
   /** 1-based indices into the citation list. Empty when unsupported. */
   passages: number[];
+}
+
+/**
+ * One pipeline step, relayed live from the server as `chat://stage` /
+ * `agent://stage` while the answer is still being assembled. Mirrors the
+ * server's `ProgressEvent` (`progress.rs`).
+ *
+ * The server does its retrieval, planning and DB work *before* the answer stream
+ * opens, so these arrive on a separate subscription the bridge opens for the run
+ * — that is the only reason the strip can show anything during the long wait.
+ */
+export interface StageEvent {
+  /** Stable stage key, e.g. `"search_vector"`. */
+  stage: string;
+  /** Human-readable label, e.g. `"Searching records by meaning"`. */
+  label: string;
+  status: "start" | "end" | "done";
+  /** Wall time for the step; present on `"end"`. */
+  ms?: number;
+  /** PHI-free detail, e.g. `"kept the best 6 of 30 passages"`. */
+  detail?: string;
+  /** Monotonic per-run sequence, used to dedupe a replayed backlog. */
+  seq: number;
 }
 
 /**

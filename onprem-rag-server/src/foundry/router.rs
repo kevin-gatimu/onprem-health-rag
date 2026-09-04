@@ -26,7 +26,7 @@ pub enum AgentKind {
     Classify,
     Extract,
     Verify,
-    /// NL-to-SQL generation: phi-4-mini on NPU/CPU, deterministic (0.1), tools on.
+    /// NL-to-SQL generation: Qwen on GPU, deterministic, plain SQL output.
     TextToSql,
 }
 
@@ -85,12 +85,8 @@ impl ModelSpec {
     /// Build a `ModelSpec` for a given agent kind, reading model aliases from `cfg`.
     ///
     /// Device placement rationale:
-    /// - `[Npu, Cpu]` only for `Extract`/`Verify` — small single-record jobs that fit
-    ///   the NPU's 4224-token cap and free the iGPU for concurrent chat.
-    /// - `[Gpu, Cpu]` for the fast lane (QueryRewrite/Classify/PatientLookup) — GPU
-    ///   preferred but CPU is an acceptable fallback for short outputs.
-    /// - `[Gpu]` for everything else — context-heavy tasks need the full iGPU window;
-    ///   NPU placement is structurally impossible here (router never sets it).
+    /// All standard roles use one shared Qwen GPU variant so the resident cap bounds
+    /// memory without cross-family model swaps.
     pub fn for_kind(kind: AgentKind, cfg: &Config) -> ModelSpec {
         let r = &cfg.router;
         match kind {
@@ -99,7 +95,7 @@ impl ModelSpec {
                 thinking: false,
                 temperature: 0.1,
                 tools: true,
-                device_pref: vec![Device::Gpu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
             AgentKind::HealthQuery => ModelSpec {
@@ -149,18 +145,16 @@ impl ModelSpec {
                 thinking: false,
                 temperature: 0.1,
                 tools: false,
-                device_pref: vec![Device::Gpu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
-            // Classify is the intent router's Tier-2 tool call: phi-4-mini on the NPU
-            // (CPU fallback) so it stays hot beside the GPU chat model. Deterministic
-            // (temp 0.0), tool-calling on, tiny output — a single small JSON object.
+            // Classification shares the same GPU resident as every other role.
             AgentKind::Classify => ModelSpec {
                 alias: r.classify.clone(),
                 thinking: false,
                 temperature: 0.0,
                 tools: true,
-                device_pref: vec![Device::Npu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: Some(128),
             },
             AgentKind::Extract => ModelSpec {
@@ -168,10 +162,7 @@ impl ModelSpec {
                 thinking: false,
                 temperature: 0.1,
                 tools: true,
-                // Small single-record extraction: prefer the NPU to keep the iGPU free
-                // for concurrent chat. CPU is the fallback when no NPU is present or if
-                // the NPU load fails (load-failure fallback in FoundryManager).
-                device_pref: vec![Device::Npu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
             AgentKind::Verify => ModelSpec {
@@ -179,7 +170,7 @@ impl ModelSpec {
                 thinking: false,
                 temperature: 0.1,
                 tools: true,
-                device_pref: vec![Device::Npu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
             // SQL is emitted directly rather than through constrained tool grammar,
@@ -189,31 +180,20 @@ impl ModelSpec {
                 thinking: false,
                 temperature: 0.0,
                 tools: false,
-                device_pref: vec![Device::Npu, Device::Cpu],
+                device_pref: vec![Device::Gpu],
                 max_tokens: Some(256),
             },
         }
     }
 }
 
-/// The settings/override key for a kind (matches the role keys in `GET /models/roles`
-/// and the ones persisted by `PUT /settings/router`). `Chat` and `MultiHop` share the
-/// `"chat"` role since they're both the conversational path; `QueryRewrite` keeps the
-/// `"fast"` fast-lane role while `Classify` gets its own `"classify"` role (the intent
-/// router's Tier-2 model, placed on the NPU).
-pub fn override_key(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::Chat | AgentKind::MultiHop => "chat",
-        AgentKind::HealthQuery => "health_query",
-        AgentKind::Trends => "trends",
-        AgentKind::Summarize => "summarize",
-        AgentKind::PatientLookup => "lookup",
-        AgentKind::QueryRewrite => "fast",
-        AgentKind::Classify => "classify",
-        AgentKind::Extract => "extractor",
-        AgentKind::Verify => "verifier",
-        AgentKind::TextToSql => "text_to_sql",
-    }
+/// The settings/override key for a kind. One shared Core LLM serves every generative
+/// role, so every kind resolves through the single `"chat"` override — stale per-role
+/// overrides persisted before the unification are deliberately ignored, otherwise a
+/// divergent role (e.g. `text_to_sql` pinned at an older model) forces an LRU swap
+/// and a multi-second cold start on nearly every request.
+pub fn override_key(_kind: AgentKind) -> &'static str {
+    "chat"
 }
 
 #[cfg(test)]
@@ -227,10 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_prefers_npu_then_cpu() {
+    fn extract_prefers_gpu() {
         let cfg = test_cfg();
         let spec = ModelSpec::for_kind(AgentKind::Extract, &cfg);
-        assert_eq!(spec.device_pref, vec![Device::Npu, Device::Cpu]);
+        assert_eq!(spec.device_pref, vec![Device::Gpu]);
         assert_eq!(spec.alias, cfg.router.extractor);
         assert!(!spec.thinking, "Extract should not use chain-of-thought");
     }
@@ -247,7 +227,7 @@ mod tests {
     fn verify_matches_extract_placement() {
         let cfg = test_cfg();
         let spec = ModelSpec::for_kind(AgentKind::Verify, &cfg);
-        assert_eq!(spec.device_pref, vec![Device::Npu, Device::Cpu]);
+        assert_eq!(spec.device_pref, vec![Device::Gpu]);
     }
 
     #[test]

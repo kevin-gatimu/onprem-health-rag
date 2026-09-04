@@ -378,6 +378,21 @@ pub(crate) async fn persist_user_message(
 ) -> AppResult<()> {
     let oid = parse_oid(conversation_id)?;
 
+    // A retry re-posts the question the failed run already persisted. Without this
+    // the transcript grows a second (and third) copy of the same unanswered turn —
+    // visible to the user, and fed to the follow-up rewriter as if they had really
+    // asked twice. Only the newest message can match: an assistant reply in between
+    // means this is a genuine repeat of an answered question.
+    if newest_message_is(db, conversation_id, "user", content).await? {
+        db.chat_conversations()
+            .update_one(
+                doc! { "_id": oid },
+                doc! { "$set": { "updated_at": BsonDateTime::now() } },
+            )
+            .await?;
+        return Ok(());
+    }
+
     // Count user messages before inserting to decide whether to auto-title.
     let existing = db
         .chat_messages()
@@ -408,6 +423,24 @@ pub(crate) async fn persist_user_message(
         .await?;
 
     Ok(())
+}
+
+/// Whether the conversation's most recent message has this exact role and content.
+/// Used to recognise a retry of a turn that never got an answer.
+async fn newest_message_is(
+    db: &DocumentDb,
+    conversation_id: &str,
+    role: &str,
+    content: &str,
+) -> AppResult<bool> {
+    let newest = db
+        .chat_messages()
+        .find_one(doc! { "conversation_id": conversation_id })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?;
+    Ok(newest.is_some_and(|message| {
+        message.get_str("role") == Ok(role) && message.get_str("content") == Ok(content)
+    }))
 }
 
 /// Insert an assistant message (with citations stored as a JSON string) and bump

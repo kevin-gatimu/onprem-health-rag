@@ -18,7 +18,7 @@ use rocket::serde::json::Json;
 use rocket::{State, post};
 use serde::{Deserialize, Serialize};
 
-use super::{ChatTurn, SYSTEM_PROMPT, apply_context_budget, build_prompt, prepare_queries};
+use super::{ChatTurn, SYSTEM_PROMPT, apply_context_budget, build_prompt, prepare_queries_with};
 use crate::answer::{Structured, run_structured};
 use crate::auth::guard::AuthUser;
 use crate::config::{Config, RetrievalMode};
@@ -90,6 +90,7 @@ pub async fn route(
         body.has_history,
         &state.config,
         foundry,
+        &state.spec_for(crate::foundry::router::AgentKind::Classify),
         &state.router_cache,
     )
     .await;
@@ -153,7 +154,13 @@ pub async fn search(
     let (standalone, queries) = trace
         .time(
             Stage::RewriteExpand,
-            prepare_queries(foundry, &state.config, &body.history, &body.query),
+            prepare_queries_with(
+                foundry,
+                &state.spec_for(crate::foundry::router::AgentKind::QueryRewrite),
+                &state.config,
+                &body.history,
+                &body.query,
+            ),
         )
         .await;
     drop(generation_permit);
@@ -188,6 +195,11 @@ pub struct ChatRequest {
     /// history from the DB instead of `history`. Absent → stateless (no persistence).
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// Client-minted id for this run. When present, every pipeline stage is
+    /// published to `GET /runs/<run_id>/progress` so the UI can show what the
+    /// server is actually doing while it works. Absent → no progress fan-out.
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +244,8 @@ enum ChatData {
 ///
 /// Event sequence: one `citations` event (JSON array of the passages backing the
 /// answer, in citation order) → zero or more `token` events → a terminal `done`.
+/// Retrieval and planning finish before the stream opens, so live pipeline stages
+/// travel on `GET /runs/<run_id>/progress` instead — pass `run_id` to enable it.
 /// Retrieval failures surface as a normal HTTP error before streaming begins; a
 /// generation failure mid-stream is emitted as an `error` event.
 ///
@@ -249,9 +263,12 @@ pub async fn chat(
     body: Json<ChatRequest>,
 ) -> AppResult<EventStream![]> {
     let trace = RequestTrace::new("chat");
+    if let Some(run_id) = body.run_id.clone() {
+        trace.attach_progress(state.run_progress.clone(), run_id);
+    }
     let (mode, rerank, top_k) = resolve(state, &body.opts);
     let foundry = state.foundry()?;
-    let generation_permit = state.admission.generation().await?;
+    let mut generation_permit = None;
 
     // Conversation persistence (pre-stream, so errors stay clean HTTP errors).
     // When conversation_id is absent, fall back to body.history (stateless path).
@@ -286,6 +303,7 @@ pub async fn chat(
                 has_history,
                 &state.config,
                 Some(foundry),
+                &state.spec_for(crate::foundry::router::AgentKind::Classify),
                 &state.router_cache,
             ),
         )
@@ -295,10 +313,12 @@ pub async fn chat(
         Some(decision.tier),
         Some(decision.cached),
     );
+    trace.stage_detail(Stage::Route, format!("{} question", decision.route_label()));
     let routed_json = decision.to_sse_json();
 
     let chat_data: ChatData = match &decision.class {
         crate::router::RouteClass::Conversational => {
+            generation_permit = Some(state.admission.generation().await?);
             // Cheap, warm, retrieval-free reply. Honour any persisted "chat" role
             // override, but nudge temperature up and cap the length — this is small talk.
             let mut spec = state.spec_for(crate::foundry::router::AgentKind::Chat);
@@ -319,6 +339,7 @@ pub async fn chat(
         }
 
         crate::router::RouteClass::ConversationMeta => {
+            generation_permit = Some(state.admission.generation().await?);
             // Answer from working memory alone — no retrieval, no citations. The
             // conversational reply path already covers the empty-citations SSE
             // contract, so this just builds a memory-only prompt and reuses it.
@@ -349,15 +370,14 @@ pub async fn chat(
             let sql_data = if *backend == crate::router::StructuredBackend::SourceSql {
                 match crate::nl2sql::routes::prepare_auto_query(state.inner(), &body.question).await
                 {
-                    Ok(Some(prepared)) => Some(ChatData::SourceSql {
-                        source_id: prepared.source_id,
-                        sql: prepared.sql,
-                        explanation: prepared.explanation,
-                        columns: prepared.columns,
-                        rows: prepared.rows,
-                        answer: prepared.answer,
-                    }),
-                    Ok(None) => None,
+                    Ok(Some(prepared)) => {
+                        trace.stage_detail(
+                            Stage::Execute,
+                            format!("{} rows from the live database", prepared.rows.len()),
+                        );
+                        Some(source_sql_chat_data(prepared))
+                    }
+                    Ok(None) => resolve_followup_sql(state.inner(), &body.question, &memory).await,
                     Err(error) => {
                         tracing::warn!(%error, "live SQL query failed; falling back to ingested records");
                         None
@@ -370,64 +390,82 @@ pub async fn chat(
             if let Some(data) = sql_data {
                 data
             } else {
+                generation_permit = Some(state.admission.generation().await?);
                 let catalog = state.catalog(); // Arc<Catalog>
-                match run_structured(
-                    &state.db,
-                    foundry,
-                    &user,
-                    state,
-                    &catalog,
-                    intent,
-                    &body.question,
-                    &trace,
-                )
-                .await
-                {
-                    Ok(structured) => match structured {
-                        Structured::Direct { answer } => ChatData::DirectStructured { answer },
-                        Structured::Aggregate { narration_stream } => ChatData::Structured {
-                            citations_json: "[]".to_string(),
-                            narration_stream,
-                            passages_for_persist: Vec::new(),
-                        },
-                        Structured::List {
-                            citations_json,
-                            narration_stream,
-                        } => {
-                            let passages = serde_json::from_str(&citations_json).unwrap_or_else(|error| {
+                if catalog.collections.is_empty() {
+                    // No ingested collection exists for the planner to name, so every
+                    // spec it could produce fails validation. Skip the model call.
+                    build_semantic_chat_data(
+                        foundry,
+                        state,
+                        &memory,
+                        &body.question,
+                        mode,
+                        rerank,
+                        top_k,
+                        &trace,
+                    )
+                    .await?
+                } else {
+                    match run_structured(
+                        &state.db,
+                        foundry,
+                        &user,
+                        state,
+                        &catalog,
+                        intent,
+                        &body.question,
+                        &trace,
+                    )
+                    .await
+                    {
+                        Ok(structured) => match structured {
+                            Structured::Direct { answer } => ChatData::DirectStructured { answer },
+                            Structured::Aggregate { narration_stream } => ChatData::Structured {
+                                citations_json: "[]".to_string(),
+                                narration_stream,
+                                passages_for_persist: Vec::new(),
+                            },
+                            Structured::List {
+                                citations_json,
+                                narration_stream,
+                            } => {
+                                let passages = serde_json::from_str(&citations_json).unwrap_or_else(|error| {
                             tracing::warn!(%error, "failed to decode list citations for persistence");
                             Vec::new()
                         });
-                            ChatData::Structured {
-                                citations_json,
-                                narration_stream,
-                                passages_for_persist: passages,
+                                ChatData::Structured {
+                                    citations_json,
+                                    narration_stream,
+                                    passages_for_persist: passages,
+                                }
                             }
+                        },
+                        Err(e) => {
+                            tracing::info!(
+                                intent = ?intent,
+                                error = %e,
+                                "run_structured failed; falling back to semantic retrieval"
+                            );
+                            build_semantic_chat_data(
+                                foundry,
+                                state,
+                                &memory,
+                                &body.question,
+                                mode,
+                                rerank,
+                                top_k,
+                                &trace,
+                            )
+                            .await?
                         }
-                    },
-                    Err(e) => {
-                        tracing::info!(
-                            intent = ?intent,
-                            error = %e,
-                            "run_structured failed; falling back to semantic retrieval"
-                        );
-                        build_semantic_chat_data(
-                            foundry,
-                            state,
-                            &memory,
-                            &body.question,
-                            mode,
-                            rerank,
-                            top_k,
-                            &trace,
-                        )
-                        .await?
                     }
                 }
             }
         }
 
         crate::router::RouteClass::Hybrid { .. } => {
+            generation_permit = Some(state.admission.generation().await?);
             // Phase C (plan 18) will run a structured cohort filter then summarise its
             // records. Until that executor lands, answer hybrids semantically — the
             // grounded path already handles "summarise records matching X" acceptably.
@@ -446,22 +484,33 @@ pub async fn chat(
         }
 
         crate::router::RouteClass::Semantic => {
-            build_semantic_chat_data(
-                foundry,
-                state,
-                &memory,
-                &body.question,
-                mode,
-                rerank,
-                top_k,
-                &trace,
-            )
-            .await?
+            // Direct patient overviews and anaphoric structured follow-ups can be
+            // answered exactly from the live source. Try only those conservative
+            // deterministic shapes before paying for semantic retrieval.
+            if let Some(data) = resolve_semantic_sql(state.inner(), &body.question, &memory).await {
+                data
+            } else {
+                generation_permit = Some(state.admission.generation().await?);
+                build_semantic_chat_data(
+                    foundry,
+                    state,
+                    &memory,
+                    &body.question,
+                    mode,
+                    rerank,
+                    top_k,
+                    &trace,
+                )
+                .await?
+            }
         }
     };
 
     // Clone owned, Send data into the generator (EventStream! is 'static — no borrows).
     let db = state.db.clone();
+    // Read before the generator opens: it is 'static and cannot borrow `&AppState`.
+    // Decides which "no answer" wording is honest — see `rag::no_grounding_message`.
+    let store_is_empty = state.catalog().collections.is_empty();
     let persist_target = body.conversation_id.clone();
     let uid = user.id.clone();
     let foundry_handle = state.foundry_handle();
@@ -469,6 +518,7 @@ pub async fn chat(
     // Resolved on the request so a persisted per-role override is honoured; the
     // generator is 'static and cannot borrow `&AppState`.
     let verify_spec = state.spec_for(crate::foundry::router::AgentKind::Verify);
+    let compact_spec = state.spec_for(crate::foundry::router::AgentKind::QueryRewrite);
 
     Ok(EventStream! {
         use futures::StreamExt;
@@ -535,6 +585,7 @@ pub async fn chat(
                                     None,
                                     &cfg,
                                     &foundry_handle,
+                                    &compact_spec,
                                     "conversational",
                                 ),
                             )
@@ -611,6 +662,7 @@ pub async fn chat(
                                 None,
                                 &cfg,
                                 &foundry_handle,
+                                &compact_spec,
                                 "direct_structured",
                             ),
                         )
@@ -667,6 +719,7 @@ pub async fn chat(
                                     None,
                                     &cfg,
                                     &foundry_handle,
+                                    &compact_spec,
                                     "structured",
                                 ),
                             )
@@ -681,7 +734,7 @@ pub async fn chat(
 
                 match stream {
                     None => {
-                        let msg = "I don't have relevant records to answer that question.";
+                        let msg = crate::rag::no_grounding_message(store_is_empty);
                         trace.record_output(msg);
                         full_answer.push_str(msg);
                         yield token_event(msg);
@@ -769,6 +822,7 @@ pub async fn chat(
                                     verification.as_ref(),
                                     &cfg,
                                     &foundry_handle,
+                                    &compact_spec,
                                     "semantic",
                                 ),
                             )
@@ -784,8 +838,82 @@ pub async fn chat(
         } else {
             trace.finish("ok", None);
         }
+        trace.progress_finished();
         yield Event::data("").event("done");
     })
+}
+
+/// Wrap a prepared live-SQL result for the SSE generator.
+fn source_sql_chat_data(prepared: crate::nl2sql::routes::PreparedNlQuery) -> ChatData {
+    ChatData::SourceSql {
+        source_id: prepared.source_id,
+        sql: prepared.sql,
+        explanation: prepared.explanation,
+        columns: prepared.columns,
+        rows: prepared.rows,
+        answer: prepared.answer,
+    }
+}
+
+/// Ground an anaphoric follow-up against identifiers from working memory and try
+/// the deterministic SQL compiler only — a miss returns `None` without any model
+/// call, so this is safe to attempt speculatively on every follow-up.
+async fn resolve_followup_sql(
+    state: &AppState,
+    question: &str,
+    memory: &WorkingMemory,
+) -> Option<ChatData> {
+    let augmented = crate::nl2sql::routes::resolve_followup_question(
+        question,
+        memory.tail.iter().map(|turn| turn.content.as_str()),
+    )?;
+    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &augmented).await {
+        Ok(Some(prepared)) => {
+            tracing::info!(%augmented, "anaphoric follow-up answered via deterministic SQL");
+            Some(source_sql_chat_data(prepared))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(%error, "follow-up SQL resolution failed; continuing normal path");
+            None
+        }
+    }
+}
+
+/// Try deterministic SQL for the narrow direct-overview shape, otherwise retain
+/// the existing anaphoric follow-up behavior. Generic semantic questions never
+/// incur source linking or SQL work.
+async fn resolve_semantic_sql(
+    state: &AppState,
+    question: &str,
+    memory: &WorkingMemory,
+) -> Option<ChatData> {
+    let candidate = semantic_sql_candidate(
+        question,
+        memory.tail.iter().map(|turn| turn.content.as_str()),
+    )?;
+    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &candidate).await {
+        Ok(Some(prepared)) => {
+            tracing::info!(%candidate, "semantic question answered via deterministic SQL");
+            Some(source_sql_chat_data(prepared))
+        }
+        Ok(None) => None,
+        Err(error) => {
+            tracing::debug!(%error, "semantic deterministic SQL failed; continuing retrieval");
+            None
+        }
+    }
+}
+
+fn semantic_sql_candidate<'turn>(
+    question: &str,
+    prior_turns: impl Iterator<Item = &'turn str>,
+) -> Option<String> {
+    if crate::nl2sql::routes::is_patient_overview_question(question) {
+        Some(question.to_string())
+    } else {
+        crate::nl2sql::routes::resolve_followup_question(question, prior_turns)
+    }
 }
 
 /// Build `ChatData::Semantic` by running the full retrieval + generation pipeline.
@@ -805,29 +933,36 @@ async fn build_semantic_chat_data(
     let (standalone, queries) = trace
         .time(
             Stage::RewriteExpand,
-            prepare_queries(foundry, &state.config, &rewrite_turns, question),
+            prepare_queries_with(
+                foundry,
+                &state.spec_for(crate::foundry::router::AgentKind::QueryRewrite),
+                &state.config,
+                &rewrite_turns,
+                question,
+            ),
         )
         .await;
+    let broad = retrieval::is_broad_question(&standalone);
     let _retrieval_permit = state.admission.retrieval().await?;
     let passages = retrieval::retrieve_observed(
         &state.db,
         &state.config,
         &queries,
         mode,
-        rerank,
+        rerank && !broad,
         top_k,
         trace,
     )
     .await?;
 
-    // Anti-hallucination gate: refuse when there's nothing relevant, or (if a floor
-    // is configured) when the best passage scores below it. PHI — better to decline.
+    // Broad questions use fused RRF ordering and only refuse when retrieval is empty;
+    // pointed questions retain the reranker-score anti-hallucination floor.
     let refuse = trace.time_sync(Stage::Gate, || {
-        passages.is_empty()
-            || state
-                .config
-                .score_gate
-                .is_some_and(|floor| passages[0].score < floor)
+        retrieval::should_refuse_semantic(
+            &standalone,
+            passages.first().map(|passage| passage.score),
+            state.config.score_gate,
+        )
     });
     trace.set_gated(refuse);
 
@@ -850,7 +985,11 @@ async fn build_semantic_chat_data(
             trace
                 .time(
                     Stage::Generate,
-                    foundry.generate_stream(SYSTEM_PROMPT, &prompt),
+                    foundry.generate_stream_with(
+                        &state.spec_for(crate::foundry::router::AgentKind::Chat),
+                        SYSTEM_PROMPT,
+                        &prompt,
+                    ),
                 )
                 .await?,
         )
@@ -876,6 +1015,7 @@ async fn persist_and_compact(
     verification: Option<&crate::verify::VerifyReport>,
     cfg: &Config,
     foundry_handle: &Option<Arc<FoundryManager>>,
+    compact_spec: &crate::foundry::router::ModelSpec,
     kind: &str,
 ) {
     use crate::routes::conversations::{clip_message_bytes, persist_assistant_message};
@@ -886,6 +1026,7 @@ async fn persist_and_compact(
                 db.clone(),
                 foundry_handle.clone(),
                 cfg.clone(),
+                compact_spec.clone(),
                 cid.to_string(),
             );
         }
@@ -898,6 +1039,43 @@ async fn persist_and_compact(
 /// bare `data:` field — fusing words together on the client.
 fn token_event(text: &str) -> Event {
     Event::data(serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string())).event("token")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::semantic_sql_candidate;
+
+    #[test]
+    fn semantic_precheck_accepts_only_deterministic_patient_shapes() {
+        for question in [
+            "Tell me about Jane Chebet.",
+            "Who is Jane Chebet?",
+            "Give me an overview of Jane Chebet",
+            "Tell me about patient SYN-2024-0001",
+        ] {
+            assert_eq!(
+                semantic_sql_candidate(question, std::iter::empty()).as_deref(),
+                Some(question),
+                "question: {question}"
+            );
+        }
+
+        for question in ["Tell me about asthma", "Tell me about the hospital"] {
+            assert!(
+                semantic_sql_candidate(question, std::iter::empty()).is_none(),
+                "question unexpectedly reached SQL: {question}"
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_precheck_retains_anaphoric_followup_resolution() {
+        let turns = ["Reviewed patient SYN-2024-0001."];
+        assert_eq!(
+            semantic_sql_candidate("What is the patient's name?", turns.iter().copied()).as_deref(),
+            Some("What is the patient's name? patient SYN-2024-0001")
+        );
+    }
 }
 
 /// Extract every unique 1-based citation index from `[N]` patterns in `text`.

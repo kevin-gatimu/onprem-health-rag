@@ -46,6 +46,16 @@ impl MysqlConnector {
     }
 }
 
+fn mysql_plan_cost(value: &serde_json::Value) -> Option<f64> {
+    value
+        .get("query_block")?
+        .get("cost_info")?
+        .get("query_cost")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 #[async_trait]
 impl SourceConnector for MysqlConnector {
     async fn test(&self) -> AppResult<()> {
@@ -219,6 +229,33 @@ impl SourceConnector for MysqlConnector {
         Ok(out)
     }
 
+    async fn estimate_cost(&self, sql: &str, timeout_secs: u64) -> AppResult<Option<f64>> {
+        let pool = self.pool(1).await?;
+        let timeout_ms = timeout_secs * 1_000;
+
+        sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+            .execute(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL set EXPLAIN timeout failed", e))?;
+
+        let explain_sql = format!("EXPLAIN FORMAT=JSON {sql}");
+        let row = sqlx::query(&explain_sql)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL EXPLAIN failed", e))?;
+        let value = row
+            .try_get::<String, _>(0)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+
+        sqlx::query("SET SESSION max_execution_time = 0")
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+        Ok(value.as_ref().and_then(mysql_plan_cost))
+    }
+
     async fn run_select(
         &self,
         sql: &str,
@@ -304,4 +341,23 @@ fn cell_to_json(row: &MySqlRow, i: usize) -> Value {
         return json!(B64.encode(v));
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mysql_plan_cost;
+    use serde_json::json;
+
+    #[test]
+    fn parses_mysql_string_plan_cost() {
+        let plan = json!({"query_block": {"cost_info": {"query_cost": "42.75"}}});
+        assert_eq!(mysql_plan_cost(&plan), Some(42.75));
+    }
+
+    #[test]
+    fn missing_or_invalid_mysql_plan_cost_returns_none() {
+        assert_eq!(mysql_plan_cost(&json!({"query_block": {}})), None);
+        let invalid = json!({"query_block": {"cost_info": {"query_cost": "unknown"}}});
+        assert_eq!(mysql_plan_cost(&invalid), None);
+    }
 }

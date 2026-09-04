@@ -22,6 +22,12 @@ pub const SCHEMA_CATALOG_STATE: &str = "schema_catalog_state";
 pub const SCHEMA_CATALOG_HISTORY: &str = "schema_catalog_history";
 /// Admin-curated aliases and undeclared relationships, independent of generations.
 pub const SCHEMA_METADATA_OVERRIDES: &str = "schema_metadata_overrides";
+/// Per-source schema bindings (service-line ontology). One doc per source_id,
+/// keyed by `source_id`. Written by `build_binding`.
+pub const SCHEMA_BINDINGS: &str = "schema_bindings";
+/// History of past schema bindings for audit / diff. One doc per binding run,
+/// keyed by `{source_id}:{bound_at}`.
+pub const SCHEMA_BINDING_HISTORY: &str = "schema_binding_history";
 /// Per-table ingestion state: one doc per `{source_id}:{table}`, tracking status,
 /// row/vector counts, and timestamps. Read by `GET /ingest/history`.
 pub const INDEXED_TABLES: &str = "indexed_tables";
@@ -105,6 +111,14 @@ impl DocumentDb {
 
     pub fn schema_metadata_overrides(&self) -> Collection<Document> {
         self.collection(SCHEMA_METADATA_OVERRIDES)
+    }
+
+    pub fn schema_bindings(&self) -> Collection<Document> {
+        self.collection(SCHEMA_BINDINGS)
+    }
+
+    pub fn schema_binding_history(&self) -> Collection<Document> {
+        self.collection(SCHEMA_BINDING_HISTORY)
     }
 }
 

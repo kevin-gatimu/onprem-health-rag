@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-On-premises RAG for health records. `plans/` is the design mind-cache — start at
-`plans/00-master-plan.md`; add numbered `NN-topic.md` notes there as decisions land.
+On-premises RAG for health records. Authoritative documentation starts at
+`plans/docs/README.md`. Archived historical plans are in `plans/old/`; add new current
+documentation under `plans/docs/`, not as numbered root-plan files.
 
 ## What this is
 

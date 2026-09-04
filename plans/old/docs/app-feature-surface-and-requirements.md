@@ -1,5 +1,7 @@
 # App feature surface & derived requirements
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Application and Feature Architecture](application-and-feature-architecture.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > Target feature surface for our app, informed by a **separate reference app** (screenshots captured
 > 2026-08-23) whose UI Kevin wants ours to be shaped by. The screenshots are **not our build** — they
 > are inspiration. This doc records what we want, and the backend work each screen implies. Companion

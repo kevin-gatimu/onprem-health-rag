@@ -21,6 +21,9 @@
 
 use std::collections::HashMap;
 
+use crate::ontology::concepts::EntityConcept;
+use crate::ontology::service_line::ServiceLine;
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -90,6 +93,13 @@ pub struct CollectionMeta {
     pub label: String,
     /// All allow-listed field names for this collection.
     pub fields: Vec<FieldMeta>,
+    /// Ontology concept bound to this collection by the schema binder, if any.
+    /// `None` when the catalog was built without binding data (e.g. degraded mode
+    /// or before the first binding run).
+    pub concept: Option<EntityConcept>,
+    /// Service lines that claim ownership of this collection via the bound concept.
+    /// Empty when `concept` is `None` or binding has not been run.
+    pub service_lines: Vec<ServiceLine>,
 }
 
 impl CollectionMeta {
@@ -302,6 +312,8 @@ async fn build_from_store_inner(
             CollectionMeta {
                 label: format!("{table} records"),
                 fields,
+                concept: None,
+                service_lines: Vec::new(),
             },
         );
     }
@@ -487,6 +499,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 ),
                 FieldMeta::with_desc("result_unit", FieldType::String, "Unit for the lab result"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
@@ -504,6 +518,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::with_desc("registration_date", FieldType::Date, "Registration date"),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
@@ -523,6 +539,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 ),
                 FieldMeta::with_desc("clinic", FieldType::String, "Clinic or facility"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
@@ -541,6 +559,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::with_desc("drug_name", FieldType::String, "Drug name"),
                 FieldMeta::with_desc("dosage", FieldType::String, "Dosage"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
@@ -561,6 +581,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::with_desc("result_value", FieldType::Numeric, "Numeric result"),
                 FieldMeta::with_desc("result_unit", FieldType::String, "Result unit"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
@@ -578,6 +600,8 @@ pub(crate) fn build_hardcoded() -> Catalog {
                 FieldMeta::with_desc("weight", FieldType::Numeric, "kg"),
                 FieldMeta::with_desc("height", FieldType::Numeric, "cm"),
             ],
+            concept: None,
+            service_lines: Vec::new(),
         },
     );
 
