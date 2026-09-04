@@ -135,6 +135,11 @@ pub trait SourceConnector: Send + Sync {
         page_size: i64,
     ) -> AppResult<Vec<FetchedRow>>;
 
+    /// Estimate a validated SELECT's backend-specific plan cost when supported.
+    async fn estimate_cost(&self, _sql: &str, _timeout_secs: u64) -> AppResult<Option<f64>> {
+        Ok(None)
+    }
+
     /// Execute a **pre-validated, read-only SELECT** and return `(column_names, rows)`.
     ///
     /// The caller MUST validate `sql` with `nl2sql::validate::validate_sql` before

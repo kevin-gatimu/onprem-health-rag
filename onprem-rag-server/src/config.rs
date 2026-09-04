@@ -37,10 +37,10 @@ pub struct RouterConfig {
     pub verifier: String,     // ONPREM_MODEL_VERIFIER
     /// Maximum number of GPU-class models resident in memory simultaneously.
     /// NPU/CPU models are exempt — they live on separate silicon and keeping
-    /// phi-4-mini hot on the NPU is the whole point of the device-placement design.
+    /// Defaults are consolidated onto one Qwen GPU model to bound resident memory.
     pub max_resident_models: usize, // ONPREM_MAX_RESIDENT_MODELS
-    /// Whether to attempt NPU placement for eligible roles (Extract, Verify, Classify).
-    /// Set false to force CPU for those roles even when an NPU is detected.
+    /// Whether NPU placement may be used by an explicitly NPU-routed role.
+    /// Default false because the standard role map is GPU-first.
     pub npu_enabled: bool, // ONPREM_NPU_ENABLED
     /// NPU context-length cap in tokens. Variants whose `context_length()` exceeds this
     /// are skipped during NPU selection — prevents OOM on the NPU's constrained VRAM.
@@ -57,14 +57,12 @@ pub struct RouterConfig {
     pub nl2sql_tables_max: usize,
     pub nl2sql_fewshots: usize,
     pub nl2sql_max_rows: i64,
+    pub nl2sql_max_plan_cost: f64,
     pub nl2sql_timeout_secs: u64,
     pub nl2sql_plan_timeout_secs: u64,
     pub nl2sql_sample_values: usize,
-    /// Approximate-token (word-count) ceiling on the assembled schema+examples+question
-    /// prompt sent to the text-to-SQL model. Prevents overrunning phi-4-mini's native
-    /// 4224-token context (the observed failure sent ~8,631 tokens): schema cards for a
-    /// wide table plus few-shots can blow well past that budget on their own. Left with
-    /// headroom for the system prompt (~150 tokens) and the model's own generation.
+    /// Conservative token ceiling on the assembled schema+examples+question prompt.
+    /// Keeps SQL planning latency bounded and protects smaller role overrides.
     pub nl2sql_prompt_token_budget: usize,
 
     pub extract_enabled: bool,
@@ -85,29 +83,29 @@ impl RouterConfig {
             chat: env_or("ONPREM_MODEL_CHAT", "qwen3-8b"),
             health_query: env_or("ONPREM_MODEL_HEALTH_QUERY", "qwen3-8b"),
             trends: env_or("ONPREM_MODEL_TRENDS", "qwen3-8b"),
-            summarize: env_or("ONPREM_MODEL_SUMMARIZE", "mistral-nemo-12b-instruct"),
-            lookup: env_or("ONPREM_MODEL_LOOKUP", "qwen3-4b"),
-            fast: env_or("ONPREM_MODEL_FAST", "qwen3-4b"),
-            classify: env_or("ONPREM_MODEL_CLASSIFY", "phi-4-mini"),
-            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "phi-4-mini"),
-            verifier: env_or("ONPREM_MODEL_VERIFIER", "phi-4-mini-reasoning"),
-            max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 2_usize),
-            npu_enabled: env_parse("ONPREM_NPU_ENABLED", true),
+            summarize: env_or("ONPREM_MODEL_SUMMARIZE", "qwen3-8b"),
+            lookup: env_or("ONPREM_MODEL_LOOKUP", "qwen3-8b"),
+            fast: env_or("ONPREM_MODEL_FAST", "qwen3-8b"),
+            classify: env_or("ONPREM_MODEL_CLASSIFY", "qwen3-8b"),
+            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "qwen3-8b"),
+            verifier: env_or("ONPREM_MODEL_VERIFIER", "qwen3-8b"),
+            max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 1_usize),
+            npu_enabled: env_parse("ONPREM_NPU_ENABLED", false),
             npu_ctx_cap: env_parse("ONPREM_NPU_CTX_CAP", 4224_u64),
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
 
             text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", true),
-            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini"),
+            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "qwen3-8b"),
             nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
             nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
             nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
+            nl2sql_max_plan_cost: env_parse("ONPREM_NL2SQL_MAX_PLAN_COST", 1_000_000.0_f64),
             nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
             nl2sql_plan_timeout_secs: env_parse("ONPREM_NL2SQL_PLAN_TIMEOUT_SECS", 30_u64),
             nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
-            // Default budget leaves headroom under the 4224-token NPU cap for the
-            // system prompt (~150 tokens) and the model's SQL completion (~256 tokens,
-            // see AgentKind::TextToSql's max_tokens). 3200 is a conservative fit.
+            // Keep planning latency bounded even when the selected GPU model has a
+            // larger context window; role overrides may also have smaller windows.
             nl2sql_prompt_token_budget: env_parse("ONPREM_NL2SQL_PROMPT_TOKEN_BUDGET", 3200_usize),
 
             extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
@@ -223,6 +221,17 @@ pub struct Config {
     pub schema_poll_concurrency: usize,
     /// Rows sampled per table for bounded aggregate column profiles.
     pub schema_profile_sample_rows: usize,
+
+    // Schema binding (service-line ontology)
+    /// Minimum concept-binding confidence score (0–1). Tables below this
+    /// threshold are stored as `EntityConcept::Unknown`.
+    pub binding_min_confidence: f32,
+    /// Maximum enum values probed per categorical column.
+    pub binding_enum_max: usize,
+    /// Maximum FK-hop depth for patient-path BFS.
+    pub binding_max_hops: usize,
+    /// Enable automatic schema binding on catalog refresh.
+    pub binding_enabled: bool,
 }
 
 impl Config {
@@ -314,6 +323,11 @@ impl Config {
             schema_poll_interval_secs: env_parse("ONPREM_SCHEMA_POLL_INTERVAL_SECS", 300_u64),
             schema_poll_concurrency: env_parse("ONPREM_SCHEMA_POLL_CONCURRENCY", 2_usize).max(1),
             schema_profile_sample_rows: env_parse("ONPREM_SCHEMA_PROFILE_SAMPLE_ROWS", 256_usize),
+
+            binding_min_confidence: env_parse("ONPREM_BINDING_MIN_CONFIDENCE", 0.55_f32),
+            binding_enum_max: env_parse("ONPREM_BINDING_ENUM_MAX", 25_usize),
+            binding_max_hops: env_parse("ONPREM_BINDING_MAX_HOPS", 3_usize),
+            binding_enabled: env_parse("ONPREM_BINDING_ENABLED", true),
         }
     }
 

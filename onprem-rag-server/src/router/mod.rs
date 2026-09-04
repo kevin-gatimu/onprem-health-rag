@@ -290,6 +290,7 @@ pub async fn route(
     has_history: bool,
     config: &Config,
     foundry_opt: Option<&FoundryManager>,
+    classify_spec: &ModelSpec,
     cache: &RouterCache,
 ) -> RouteDecision {
     // Tier 0a — conversation-meta gate: "what have I asked so far?" needs the
@@ -337,7 +338,9 @@ pub async fn route(
             // marker ("summarise the notes of patients who visited > 3 times").
             // Escalate to Tier 2 to confirm; a plain structured question does not.
             if structural && has_narrative_marker(question) && model_enabled {
-                if let Some(decision) = tier2(question, config, foundry_opt, cache).await {
+                if let Some(decision) =
+                    tier2(question, config, foundry_opt, classify_spec, cache).await
+                {
                     return finish(decision, question, has_history);
                 }
                 // Tier 2 unavailable — trust the lexical structural read.
@@ -357,7 +360,9 @@ pub async fn route(
         None => {
             // Ambiguous for the lexical pass — ask the model, if enabled.
             if model_enabled {
-                if let Some(decision) = tier2(question, config, foundry_opt, cache).await {
+                if let Some(decision) =
+                    tier2(question, config, foundry_opt, classify_spec, cache).await
+                {
                     return finish(decision, question, has_history);
                 }
             }
@@ -383,6 +388,7 @@ async fn tier2(
     question: &str,
     config: &Config,
     foundry_opt: Option<&FoundryManager>,
+    classify_spec: &ModelSpec,
     cache: &RouterCache,
 ) -> Option<RouteDecision> {
     let key = normalize_key(question);
@@ -393,8 +399,10 @@ async fn tier2(
     }
 
     let foundry = foundry_opt?;
-    let spec = ModelSpec::for_kind(AgentKind::Classify, config);
-    let out = match foundry.plan_route(&spec, question).await {
+    // The caller resolves the spec (`AppState::spec_for`) so the Core-LLM
+    // override applies here too — computing it from env defaults would
+    // cold-swap a different alias mid-request under a 1-model LRU.
+    let out = match foundry.plan_route(classify_spec, question).await {
         Ok(o) => o,
         Err(e) => {
             tracing::info!(error = %e, "router Tier 2 classify failed; falling open");
@@ -468,7 +476,9 @@ fn class_from_model(out: &RouteToolOutput, config: &Config) -> Option<RouteClass
             }),
         },
         "hybrid" => Some(RouteClass::Hybrid {
-            cohort_intent: intent.filter(|i| is_structural(*i)).unwrap_or(QueryIntent::Aggregation),
+            cohort_intent: intent
+                .filter(|i| is_structural(*i))
+                .unwrap_or(QueryIntent::Aggregation),
         }),
         _ => None,
     }
@@ -572,8 +582,9 @@ mod tests {
         let mut config = Config::from_env();
         config.router.text2sql_enabled = true;
         let cache = RouterCache::new(8);
+        let spec = ModelSpec::for_kind(AgentKind::Classify, &config);
         for question in ["how many patients do we have?", "list 5 patients"] {
-            let decision = route(question, false, &config, None, &cache).await;
+            let decision = route(question, false, &config, None, &spec, &cache).await;
             assert!(
                 matches!(
                     decision.class,
@@ -585,6 +596,29 @@ mod tests {
                 "unexpected route for {question}: {:?}",
                 decision.class
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn patient_info_questions_route_semantic_at_tier_1() {
+        // "share information about patient <name>" previously fell through to
+        // the Tier-2 model, which misclassified it as a structured aggregation
+        // and narrated "the query returned one result" instead of the patient's
+        // fields. Lexical lookup markers must decide this without a model.
+        let config = Config::from_env();
+        let cache = RouterCache::new(8);
+        let spec = ModelSpec::for_kind(AgentKind::Classify, &config);
+        for question in [
+            "share information about patient Jane Chebet",
+            "give me details on John Otieno",
+        ] {
+            let decision = route(question, false, &config, None, &spec, &cache).await;
+            assert_eq!(
+                decision.class,
+                RouteClass::Semantic,
+                "unexpected route for {question}"
+            );
+            assert_eq!(decision.tier, 1, "should not need Tier 2 for {question}");
         }
     }
 
@@ -690,11 +724,21 @@ mod tests {
         // history to recap; with none it falls through to the normal pipeline.
         let cache = RouterCache::new(8);
         let cfg = Config::from_env();
-        let with_history = route("what have I asked so far?", true, &cfg, None, &cache).await;
+        let spec = ModelSpec::for_kind(AgentKind::Classify, &cfg);
+        let with_history =
+            route("what have I asked so far?", true, &cfg, None, &spec, &cache).await;
         assert_eq!(with_history.class, RouteClass::ConversationMeta);
         assert_eq!(with_history.tier, 0);
 
-        let without_history = route("what have I asked so far?", false, &cfg, None, &cache).await;
+        let without_history = route(
+            "what have I asked so far?",
+            false,
+            &cfg,
+            None,
+            &spec,
+            &cache,
+        )
+        .await;
         assert_ne!(without_history.class, RouteClass::ConversationMeta);
     }
 

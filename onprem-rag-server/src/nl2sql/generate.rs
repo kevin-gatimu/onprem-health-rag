@@ -27,12 +27,13 @@ pub fn system_prompt(dialect: SourceKind) -> String {
     )
 }
 
-/// Approximate token count. Source projections and schema text are whitespace-
-/// delimited, so word count is a conservative, model-independent proxy that
-/// avoids loading a tokenizer on the request path (same convention as
-/// `rag::apply_context_budget`).
+/// Conservative token estimate without loading a tokenizer on the request path.
+/// Schema identifiers and punctuation-heavy SQL often tokenize much more densely
+/// than prose, so use the larger of word count and four characters per token.
 fn approx_tokens(s: &str) -> usize {
-    s.split_whitespace().count()
+    s.split_whitespace()
+        .count()
+        .max(s.chars().count().div_ceil(4))
 }
 
 /// Truncate `s` to at most `budget` whitespace-delimited tokens, appending a
@@ -41,8 +42,25 @@ fn clip_to_tokens(s: &str, budget: usize) -> String {
     if approx_tokens(s) <= budget {
         return s.to_string();
     }
-    let clipped: Vec<&str> = s.split_whitespace().take(budget).collect();
-    format!("{}\n[...schema truncated to fit model context...]", clipped.join(" "))
+    const MARKER: &str = "[...schema truncated to fit model context...]";
+    let content_budget = budget.saturating_sub(approx_tokens(MARKER));
+    let mut clipped = Vec::new();
+    let mut chars = 0;
+
+    for word in s.split_whitespace() {
+        let next_chars = chars + usize::from(!clipped.is_empty()) + word.chars().count();
+        let next_tokens = (clipped.len() + 1).max(next_chars.div_ceil(4));
+        if next_tokens > content_budget {
+            break;
+        }
+        clipped.push(word);
+        chars = next_chars;
+    }
+
+    if clipped.is_empty() {
+        return MARKER.to_string();
+    }
+    format!("{}\n{MARKER}", clipped.join(" "))
 }
 
 /// Format schema cards into the user message, dropping whole tables (least
@@ -306,15 +324,19 @@ mod tests {
 
     #[test]
     fn approx_tokens_counts_whitespace_delimited_words() {
-        assert_eq!(approx_tokens("one two three"), 3);
+        assert_eq!(approx_tokens("one two three"), 4);
+        assert_eq!(approx_tokens("abcdefghijkl"), 3);
         assert_eq!(approx_tokens(""), 0);
     }
 
     #[test]
     fn clip_to_tokens_truncates_and_marks_overflowing_text() {
-        let text = "one two three four five";
-        let clipped = clip_to_tokens(text, 2);
-        assert_eq!(clipped, "one two\n[...schema truncated to fit model context...]");
+        let text = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen";
+        let clipped = clip_to_tokens(text, 14);
+        assert_eq!(
+            clipped,
+            "one two\n[...schema truncated to fit model context...]"
+        );
         assert_eq!(clip_to_tokens(text, 100), text);
     }
 

@@ -9,6 +9,17 @@ use crate::config::Config;
 use crate::documentdb::DocumentDb;
 use crate::error::{AppError, AppResult};
 use crate::foundry::FoundryManager;
+use crate::ontology::binder::BindingOverrides;
+use crate::ontology::binding::SchemaBinding;
+use crate::ontology::concepts::EntityConcept;
+
+/// Cheaply-cloneable handle to the per-source schema binding cache.
+///
+/// Passed to any code that may build or update a binding so the result is
+/// immediately visible to route handlers without a server restart.
+/// `Arc`-wrapped so it can be moved into background tasks that outlive
+/// a request (ingest pipeline, catalog refresh).
+pub type BindingCache = Arc<RwLock<HashMap<String, Arc<SchemaBinding>>>>;
 
 /// Everything a route needs at runtime. Cheaply cloneable handles live here;
 /// later workstreams add the connector registry and reranker.
@@ -37,13 +48,30 @@ pub struct AppState {
     catalog: Arc<RwLock<Arc<Catalog>>>,
     /// Tier-2 intent-route decision cache (bounded LRU + metrics). Cleared on every
     /// `set_catalog` — a schema change can flip a structured/semantic decision.
-    pub router_cache: crate::router::RouterCache,
+    /// `Arc` so detached work (the ingest pipeline, which owns cloned handles
+    /// rather than `&AppState`) can invalidate routes after a schema change.
+    pub router_cache: Arc<crate::router::RouterCache>,
     /// Process-local bounds for expensive inference, retrieval, and ingestion work.
     pub admission: crate::admission::AdmissionControl,
     /// Process-local notifications for live ingestion progress; snapshots remain durable in MongoDB.
     pub ingest_progress: crate::ingest::IngestProgressHub,
+    /// Live pipeline-stage fan-out for `/chat` and `/agents`, keyed by the run id
+    /// the client mints. Read by `GET /runs/<run_id>/progress`; see `progress.rs`
+    /// for why the stages can't ride the answer stream itself.
+    pub run_progress: crate::progress::RunProgressHub,
     /// 0 warming, 1 ready, 2 disabled, 3 failed.
     warmup_state: Arc<AtomicU8>,
+
+    /// Per-source schema bindings (service-line ontology), keyed by `source_id`.
+    /// Built on first `build_binding` call and updated on each catalog refresh.
+    bindings: Arc<RwLock<HashMap<String, Arc<SchemaBinding>>>>,
+
+    /// BGE-M3 embeddings for every `ConceptDescriptor::description`, cached on
+    /// first `build_binding` call.  `None` while fastembed is not loaded.
+    descriptor_vectors: Arc<RwLock<Option<HashMap<EntityConcept, Vec<f32>>>>>,
+
+    /// Per-source manual binding overrides, loaded from `schema_metadata_overrides`.
+    binding_overrides: Arc<RwLock<HashMap<String, BindingOverrides>>>,
 }
 
 impl AppState {
@@ -54,7 +82,9 @@ impl AppState {
         router_overrides: HashMap<String, String>,
         initial_catalog: Catalog,
     ) -> Self {
-        let router_cache = crate::router::RouterCache::new(config.router.router_cache_size);
+        let router_cache = Arc::new(crate::router::RouterCache::new(
+            config.router.router_cache_size,
+        ));
         let admission = crate::admission::AdmissionControl::new(&config);
         let warmup_state = Arc::new(AtomicU8::new(if config.warmup_enabled { 0 } else { 2 }));
         AppState {
@@ -67,7 +97,11 @@ impl AppState {
             router_cache,
             admission,
             ingest_progress: crate::ingest::IngestProgressHub::default(),
+            run_progress: crate::progress::RunProgressHub::default(),
             warmup_state,
+            bindings: Arc::new(RwLock::new(HashMap::new())),
+            descriptor_vectors: Arc::new(RwLock::new(None)),
+            binding_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -160,5 +194,86 @@ impl AppState {
     /// `&AppState` cannot be borrowed across `yield` points.
     pub fn catalog_handle(&self) -> Arc<RwLock<Arc<Catalog>>> {
         self.catalog.clone()
+    }
+
+    /// Clone the router-cache handle for the same reason as `catalog_handle`:
+    /// whoever replaces the catalog must also invalidate cached route decisions.
+    pub fn router_cache_handle(&self) -> Arc<crate::router::RouterCache> {
+        self.router_cache.clone()
+    }
+
+    // -----------------------------------------------------------------------
+    // Schema binding accessors
+    // -----------------------------------------------------------------------
+
+    /// Clone the binding-cache `Arc` for background tasks (ingest pipeline, catalog
+    /// refresh hooks) that outlive the request and cannot borrow `&AppState`.
+    pub fn binding_cache(&self) -> BindingCache {
+        self.bindings.clone()
+    }
+
+    /// Return a snapshot of all bindings (Arc clones, no copy of data).
+    pub fn bindings(&self) -> HashMap<String, Arc<SchemaBinding>> {
+        self.bindings
+            .read()
+            .expect("bindings lock poisoned")
+            .clone()
+    }
+
+    /// Return the binding for one source (Arc clone), if cached.
+    pub fn binding_for(&self, source_id: &str) -> Option<Arc<SchemaBinding>> {
+        self.bindings
+            .read()
+            .expect("bindings lock poisoned")
+            .get(source_id)
+            .cloned()
+    }
+
+    /// Insert or replace the cached binding for a source.
+    pub fn set_binding(&self, source_id: String, binding: Arc<SchemaBinding>) {
+        if let Ok(mut w) = self.bindings.write() {
+            w.insert(source_id, binding);
+        }
+    }
+
+    /// Bulk-load bindings from a `Vec` (called at startup after DB load).
+    pub fn set_all_bindings(&self, all: Vec<SchemaBinding>) {
+        if let Ok(mut w) = self.bindings.write() {
+            for b in all {
+                w.insert(b.source_id.clone(), Arc::new(b));
+            }
+        }
+    }
+
+    /// Return cached descriptor vectors (Arc clone).  `None` while not loaded.
+    pub fn descriptor_vectors(&self) -> Option<Arc<HashMap<EntityConcept, Vec<f32>>>> {
+        self.descriptor_vectors
+            .read()
+            .expect("descriptor_vectors lock poisoned")
+            .as_ref()
+            .map(|m| Arc::new(m.clone()))
+    }
+
+    /// Cache descriptor vectors after first computation.
+    pub fn set_descriptor_vectors(&self, vecs: HashMap<EntityConcept, Vec<f32>>) {
+        if let Ok(mut w) = self.descriptor_vectors.write() {
+            *w = Some(vecs);
+        }
+    }
+
+    /// Return manual binding overrides for a source, if any.
+    pub fn binding_overrides_for(&self, source_id: &str) -> Option<BindingOverrides> {
+        self.binding_overrides
+            .read()
+            .expect("binding_overrides lock poisoned")
+            .get(source_id)
+            .cloned()
+    }
+
+    /// Store manual binding overrides for a source.
+    pub fn set_binding_overrides(&self, source_id: String, ov: BindingOverrides) {
+        if let Ok(mut w) = self.binding_overrides.write() {
+            w.insert(source_id, ov);
+        }
     }
 }

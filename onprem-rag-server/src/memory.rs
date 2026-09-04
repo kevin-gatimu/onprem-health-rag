@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::documentdb::DocumentDb;
 use crate::error::{AppError, AppResult};
 use crate::foundry::FoundryManager;
-use crate::foundry::router::{AgentKind, ModelSpec};
+use crate::foundry::router::ModelSpec;
 use crate::rag::ChatTurn;
 use crate::routes::conversations::parse_oid;
 
@@ -166,11 +166,12 @@ pub fn maybe_spawn_compaction(
     db: DocumentDb,
     foundry: Option<Arc<FoundryManager>>,
     config: Config,
+    spec: ModelSpec,
     conversation_id: String,
 ) {
     tokio::spawn(async move {
         let Some(foundry) = foundry else { return };
-        if let Err(e) = compact_if_needed(&db, &foundry, &config, &conversation_id).await {
+        if let Err(e) = compact_if_needed(&db, &foundry, &config, &spec, &conversation_id).await {
             tracing::warn!(error = %e, conversation_id, "conversation compaction failed (non-fatal)");
         }
     });
@@ -180,6 +181,7 @@ async fn compact_if_needed(
     db: &DocumentDb,
     foundry: &FoundryManager,
     config: &Config,
+    spec: &ModelSpec,
     conversation_id: &str,
 ) -> AppResult<()> {
     let oid = parse_oid(conversation_id)?;
@@ -237,7 +239,7 @@ async fn compact_if_needed(
         None => format!("New turns:\n{transcript}\n\nSummary:"),
     };
 
-    let mut spec = ModelSpec::for_kind(AgentKind::QueryRewrite, config);
+    let mut spec = spec.clone();
     spec.temperature = 0.1;
     spec.max_tokens = Some(256);
     let new_summary = foundry.complete_with(&spec, system, &user).await?;

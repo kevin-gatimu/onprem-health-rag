@@ -1,6 +1,7 @@
 // Agent store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { AgentKind, AggRow, Passage } from '../lib/bridge';
+import type { AgentKind, AggRow, Passage, StageEvent } from '../lib/bridge';
+import { applyStageEvent, type StageStep } from './stages';
 
 export type AgentPhase =
   | 'routing'
@@ -24,6 +25,8 @@ export interface AgentPending {
   pipeline: unknown[] | null;
   error: string | null;
   phase: AgentPhase;
+  /** Pipeline steps the server reported for this run, oldest first. */
+  stages: StageStep[];
   startedAt: number;
 }
 
@@ -53,6 +56,7 @@ interface AgentsState {
   setPipeline(runId: string, pipeline: unknown[]): void;
   appendAnswer(runId: string, batch: string[]): void;
   setCitations(runId: string, citations: Passage[]): void;
+  pushStage(runId: string, event: StageEvent): void;
   setError(runId: string, message: string): void;
   markStopped(runId: string): void;
   finish(runId: string): void;
@@ -98,6 +102,7 @@ export const useAgents = create<AgentsState>((set, get) => ({
           pipeline: null,
           error: null,
           phase: 'routing',
+          stages: [],
           startedAt: Date.now(),
         },
       },
@@ -148,6 +153,17 @@ export const useAgents = create<AgentsState>((set, get) => ({
     if (!get().runs[runId]) return;
     set((state) => ({
       runs: { ...state.runs, [runId]: { ...state.runs[runId], citations } },
+    }));
+  },
+
+  pushStage(runId, event) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], stages: applyStageEvent(state.runs[runId].stages, event) },
+      },
     }));
   },
 

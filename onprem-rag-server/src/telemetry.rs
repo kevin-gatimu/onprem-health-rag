@@ -53,6 +53,38 @@ impl Stage {
             Self::Narrate => "narrate",
         }
     }
+
+    /// Short, human-readable description of what this stage is doing, shown live
+    /// in the client activity strip. Plain language on purpose — the strip is for
+    /// clinicians watching an answer being assembled, not for operators reading
+    /// the `stages_ms` log line.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Route => "Working out what you're asking",
+            Self::History => "Loading the conversation",
+            Self::RewriteExpand => "Rewriting the question",
+            Self::Embed => "Embedding the question",
+            Self::SearchVector => "Searching records by meaning",
+            Self::SearchText => "Searching records by keyword",
+            Self::Rrf => "Merging both result sets",
+            Self::Rerank => "Re-ranking the best matches",
+            Self::Gate => "Checking the matches are good enough",
+            Self::Prompt => "Assembling the evidence",
+            Self::Ttft => "Waiting for the model",
+            Self::Generate => "Writing the answer",
+            Self::Persist => "Saving the conversation",
+            Self::Plan => "Planning the query",
+            Self::Validate => "Checking the query is safe",
+            Self::Execute => "Querying the database",
+            Self::Narrate => "Writing the answer",
+        }
+    }
+
+    /// `Ttft` is a derived measurement, not a step the user is waiting through,
+    /// so it never reaches the strip. Everything else does.
+    const fn user_visible(self) -> bool {
+        !matches!(self, Self::Ttft)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +133,15 @@ pub struct Percentiles {
 
 static METRICS: LazyLock<Mutex<Metrics>> = LazyLock::new(|| Mutex::new(Metrics::default()));
 
+/// Where live stage transitions are published, once a request has been given a
+/// client run id. `None` for requests the client isn't watching (the eval
+/// harness, `/search`, any caller that omits `run_id`).
+#[derive(Debug)]
+struct ProgressSink {
+    hub: crate::progress::RunProgressHub,
+    run_id: String,
+}
+
 #[derive(Debug)]
 struct Inner {
     request_id: String,
@@ -108,6 +149,10 @@ struct Inner {
     started: Instant,
     summary: Mutex<Summary>,
     emitted: AtomicBool,
+    /// Set at most once, before any stage runs. Behind a lock rather than a
+    /// `OnceLock` only because the run id arrives from the request body, after
+    /// `RequestTrace::new`.
+    progress: Mutex<Option<ProgressSink>>,
 }
 
 impl Inner {
@@ -154,6 +199,18 @@ impl Drop for Inner {
         if !self.emitted.load(Ordering::Acquire) {
             self.emit("cancelled_or_setup_error", Some("request_incomplete"));
         }
+        // A request that never reached its stream (auth failure, cancelled client)
+        // still has a progress subscriber waiting on it. Close it now rather than
+        // leaving the strip spinning until the stream's idle timeout.
+        if let Ok(mut slot) = self.progress.lock()
+            && let Some(sink) = slot.take()
+        {
+            sink.hub.publish(
+                &sink.run_id,
+                crate::progress::ProgressEvent::new("done", "", "done"),
+            );
+            sink.hub.remove(&sink.run_id);
+        }
     }
 }
 
@@ -171,7 +228,65 @@ impl RequestTrace {
                 started: Instant::now(),
                 summary: Mutex::new(Summary::default()),
                 emitted: AtomicBool::new(false),
+                progress: Mutex::new(None),
             }),
+        }
+    }
+
+    /// Start publishing live stage transitions for `run_id`. Call once, before
+    /// the first stage; requests without a client run id simply never call it and
+    /// pay nothing.
+    pub fn attach_progress(&self, hub: crate::progress::RunProgressHub, run_id: String) {
+        if let Ok(mut slot) = self.inner.progress.lock() {
+            *slot = Some(ProgressSink { hub, run_id });
+        }
+    }
+
+    fn publish(&self, event: crate::progress::ProgressEvent) {
+        let Ok(slot) = self.inner.progress.lock() else {
+            return;
+        };
+        if let Some(sink) = slot.as_ref() {
+            sink.hub.publish(&sink.run_id, event);
+        }
+    }
+
+    fn stage_started(&self, stage: Stage) {
+        if stage.user_visible() {
+            self.publish(crate::progress::ProgressEvent::new(
+                stage.name(),
+                stage.label(),
+                "start",
+            ));
+        }
+    }
+
+    fn stage_ended(&self, stage: Stage, elapsed: Duration) {
+        if stage.user_visible() {
+            self.publish(
+                crate::progress::ProgressEvent::new(stage.name(), stage.label(), "end")
+                    .with_ms(duration_ms(elapsed)),
+            );
+        }
+    }
+
+    /// Attach a PHI-free detail to a stage already reported — row counts, kept
+    /// passages, the backend that answered. Shown as the strip's sub-label.
+    pub fn stage_detail(&self, stage: Stage, detail: impl Into<String>) {
+        self.publish(
+            crate::progress::ProgressEvent::new(stage.name(), stage.label(), "end")
+                .with_detail(detail),
+        );
+    }
+
+    /// Close the run's progress stream and drop its buffer. Always call this when
+    /// the answer stream ends, however it ended.
+    pub fn progress_finished(&self) {
+        self.publish(crate::progress::ProgressEvent::new("done", "", "done"));
+        if let Ok(mut slot) = self.inner.progress.lock()
+            && let Some(sink) = slot.take()
+        {
+            sink.hub.remove(&sink.run_id);
         }
     }
 
@@ -181,6 +296,7 @@ impl RequestTrace {
 
     pub async fn time<T>(&self, stage: Stage, future: impl Future<Output = T>) -> T {
         let started = Instant::now();
+        self.stage_started(stage);
         let request_id = self.request_id().to_string();
         let result = match stage {
             Stage::Route => {
@@ -247,12 +363,15 @@ impl RequestTrace {
                 future.await
             }
         };
-        self.record_duration(stage, started.elapsed());
+        let elapsed = started.elapsed();
+        self.record_duration(stage, elapsed);
+        self.stage_ended(stage, elapsed);
         result
     }
 
     pub fn time_sync<T>(&self, stage: Stage, operation: impl FnOnce() -> T) -> T {
         let started = Instant::now();
+        self.stage_started(stage);
         let request_id = self.request_id();
         let result = match stage {
             Stage::Rrf => tracing::info_span!("rrf", %request_id).in_scope(operation),
@@ -261,11 +380,14 @@ impl RequestTrace {
             Stage::Validate => tracing::info_span!("validate", %request_id).in_scope(operation),
             _ => operation(),
         };
-        self.record_duration(stage, started.elapsed());
+        let elapsed = started.elapsed();
+        self.record_duration(stage, elapsed);
+        self.stage_ended(stage, elapsed);
         result
     }
 
     pub fn stage_guard(&self, stage: Stage) -> StageGuard {
+        self.stage_started(stage);
         StageGuard {
             trace: self.clone(),
             stage,
@@ -286,10 +408,16 @@ impl RequestTrace {
         candidates_out: usize,
         top_score: Option<f64>,
     ) {
-        let mut summary = self.inner.summary();
-        summary.candidates_in = Some(candidates_in);
-        summary.candidates_out = Some(candidates_out);
-        summary.rerank_top_score = top_score;
+        {
+            let mut summary = self.inner.summary();
+            summary.candidates_in = Some(candidates_in);
+            summary.candidates_out = Some(candidates_out);
+            summary.rerank_top_score = top_score;
+        }
+        self.stage_detail(
+            Stage::Rerank,
+            format!("kept the best {candidates_out} of {candidates_in} passages"),
+        );
     }
 
     pub fn set_gated(&self, gated: bool) {
@@ -389,8 +517,9 @@ pub struct StageGuard {
 
 impl Drop for StageGuard {
     fn drop(&mut self) {
-        self.trace
-            .record_duration(self.stage, self.started.elapsed());
+        let elapsed = self.started.elapsed();
+        self.trace.record_duration(self.stage, elapsed);
+        self.trace.stage_ended(self.stage, elapsed);
     }
 }
 

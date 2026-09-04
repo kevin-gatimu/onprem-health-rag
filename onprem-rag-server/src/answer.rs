@@ -70,7 +70,11 @@ RULES: \
 pub fn build_agg_planner_system(catalog: &Catalog, intent: QueryIntent) -> String {
     let kind_instruction = if intent == QueryIntent::Trend {
         "The user wants a TREND query — always include a `time_bucket` field in your \
-         response to bucket results by a calendar unit (month is usually appropriate)."
+         response to bucket results by a calendar unit (month is usually appropriate). \
+         `time_bucket` must be an object whose `field` is a real date column and whose \
+         `unit` is the granularity, for example: \
+         `\"time_bucket\": {\"field\":\"encounter_date\",\"unit\":\"month\"}`. \
+         NEVER put `time_bucket` in `group_by` or use `time_bucket` as a field name."
     } else {
         "The user wants a HEALTH QUERY — aggregate the records. \
          Do NOT include a `time_bucket` unless the question explicitly asks for a trend."
@@ -80,6 +84,9 @@ pub fn build_agg_planner_system(catalog: &Catalog, intent: QueryIntent) -> Strin
          Your job: given a user question, call the `run_aggregation` tool with a valid JSON spec.\n\
          Use ONLY the field names listed in the schema below — do not invent new field names.\n\
          Map natural-language terms to ICD-10 prefixes using the code vocabulary.\n\
+         Preserve every qualifier in the question as a `filter` (for example abnormal, active, \
+         failed, positive, male/female, or a status value). Prefer an allowed boolean or flag \
+         field such as `is_abnormal` when one exists. NEVER count all rows for a qualified question.\n\
          {kind_instruction}\n\n\
          {}",
         catalog.planner_context()
@@ -97,6 +104,33 @@ pub fn build_list_planner_system(catalog: &Catalog) -> String {
          {}",
         catalog.planner_context()
     )
+}
+
+#[cfg(test)]
+mod planner_prompt_tests {
+    use super::build_agg_planner_system;
+    use crate::aggregation::catalog::Catalog;
+    use crate::aggregation::intent::QueryIntent;
+
+    #[test]
+    fn aggregation_trend_prompt_explains_time_bucket_shape() {
+        let prompt = build_agg_planner_system(&Catalog::empty(), QueryIntent::Trend);
+
+        assert!(
+            prompt.contains("\"time_bucket\": {\"field\":\"encounter_date\",\"unit\":\"month\"}")
+        );
+        assert!(prompt.contains("NEVER put `time_bucket` in `group_by`"));
+        assert!(prompt.contains("use `time_bucket` as a field name"));
+    }
+
+    #[test]
+    fn aggregation_prompt_requires_filters_for_qualified_questions() {
+        let prompt = build_agg_planner_system(&Catalog::empty(), QueryIntent::Aggregation);
+
+        assert!(prompt.contains("Preserve every qualifier"));
+        assert!(prompt.contains("`is_abnormal`"));
+        assert!(prompt.contains("NEVER count all rows for a qualified question"));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -43,6 +43,10 @@ impl PostgresConnector {
     }
 }
 
+fn postgres_plan_cost(value: &serde_json::Value) -> Option<f64> {
+    value.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
+}
+
 #[async_trait]
 impl SourceConnector for PostgresConnector {
     async fn test(&self) -> AppResult<()> {
@@ -250,6 +254,37 @@ impl SourceConnector for PostgresConnector {
         Ok(out)
     }
 
+    async fn estimate_cost(&self, sql: &str, timeout_secs: u64) -> AppResult<Option<f64>> {
+        let pool = self.pool(1).await?;
+        let timeout_ms = timeout_secs * 1_000;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| conn_err("PostgreSQL begin EXPLAIN transaction failed", e))?;
+
+        sqlx::query("SET LOCAL transaction_read_only = on")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set EXPLAIN read-only failed", e))?;
+        sqlx::query(&format!("SET LOCAL statement_timeout = '{timeout_ms}ms'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set EXPLAIN timeout failed", e))?;
+
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
+        let row = sqlx::query(&explain_sql)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL EXPLAIN failed", e))?;
+        let value = row.try_get::<serde_json::Value, _>(0).ok();
+
+        tx.rollback()
+            .await
+            .map_err(|e| conn_err("PostgreSQL EXPLAIN rollback failed", e))?;
+        pool.close().await;
+        Ok(value.as_ref().and_then(postgres_plan_cost))
+    }
+
     async fn run_select(
         &self,
         sql: &str,
@@ -333,5 +368,23 @@ impl SourceConnector for PostgresConnector {
         }
 
         Ok((columns, result_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::postgres_plan_cost;
+    use serde_json::json;
+
+    #[test]
+    fn parses_postgres_plan_cost() {
+        let plan = json!([{"Plan": {"Node Type": "Seq Scan", "Total Cost": 431.25}}]);
+        assert_eq!(postgres_plan_cost(&plan), Some(431.25));
+    }
+
+    #[test]
+    fn missing_postgres_plan_cost_returns_none() {
+        assert_eq!(postgres_plan_cost(&json!([{"Plan": {}}])), None);
+        assert_eq!(postgres_plan_cost(&json!({})), None);
     }
 }

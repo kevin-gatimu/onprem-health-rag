@@ -108,10 +108,10 @@ export default function Chat() {
       </div>
 
       {/* Main two-column (md+) / single-column (mobile) layout */}
-      <div className="flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] rounded-lg border border-border overflow-hidden">
+      <div className="flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] rounded-lg border border-border overflow-hidden">
 
         {/* Left rail — desktop only; mirrors ConnectionTree pattern from data-explorer */}
-        <aside className="hidden md:flex md:flex-col border-r border-border bg-surface">
+        <aside className="hidden md:flex md:flex-col min-h-0 overflow-hidden border-r border-border bg-surface">
           <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border text-xs font-semibold text-fg-muted uppercase tracking-wide flex-shrink-0">
             <Layers size={13} aria-hidden="true" />
             Conversations
@@ -129,7 +129,7 @@ export default function Chat() {
         </aside>
 
         {/* Right pane: message list + composer */}
-        <div className="flex-1 min-h-0 flex flex-col bg-base">
+        <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-base">
           <MessageList
             persisted={messages}
             runs={runs}

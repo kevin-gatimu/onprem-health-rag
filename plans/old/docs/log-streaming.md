@@ -1,5 +1,7 @@
 # Live Log Streaming
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Operations, Performance, and Observability](operations-performance-and-observability.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > The system for streaming server-side trace events to app panels in real-time, so users can watch long-running operations (model downloads, embeddings generation, ingestion) without checking the server terminal. Companion docs: [`architecture-overview.md`](architecture-overview.md).
 
 ## Problem

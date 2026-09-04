@@ -6,4 +6,5 @@ pub mod explorer;
 pub mod health;
 pub mod logs;
 pub mod metrics;
+pub mod progress;
 pub mod stats;

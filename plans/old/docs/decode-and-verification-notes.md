@@ -1,5 +1,7 @@
 # Live Verification & Decode Findings
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Verified Platform Notes](verified-platform-notes.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > Technical findings from verification against real containers during development. Everything here was **tested live**, not inferred from documentation. Dates: 2026-08-23. Companion docs: [`architecture-overview.md`](architecture-overview.md), [`retrieval-pipeline.md`](retrieval-pipeline.md).
 
 ## 1. DocumentDB `cosmosSearch` Syntax — VERIFIED

@@ -1,5 +1,7 @@
 # Retrieval Pipeline
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Retrieval, Chat Memory, and Concurrency](retrieval-chat-memory-and-concurrency.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > The per-turn semantic RAG pipeline for chat: query rewrite through grounded generation with reranking. Companion docs: [`architecture-overview.md`](architecture-overview.md), [`accelerator-and-hardware-detection.md`](accelerator-and-hardware-detection.md), [`aggregation-aware-retrieval.md`](aggregation-aware-retrieval.md).
 
 ## Per-Turn Pipeline (Accurate Path)

@@ -132,7 +132,7 @@ export default function MessageBubble(props: MessageBubbleProps) {
 
       {/* Activity strip: visible while no tokens and no rows */}
       {pendingRun !== null && !isDone && content === '' && !hasStructured && (
-        <AgentActivityStrip phase={pendingRun.phase} />
+        <AgentActivityStrip phase={pendingRun.phase} steps={pendingRun.stages} />
       )}
 
       {pendingRun?.phase === 'stopped' && (

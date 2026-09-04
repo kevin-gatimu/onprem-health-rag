@@ -6,7 +6,7 @@ export interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
   label?: string;
   hint?: string;
   error?: string;
-  options?: { value: string; label: string }[];
+  options?: { value: string; label: string; disabled?: boolean }[];
   children?: ReactNode;
 }
 
@@ -39,14 +39,19 @@ export default function Select({
             'transition-colors duration-150',
             'focus:border-accent focus:ring-2 focus:ring-accent/20 focus:outline-none',
             'disabled:opacity-50 disabled:cursor-not-allowed',
-            error && 'border-danger focus:border-danger focus:ring-danger/20',
+            error && 'border-danger focus:ring-danger/20',
             className,
           )}
           {...props}
         >
           {options
             ? options.map((o) => (
-                <option key={o.value} value={o.value}>
+                <option
+                  key={o.value}
+                  value={o.value}
+                  disabled={o.disabled}
+                  className="bg-surface text-fg disabled:text-fg-subtle"
+                >
                   {o.label}
                 </option>
               ))

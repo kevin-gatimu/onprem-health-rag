@@ -23,6 +23,11 @@ static EMBEDDER: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
 /// Serialises initialisation so two concurrent first-callers don't both download.
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 
+/// Whether the embedding model is resident in this server process.
+pub fn is_loaded() -> bool {
+    EMBEDDER.get().is_some()
+}
+
 /// Per-process LRU cache mapping normalised query text to its vector. 1 KiB of
 /// entries covers typical warm-session reuse; the mutex is held only briefly
 /// (clone the hit, release). Serialised writes are negligible vs. spawn_blocking.
@@ -68,6 +73,14 @@ fn get_or_init(model: EmbeddingModel) -> AppResult<&'static Mutex<TextEmbedding>
     EMBEDDER
         .get()
         .ok_or_else(|| AppError::Internal("embedder disappeared after init".into()))
+}
+
+/// Download the configured weights when needed and load the embedding model.
+pub async fn initialize(config: &Config) -> AppResult<()> {
+    let model = resolve_model(&config.embedding_model);
+    tokio::task::spawn_blocking(move || get_or_init(model).map(|_| ()))
+        .await
+        .map_err(|e| AppError::Internal(format!("embedding setup task panicked: {e}")))?
 }
 
 /// Embed a batch of texts, returning one vector per input (order preserved). Runs on

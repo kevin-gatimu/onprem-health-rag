@@ -61,5 +61,5 @@ above.
 ## Documentation
 
 - [`CLAUDE.md`](./CLAUDE.md) — contributor guidance and the architecture overview.
-- [`plans/`](./plans/) — numbered design notes (the project's "mind cache"); start at
-  [`plans/00-master-plan.md`](./plans/00-master-plan.md).
+- [`plans/docs/README.md`](./plans/docs/README.md) — authoritative current documentation and its
+  maintenance policy. Historical plans are preserved in [`plans/old/`](./plans/old/).

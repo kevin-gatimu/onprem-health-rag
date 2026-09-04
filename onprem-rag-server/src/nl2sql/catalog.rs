@@ -7,6 +7,8 @@ use crate::connectors::{SourceSpec, TableSchema, connector};
 use crate::documentdb::{DocumentDb, SCHEMA_CATALOG};
 use crate::embed::embed_documents;
 use crate::error::{AppError, AppResult};
+use crate::ontology::binder::BindingOverrides;
+use crate::state::BindingCache;
 use mongodb::bson::{Bson, DateTime as BsonDateTime, Document, doc};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -18,13 +20,18 @@ static REFRESHING_SOURCES: LazyLock<Mutex<HashSet<String>>> =
 
 /// Build or refresh schema cards for every table in a source. Replaces all cards
 /// for this source so removed or renamed tables cannot remain routing candidates.
+///
+/// `binding_cache` is the `AppState::bindings` handle; after a successful binding
+/// rebuild the new binding is inserted so the running server sees it immediately
+/// without a restart.
 pub async fn refresh_catalog(
     db: &DocumentDb,
     config: &Config,
     spec: &SourceSpec,
     source_id: &str,
+    binding_cache: &BindingCache,
 ) -> AppResult<usize> {
-    refresh_catalog_with_trigger(db, config, spec, source_id, "system").await
+    refresh_catalog_with_trigger(db, config, spec, source_id, "system", binding_cache).await
 }
 
 pub async fn refresh_catalog_with_trigger(
@@ -33,6 +40,7 @@ pub async fn refresh_catalog_with_trigger(
     spec: &SourceSpec,
     source_id: &str,
     trigger: &str,
+    binding_cache: &BindingCache,
 ) -> AppResult<usize> {
     {
         let mut refreshing = REFRESHING_SOURCES.lock().await;
@@ -45,7 +53,7 @@ pub async fn refresh_catalog_with_trigger(
 
     let started_at = BsonDateTime::now();
     let previous_hash = current_hash(db, source_id).await;
-    let result = refresh_catalog_inner(db, config, spec, source_id).await;
+    let result = refresh_catalog_inner(db, config, spec, source_id, binding_cache).await;
     let completed_at = BsonDateTime::now();
     match &result {
         Ok(count) => {
@@ -106,6 +114,7 @@ async fn refresh_catalog_inner(
     config: &Config,
     spec: &SourceSpec,
     source_id: &str,
+    binding_cache: &BindingCache,
 ) -> AppResult<usize> {
     let conn = connector(spec);
     let tables = conn.get_schema().await?;
@@ -231,8 +240,127 @@ async fn refresh_catalog_inner(
     }
 
     super::linker::invalidate_source(source_id);
+
+    // Non-fatal binding rebuild: persists the updated binding to DocumentDB AND
+    // updates the in-memory BindingCache so the running server sees it immediately
+    // (fixes the "write-only hook" defect — plan 07 agent tabs read from
+    // AppState::bindings, not from DocumentDB).
+    //
+    // Descriptor vectors stay None (degraded mode): re-embedding every concept
+    // for each catalog refresh would be expensive and is not needed for correctness.
+    // The binding is marked degraded: true to signal this.
+    //
+    // Overrides ARE applied: they are read from the persisted `schema_metadata_overrides`
+    // document so an admin's concept or role override survives every catalog refresh.
+    if config.binding_enabled {
+        let overrides = load_binding_overrides(db, source_id).await;
+        match crate::ontology::binder::build_binding(
+            &cards,
+            db,
+            config,
+            source_id,
+            None,
+            overrides.as_ref(),
+        )
+        .await
+        {
+            Ok(binding) => {
+                let tables_count = binding.tables.len();
+                crate::ontology::store::save_binding_nonfatal(db, &binding).await;
+                let arc = Arc::new(binding);
+                match binding_cache.write() {
+                    Ok(mut w) => {
+                        w.insert(source_id.to_string(), arc);
+                        tracing::info!(
+                            source_id,
+                            tables = tables_count,
+                            "schema binding rebuilt, persisted, and cached after catalog refresh (degraded)"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            source_id,
+                            "binding cache lock poisoned; binding persisted to DB but not cached"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    source_id,
+                    error = %e,
+                    "non-fatal: schema binding rebuild failed after catalog refresh"
+                );
+            }
+        }
+    }
+
     tracing::info!(source_id, count, %version, %schema_hash, "schema catalog refreshed");
     Ok(count)
+}
+
+/// Read persisted `MetadataOverrides` for a source and convert them into the
+/// `BindingOverrides` format understood by the binder.
+///
+/// Returns `None` if no overrides document exists, the DB query fails, or the
+/// document cannot be deserialized — all treated as "no overrides" so the hook
+/// remains non-fatal.
+async fn load_binding_overrides(db: &DocumentDb, source_id: &str) -> Option<BindingOverrides> {
+    use crate::ontology::concepts::EntityConcept;
+    use crate::ontology::roles::ColumnRole;
+    use std::collections::HashMap;
+
+    let doc = db
+        .schema_metadata_overrides()
+        .find_one(mongodb::bson::doc! { "_id": source_id })
+        .await
+        .ok()??; // None on error or missing doc — non-fatal
+
+    // Deserialize the stored MetadataOverrides.  We read the raw document here
+    // to avoid a circular import between catalog.rs and nl2sql/routes.rs.
+    let table_concepts_arr = doc
+        .get_array("table_concepts")
+        .ok()
+        .cloned()
+        .unwrap_or_default();
+    let column_roles_arr = doc
+        .get_array("column_roles")
+        .ok()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut table_concepts: HashMap<String, Option<EntityConcept>> = HashMap::new();
+    for item in table_concepts_arr.iter().filter_map(|b| b.as_document()) {
+        let table = item.get_str("table").ok()?.to_string();
+        let concept = item
+            .get_str("concept")
+            .ok()
+            .and_then(EntityConcept::from_slug);
+        table_concepts.insert(table, concept);
+    }
+
+    let mut column_roles: HashMap<String, HashMap<String, ColumnRole>> = HashMap::new();
+    for item in column_roles_arr.iter().filter_map(|b| b.as_document()) {
+        let table = item.get_str("table").ok()?.to_string();
+        let column = item.get_str("column").ok()?.to_string();
+        let role = item
+            .get_str("role")
+            .ok()
+            .and_then(ColumnRole::from_slug)?;
+        column_roles
+            .entry(table)
+            .or_default()
+            .insert(column, role);
+    }
+
+    if table_concepts.is_empty() && column_roles.is_empty() {
+        return None;
+    }
+
+    Some(BindingOverrides {
+        table_concepts,
+        column_roles,
+    })
 }
 
 /// Stable structure-only hash used by the drift poller. Data growth and profile
@@ -270,6 +398,7 @@ pub async fn poll_source_for_drift(
     config: &Config,
     spec: &SourceSpec,
     source_id: &str,
+    binding_cache: &BindingCache,
 ) -> AppResult<bool> {
     if REFRESHING_SOURCES.lock().await.contains(source_id) {
         return Ok(false);
@@ -294,7 +423,7 @@ pub async fn poll_source_for_drift(
         .await?;
 
     if changed {
-        refresh_catalog_with_trigger(db, config, spec, source_id, "poll").await?;
+        refresh_catalog_with_trigger(db, config, spec, source_id, "poll", binding_cache).await?;
     } else {
         record_history(
             db,
@@ -313,7 +442,7 @@ pub async fn poll_source_for_drift(
     Ok(changed)
 }
 
-pub fn spawn_schema_poller(db: DocumentDb, config: Config) {
+pub fn spawn_schema_poller(db: DocumentDb, config: Config, binding_cache: BindingCache) {
     if config.schema_poll_interval_secs == 0 {
         return;
     }
@@ -338,6 +467,7 @@ pub fn spawn_schema_poller(db: DocumentDb, config: Config) {
                 let db = db.clone();
                 let config = config.clone();
                 let semaphore = semaphore.clone();
+                let binding_cache = binding_cache.clone();
                 tasks.push(tokio::spawn(async move {
                     let Ok(_permit) = semaphore.acquire_owned().await else {
                         return;
@@ -345,7 +475,7 @@ pub fn spawn_schema_poller(db: DocumentDb, config: Config) {
                     let result = async {
                         let spec =
                             crate::connectors::routes::load_spec(&db, &config, &source_id).await?;
-                        poll_source_for_drift(&db, &config, &spec, &source_id).await
+                        poll_source_for_drift(&db, &config, &spec, &source_id, &binding_cache).await
                     }
                     .await;
                     if let Err(error) = result {
@@ -637,6 +767,51 @@ mod tests {
         assert_eq!(created.min.as_deref(), Some("2023-12-01"));
         assert_eq!(created.max.as_deref(), Some("2024-02-01"));
     }
+
+    /// Verify the cache-insert path: inserting a binding for a source replaces any
+    /// previous entry and is immediately readable from the same Arc.
+    ///
+    /// Coverage note: this test covers the in-memory insert logic used by
+    /// `refresh_catalog_inner`.  The end-to-end path
+    /// (DB refresh → binding build → `save_binding_nonfatal` → cache insert →
+    /// `GET /agents` sees updated tabs) depends on a live DocumentDB and is NOT
+    /// tested here — it is covered by construction and the integration smoke test
+    /// run against a dev deployment.
+    #[test]
+    fn binding_cache_insert_replaces_previous_entry() {
+        use super::BindingCache;
+        use crate::ontology::binding::SchemaBinding;
+        use std::collections::HashMap;
+        use std::sync::{Arc, RwLock};
+
+        let cache: BindingCache = Arc::new(RwLock::new(HashMap::new()));
+        let source_id = "test-source";
+
+        let b1 = SchemaBinding {
+            source_id: source_id.to_string(),
+            bound_at: chrono::Utc::now(),
+            tables: vec![],
+            degraded: true,
+            override_version: 0,
+        };
+        let b2 = SchemaBinding {
+            source_id: source_id.to_string(),
+            bound_at: chrono::Utc::now(),
+            tables: vec![],
+            degraded: true,
+            override_version: 1,
+        };
+
+        cache.write().unwrap().insert(source_id.to_string(), Arc::new(b1));
+        assert_eq!(cache.read().unwrap().get(source_id).unwrap().override_version, 0);
+
+        cache.write().unwrap().insert(source_id.to_string(), Arc::new(b2));
+        assert_eq!(
+            cache.read().unwrap().get(source_id).unwrap().override_version,
+            1,
+            "cache must hold the latest binding after replacement"
+        );
+    }
 }
 
 /// Render a card to a BSON Document. The card_vector (Vec<f32>) serializes as
@@ -760,3 +935,46 @@ fn extract_samples(
     }
     out
 }
+
+/// Load all `TableCard`s for the active catalog version of a source.
+///
+/// Returns an empty `Vec` if no catalog has been built yet.
+pub async fn get_catalog_cards(
+    db: &crate::documentdb::DocumentDb,
+    config: &crate::config::Config,
+    source_id: &str,
+) -> crate::error::AppResult<Vec<super::spec::TableCard>> {
+    use futures::TryStreamExt;
+    // Resolve the active catalog version for this source
+    let state_doc = db
+        .schema_catalog_state()
+        .find_one(doc! { "_id": source_id })
+        .await
+        .map_err(|e| crate::error::AppError::Internal(format!("catalog state lookup: {e}")))?;
+    let Some(state) = state_doc else {
+        return Ok(vec![]);
+    };
+    let version = match state.get_str("active_version") {
+        Ok(v) => v.to_string(),
+        Err(_) => return Ok(vec![]),
+    };
+
+    let mut cursor = db
+        .schema_catalog()
+        .find(doc! { "source_id": source_id, "catalog_version": &version })
+        .await
+        .map_err(|e| crate::error::AppError::Internal(format!("catalog find: {e}")))?;
+
+    let mut cards = Vec::new();
+    while let Some(raw) = cursor
+        .try_next()
+        .await
+        .map_err(|e| crate::error::AppError::Internal(format!("catalog cursor: {e}")))?
+    {
+        if let Ok(card) = super::linker::doc_to_card(raw) {
+            cards.push(card);
+        }
+    }
+    Ok(cards)
+}
+

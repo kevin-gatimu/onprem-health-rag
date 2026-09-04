@@ -219,10 +219,10 @@ export default function Agents() {
       </div>
 
       {/* Main layout: single column (mobile) → two column (md+) → three column (xl+) */}
-      <div className={`flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] ${panelOpen ? 'xl:grid-cols-[260px_minmax(0,1fr)_220px]' : ''} rounded-lg border border-border overflow-hidden`}>
+      <div className={`flex-1 min-h-0 flex flex-col md:grid md:grid-cols-[260px_minmax(0,1fr)] md:grid-rows-[minmax(0,1fr)] ${panelOpen ? 'xl:grid-cols-[260px_minmax(0,1fr)_220px]' : ''} rounded-lg border border-border overflow-hidden`}>
 
         {/* Left rail — desktop only; conversation list */}
-        <aside className="hidden md:flex md:flex-col border-r border-border bg-surface">
+        <aside className="hidden md:flex md:flex-col min-h-0 overflow-hidden border-r border-border bg-surface">
           <div className="flex items-center gap-2 px-3 py-2.5 border-b border-border text-xs font-semibold text-fg-muted uppercase tracking-wide flex-shrink-0">
             <Layers size={13} aria-hidden="true" />
             Conversations
@@ -241,7 +241,7 @@ export default function Agents() {
         </aside>
 
         {/* Right pane: message list + composer */}
-        <div className="flex-1 min-h-0 flex flex-col bg-base">
+        <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-base">
           <MessageList
             persisted={messages}
             runs={runs}
@@ -265,7 +265,7 @@ export default function Agents() {
         </div>
 
         {/* Context panel — xl+ third column; hidden on smaller screens */}
-        {panelOpen && <aside id="agent-data-overview" className="hidden xl:flex xl:flex-col border-l border-border bg-surface overflow-y-auto p-3 gap-3">
+        {panelOpen && <aside id="agent-data-overview" className="hidden xl:flex xl:flex-col min-h-0 border-l border-border bg-surface overflow-y-auto p-3 gap-3">
           <h3 className="text-xs font-semibold text-fg-muted uppercase tracking-wide flex items-center gap-1.5 flex-shrink-0">
             <Bot size={12} aria-hidden="true" />
             Data Overview

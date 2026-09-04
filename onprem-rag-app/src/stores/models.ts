@@ -1,14 +1,14 @@
 // Model download store — per-variant download progress that survives navigation.
 //
-// State lives here (not in VariantCard) so leaving Models mid-download and coming
-// back shows the live progress bar rather than nothing. The boot-time listeners in
-// bridgeEvents.ts fan `model://progress|status` events into `applyProgress` /
-// `applyStatus` keyed by variant id; `startDownload` owns the whole lifecycle
-// (invoke → toast → query invalidation) so completion is handled even when the
-// Models screen is unmounted. Keyed entries also mean two concurrent downloads
-// can't cross-wire each other's bars.
+// State lives here (not in VariantCard/SharedLlmCard) so leaving Models mid-download
+// and coming back shows the live progress bar rather than nothing. The boot-time
+// listeners in bridgeEvents.ts fan `model://progress|status` events into
+// `applyProgress` / `applyStatus` keyed by variant id; `startDownload`, `startLoad`,
+// and `applyShared` each own their whole lifecycle (invoke → toast → query
+// invalidation) so completion is handled even when the Models screen is unmounted.
+// Keyed entries also mean two concurrent downloads can't cross-wire each other's bars.
 import { create } from 'zustand';
-import { pullModel, selectModel } from '../lib/bridge';
+import { pullModel, selectModel, setSharedModel } from '../lib/bridge';
 import { notifyBackground } from '../lib/notify';
 import { queryClient } from '../lib/queryClient';
 import { toast } from './ui';
@@ -38,6 +38,13 @@ interface ModelsState {
   /** Load a variant (select → download-if-needed → load → set current). No-op
    *  while ANY load is in flight, mirroring the server-side load gate. */
   startLoad: (variantId: string) => Promise<void>;
+  /**
+   * Apply a variant as the shared Core LLM (download/load if needed, then route
+   * every generative role to it). Owns the whole lifecycle — same pattern as
+   * `startDownload`/`startLoad` — so it finishes even if SharedLlmCard unmounts.
+   * No-op if this variant is already downloading or ANY load is in flight.
+   */
+  applyShared: (variantId: string, cached: boolean) => Promise<void>;
 }
 
 export const useModels = create<ModelsState>((set, get) => ({
@@ -102,4 +109,38 @@ export const useModels = create<ModelsState>((set, get) => ({
       queryClient.invalidateQueries({ queryKey: ['setup-status'] });
     }
   },
+
+  applyShared: async (variantId, cached) => {
+    if (get().downloads[variantId] || get().loadingId) return; // already busy
+    if (!cached) {
+      // Only seed a progress entry for the not-cached path — pullModel streams
+      // download progress; the cached path goes straight to the load phase below.
+      set((s) => ({
+        downloads: { ...s.downloads, [variantId]: { pct: 0, status: 'starting…' } },
+      }));
+    }
+    set({ loadingId: variantId });
+    try {
+      if (!cached) {
+        // load:true → download + load + set current in one call, with progress.
+        await pullModel(variantId, true);
+      } else {
+        await selectModel(variantId);
+      }
+      await setSharedModel(variantId);
+      toast.success(`${variantId} now powers all generative roles.`);
+      void notifyBackground('Core LLM applied', `${variantId} now powers all generative roles.`);
+    } catch (err) {
+      toast.error(String(err));
+      void notifyBackground('Core LLM apply failed', `${variantId}: ${String(err)}`);
+    } finally {
+      set((s) => {
+        const { [variantId]: _, ...rest } = s.downloads;
+        return { downloads: rest, loadingId: null };
+      });
+      queryClient.invalidateQueries({ queryKey: ['model-roles'] });
+      queryClient.invalidateQueries({ queryKey: ['setup-status'] });
+    }
+  },
 }));
+

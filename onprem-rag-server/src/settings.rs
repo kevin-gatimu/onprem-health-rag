@@ -57,6 +57,31 @@ pub async fn set_router_override(
     Ok(())
 }
 
+/// Atomically apply one model override to a group of roles.
+pub async fn set_router_overrides(
+    db: &DocumentDb,
+    roles: &[&str],
+    variant_id: Option<&str>,
+    updated_by: &str,
+) -> AppResult<()> {
+    let mut values = doc! {};
+    for role in roles {
+        values.insert(format!("router_overrides.{role}"), variant_id.unwrap_or(""));
+    }
+    let metadata = doc! { "updated_at": DateTime::now(), "updated_by": updated_by };
+    let update = if variant_id.is_some() {
+        values.extend(metadata);
+        doc! { "$set": values }
+    } else {
+        doc! { "$unset": values, "$set": metadata }
+    };
+    db.settings()
+        .update_one(doc! { "_id": SETTINGS_DOC_ID }, update)
+        .upsert(true)
+        .await?;
+    Ok(())
+}
+
 /// Clear every role override that points at `variant_id`, returning the roles cleared.
 ///
 /// Called when a variant's weights are deleted from the Foundry cache: an override left

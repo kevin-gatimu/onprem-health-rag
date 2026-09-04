@@ -1,5 +1,7 @@
 # LLM selection & task-aware routing
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Models, Accelerators, and Lifecycle](models-accelerators-and-lifecycle.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > How we pick local chat LLMs for each kind of question the app supports, and how the server
 > routes a request to the right model + generation mode. Design note started 2026-08-23.
 > Companion to `plans/05-accelerator-detection.md` (EP/hardware),

@@ -1,6 +1,7 @@
 // Chat store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { Passage, RetrievalOpts, SqlResult, VerifyReport } from '../lib/bridge';
+import type { Passage, RetrievalOpts, SqlResult, StageEvent, VerifyReport } from '../lib/bridge';
+import { applyStageEvent, type StageStep } from './stages';
 
 export type ChatPhase = 'searching' | 'generating' | 'done' | 'stopped';
 
@@ -17,6 +18,8 @@ export interface PendingRun {
   verify: VerifyReport | null;
   error: string | null;
   phase: ChatPhase;
+  /** Pipeline steps the server reported for this run, oldest first. */
+  stages: StageStep[];
   startedAt: number;
 }
 
@@ -42,6 +45,7 @@ interface ChatState {
   setSqlColumns(runId: string, columns: string[]): void;
   setSqlRows(runId: string, rows: unknown[][]): void;
   setVerify(runId: string, report: VerifyReport): void;
+  pushStage(runId: string, event: StageEvent): void;
   setError(runId: string, message: string): void;
   markStopped(runId: string): void;
   finish(runId: string): void;
@@ -80,6 +84,7 @@ export const useChat = create<ChatState>((set, get) => ({
           verify: null,
           error: null,
           phase: 'searching',
+          stages: [],
           startedAt: Date.now(),
         },
       },
@@ -139,6 +144,17 @@ export const useChat = create<ChatState>((set, get) => ({
     if (!get().runs[runId]) return;
     set((state) => ({
       runs: { ...state.runs, [runId]: { ...state.runs[runId], verify } },
+    }));
+  },
+
+  pushStage(runId, event) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], stages: applyStageEvent(state.runs[runId].stages, event) },
+      },
     }));
   },
 

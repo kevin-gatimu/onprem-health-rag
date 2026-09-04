@@ -34,8 +34,9 @@ services:
   # ---------------------------------------------------------------------------
   # Optional: a sample PostgreSQL "source" database with fake health records,
   # so ingestion can be exercised end-to-end without a real hospital system.
-  # Loads a normalized synthetic EMR (~25 tables: patients, encounters,
-  # diagnoses, prescriptions, labs, imaging, admissions, billing) from
+  # Loads a normalized synthetic hospital EMR (64 tables: organisation, staffing,
+  # scheduling, clinical, maternity, pharmacy stock, blood bank, safety and
+  # governance, operations, revenue) from
   # docker/dev-postgres/init/ (01_schema.sql then 02_seed.sql, in name order).
   # Enable with:  docker compose --profile dev-sources up -d
   # Init scripts run only on a fresh data dir. To reload after a change, reset

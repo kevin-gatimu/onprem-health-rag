@@ -19,6 +19,8 @@ mod ingest;
 mod logstream;
 mod memory;
 mod nl2sql;
+mod ontology;
+mod progress;
 mod rag;
 mod retrieval;
 mod router;
@@ -150,8 +152,9 @@ async fn rocket() -> _ {
         let wc = config.clone();
         let warmup_state = app_state.warmup_handle();
         let foundry = app_state.foundry_handle();
-        let sql_spec = app_state.spec_for(crate::foundry::router::AgentKind::TextToSql);
-        let warm_sql = config.router.text2sql_enabled;
+        // Warm the shared Core LLM (all generative roles resolve to it) so the first
+        // request doesn't pay the load + EP graph-setup cost.
+        let core_spec = app_state.spec_for(crate::foundry::router::AgentKind::Chat);
         tokio::spawn(async move {
             let local_models = async {
                 let embed_ok = crate::embed::embed_query(&wc, "warmup")
@@ -170,7 +173,7 @@ async fn rocket() -> _ {
                 .is_ok();
                 embed_ok && rerank_ok
             };
-            let sql_model = async {
+            let core_model = async {
                 let Some(foundry) = foundry else {
                     return true;
                 };
@@ -178,18 +181,15 @@ async fn rocket() -> _ {
                     tracing::warn!(%error, "startup: execution-provider registration failed");
                     return false;
                 }
-                if !warm_sql {
-                    return true;
-                }
                 foundry
-                    .warm_cached_model(&sql_spec)
+                    .warm_cached_model(&core_spec)
                     .await
-                    .inspect_err(|error| tracing::warn!(%error, "warmup: SQL model preload failed"))
+                    .inspect_err(|error| tracing::warn!(%error, "warmup: core LLM preload failed"))
                     .is_ok()
             };
-            let (local_ok, sql_ok) = tokio::join!(local_models, sql_model);
+            let (local_ok, core_ok) = tokio::join!(local_models, core_model);
             warmup_state.store(
-                if local_ok && sql_ok { 1 } else { 3 },
+                if local_ok && core_ok { 1 } else { 3 },
                 std::sync::atomic::Ordering::Relaxed,
             );
         });
@@ -200,7 +200,26 @@ async fn rocket() -> _ {
     // Conversation retention sweep (plan 22.7): boot-time + daily, no-op when
     // ONPREM_CONVERSATION_RETENTION_DAYS=0 (default: keep forever).
     memory::spawn_retention_sweep(db.clone(), config.clone());
-    nl2sql::catalog::spawn_schema_poller(db.clone(), config.clone());
+    nl2sql::catalog::spawn_schema_poller(db.clone(), config.clone(), app_state.binding_cache());
+
+    // Load persisted schema bindings into AppState (non-fatal — schema binding
+    // is optional; server boots normally if bindings have never been built).
+    if config.binding_enabled {
+        match ontology::store::load_all_bindings(&db).await {
+            Ok(all) => {
+                tracing::info!("loaded {} schema binding(s) from storage", all.len());
+                app_state.set_all_bindings(all);
+            }
+            Err(e) => tracing::warn!("failed to load schema bindings: {e}"),
+        }
+        // Ensure indexes for the new binding collections (idempotent)
+        let db2 = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ontology::store::ensure_binding_indexes(&db2).await {
+                tracing::warn!("failed to create binding indexes: {e}");
+            }
+        });
+    }
 
     // Bind address/port come from our config rather than Rocket.toml.
     let figment = rocket::Config::figment()
@@ -244,8 +263,10 @@ async fn rocket() -> _ {
                 foundry::routes::select_model,
                 foundry::routes::generate,
                 foundry::routes::model_roles,
+                foundry::routes::load_specialized_model,
                 foundry::routes::pull_model,
                 foundry::routes::set_router,
+                foundry::routes::set_shared_router,
                 foundry::routes::delete_model,
                 foundry::routes::unload_model,
                 foundry::routes::setup_status,
@@ -307,7 +328,17 @@ async fn rocket() -> _ {
                 routes::conversations::rename_conversation,
                 routes::conversations::delete_conversation,
                 routes::conversations::list_messages,
+                routes::progress::run_progress,
             ],
         )
         .mount("/", rocket::routes![agents::routes::agent])
+        .mount(
+            "/",
+            rocket::routes![
+                ontology::routes::list_agents,
+                ontology::routes::get_binding,
+                ontology::routes::rebuild_binding,
+                ontology::routes::get_binding_history,
+            ],
+        )
 }

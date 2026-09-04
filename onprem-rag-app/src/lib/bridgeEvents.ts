@@ -9,7 +9,7 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type VerifyReport } from "./bridge";
+import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type StageEvent, type VerifyReport } from "./bridge";
 import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
 import { notifyBackground } from "./notify";
@@ -205,6 +205,20 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // Live pipeline steps, relayed from the server's per-run progress stream. These
+  // arrive *while* the server is still working — before any citations or tokens —
+  // which is the whole point: the strip shows the actual step instead of a spinner.
+  unlisteners.push(
+    await listen<ChatEvent>("chat://stage", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().pushStage(run_id, JSON.parse(data) as StageEvent);
+      } catch {
+        /* ignore malformed stage payload — the answer is unaffected */
+      }
+    }),
+  );
+
   unlisteners.push(
     await listen<ChatEvent>("chat://error", (ev) => {
       const { run_id, data } = ev.payload;
@@ -289,6 +303,18 @@ export async function initBridgeEvents(): Promise<void> {
         useAgents.getState().setCitations(run_id, JSON.parse(data) as Passage[]);
       } catch {
         /* ignore malformed citations payload */
+      }
+    }),
+  );
+
+  // Live pipeline steps for agent runs; see the chat://stage listener above.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://stage", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().pushStage(run_id, JSON.parse(data) as StageEvent);
+      } catch {
+        /* ignore malformed stage payload */
       }
     }),
   );

@@ -1,5 +1,7 @@
 # Security & Auth Architecture
 
+> **Superseded.** This file is retained for link/history stability. The authoritative replacement is [Security, Auth, and Audit](security-auth-and-audit.md). Do not treat the statuses, defaults, or diagrams below as current.
+
 > How authentication, authorization, session lifecycle, and data protection work in the on-premises
 > health-records RAG system — as **currently implemented**, with a clearly marked list of what is still
 > planned. This is the engineer-facing companion to the design note `plans/16-security-hardening.md`

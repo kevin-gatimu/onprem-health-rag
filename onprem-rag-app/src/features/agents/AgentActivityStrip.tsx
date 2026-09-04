@@ -1,11 +1,15 @@
-// Client-derived activity indicator for agent runs. The server emits a `routed`
-// event that advances the phase; the UI maps phase → a human-readable label.
-// Mirror of chat/ActivityStrip.tsx with agent-specific phase labels.
-import { Loader2 } from 'lucide-react';
+// Activity indicator for an agent run.
+//
+// Renders the pipeline steps the server reports over `agent://stage`; the
+// phase-derived labels are the fallback until the first step arrives. Mirror of
+// chat/ActivityStrip.tsx with agent-specific fallback wording.
+import PipelineTrace from '../../components/PipelineTrace';
 import type { AgentPhase } from '../../stores/agents';
+import type { StageStep } from '../../stores/stages';
 
 interface AgentActivityStripProps {
   phase: AgentPhase;
+  steps: StageStep[];
 }
 
 const PHASE_LABELS: Partial<Record<AgentPhase, string>> = {
@@ -16,15 +20,11 @@ const PHASE_LABELS: Partial<Record<AgentPhase, string>> = {
   generating: 'Writing answer…',
 };
 
-export default function AgentActivityStrip({ phase }: AgentActivityStripProps) {
-  const label = PHASE_LABELS[phase];
-  // 'done' has no label — render nothing once the run is complete.
-  if (!label) return null;
+export default function AgentActivityStrip({ phase, steps }: AgentActivityStripProps) {
+  const fallback = PHASE_LABELS[phase];
+  // 'done' has no label — render nothing once the run is complete, unless the
+  // server is still reporting steps we haven't shown.
+  if (!fallback && steps.length === 0) return null;
 
-  return (
-    <div className="flex items-center gap-2 text-xs text-fg-subtle py-1">
-      <Loader2 size={12} className="animate-spin flex-shrink-0" aria-hidden="true" />
-      <span>{label}</span>
-    </div>
-  );
+  return <PipelineTrace steps={steps} fallbackLabel={fallback ?? 'Working…'} />;
 }

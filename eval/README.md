@@ -2,6 +2,11 @@
 
 The judge-free smoke runner measures router accuracy and retrieval hit-rate/MRR against the synthetic PostgreSQL seed. It sends data only to the local on-premises server.
 
+Final Auto answers are evaluated with the database-grounded manual/E2E procedure in
+[`AUTO_BENCHMARK.md`](AUTO_BENCHMARK.md). It covers exact lists, aggregates, joins, ties,
+conversation follow-ups, UI rendering, and remediation guidance that the smoke runner does not yet
+measure.
+
 ## Prerequisites
 
 1. Start DocumentDB and the seeded development PostgreSQL source.
