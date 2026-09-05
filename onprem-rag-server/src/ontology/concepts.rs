@@ -341,7 +341,7 @@ pub static DESCRIPTORS: &[ConceptDescriptor] = &[
     },
     ConceptDescriptor {
         concept: EntityConcept::Department,
-        name_tokens: &["department", "dept", "unit", "section", "service", "division"],
+        name_tokens: &["department", "dept", "unit", "service", "division"],
         column_tokens: &["code", "dept_type", "name", "floor", "cost_centre", "is_active"],
         required_roles: &[ColumnRole::PrimaryKey, ColumnRole::Code],
         description: "A hospital department, unit, or organisational section.",
@@ -361,7 +361,7 @@ pub static DESCRIPTORS: &[ConceptDescriptor] = &[
     },
     ConceptDescriptor {
         concept: EntityConcept::Geography,
-        name_tokens: &["county", "region", "province", "district", "area", "zone", "location", "address"],
+        name_tokens: &["county", "region", "province", "district", "zone", "location", "address"],
         column_tokens: &["name", "region", "code", "county"],
         required_roles: &[ColumnRole::PrimaryKey, ColumnRole::Description],
         description: "Geographic reference: county, region, district or area used for catchment analysis.",
@@ -501,7 +501,7 @@ pub static DESCRIPTORS: &[ConceptDescriptor] = &[
     },
     ConceptDescriptor {
         concept: EntityConcept::Insurer,
-        name_tokens: &["insurer", "insurance_provider", "payer", "nhif", "shif", "scheme", "fund"],
+        name_tokens: &["insurer", "insurance_provider", "payer", "nhif", "scheme", "fund"],
         column_tokens: &["name", "code", "scheme_type", "contact", "is_active", "claims_email"],
         required_roles: &[ColumnRole::PrimaryKey, ColumnRole::Description],
         description: "An insurance company, health fund, or payer that covers patient costs.",
@@ -617,7 +617,7 @@ pub static DESCRIPTORS: &[ConceptDescriptor] = &[
         description: "A newborn baby record linked to the mother's delivery.",
         singular: "newborn",
         plural: "newborns",
-        synonyms: &["baby", "neonate", "infant"],
+        synonyms: &["baby", "babies", "neonate", "neonates", "infant", "infants"],
     },
     ConceptDescriptor {
         concept: EntityConcept::Surgery,
@@ -751,7 +751,10 @@ pub static DESCRIPTORS: &[ConceptDescriptor] = &[
     },
     ConceptDescriptor {
         concept: EntityConcept::LabResult,
-        name_tokens: &["lab_result", "laboratory_result", "test_result", "lab_res"],
+        // "result" is standard clinical shorthand for a laboratory result
+        // (e.g. "any abnormal results?"); included as a name_token so alt-schema
+        // tables with short names (LabRes) and bare "result" phrasing resolve.
+        name_tokens: &["lab_result", "laboratory_result", "test_result", "lab_res", "result"],
         column_tokens: &["order_id", "result_value", "result_date", "unit", "reference_range", "is_abnormal", "verified_by"],
         required_roles: &[ColumnRole::PatientRef, ColumnRole::EventTime],
         description: "A laboratory test result for a patient.",

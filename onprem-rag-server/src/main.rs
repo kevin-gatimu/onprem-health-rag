@@ -311,12 +311,12 @@ async fn rocket() -> _ {
                 rag::routes::route,
                 rag::routes::search,
                 rag::routes::chat,
-                nl2sql::routes::nl_query,
-                nl2sql::routes::catalog_status,
-                nl2sql::routes::catalog_refresh,
-                nl2sql::routes::catalog_history,
-                nl2sql::routes::catalog_overrides,
-                nl2sql::routes::save_catalog_overrides,
+                nl2sql::http::nl_query,
+                nl2sql::http::catalog_status,
+                nl2sql::http::catalog_refresh,
+                nl2sql::http::catalog_history,
+                nl2sql::http::catalog_overrides,
+                nl2sql::http::save_catalog_overrides,
             ],
         )
         .mount(

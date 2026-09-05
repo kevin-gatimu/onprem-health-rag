@@ -71,7 +71,12 @@ pub fn validate_sql(
         .collect();
     let mut denied = None;
     let _ = visit_relations(&*query, |relation| {
-        let name = relation.to_string().to_ascii_lowercase();
+        // Strip surrounding dialect-specific quote chars (`"…"`, `` `…` ``, `[…]`)
+        // so an IR-compiled quoted identifier still matches the unquoted allowed list.
+        let raw = relation.to_string();
+        let name = raw
+            .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+            .to_ascii_lowercase();
         if !allowed.contains(&name) && !ctes.contains(&name) {
             denied = Some(relation.to_string());
             return ControlFlow::Break(());
@@ -258,5 +263,99 @@ mod tests {
         )
         .expect_err("locking query must be rejected");
         assert!(error.to_string().contains("locking"));
+    }
+
+    // ── Dialect-quoted identifier tests (testing the trim_matches normalization) ──
+
+    #[test]
+    fn pg_double_quoted_allowed_table_passes() {
+        // The IR compiler emits double-quoted identifiers for PG dialect.
+        // validate_sql must accept them when the unquoted name is in allowed_tables.
+        validate_sql(
+            r#"SELECT COUNT(*) AS count FROM "encounters" LIMIT 500"#,
+            SourceKind::Postgres,
+            500,
+            &tables(&["encounters"]),
+        )
+        .expect("double-quoted allowed table must pass");
+    }
+
+    #[test]
+    fn mysql_backtick_quoted_allowed_table_passes() {
+        validate_sql(
+            "SELECT COUNT(*) AS count FROM `encounters` LIMIT 500",
+            SourceKind::Mysql,
+            500,
+            &tables(&["encounters"]),
+        )
+        .expect("backtick-quoted allowed table must pass");
+    }
+
+    #[test]
+    fn mssql_bracket_quoted_allowed_table_passes() {
+        validate_sql(
+            "SELECT COUNT(*) AS count FROM [encounters]",
+            SourceKind::Mssql,
+            500,
+            &tables(&["encounters"]),
+        )
+        .expect("bracket-quoted allowed table must pass");
+    }
+
+    #[test]
+    fn pg_double_quoted_disallowed_table_is_denied() {
+        // Even with dialect quoting, a table not in allowed_tables must be rejected.
+        let err = validate_sql(
+            r#"SELECT COUNT(*) AS count FROM "billing_items" LIMIT 500"#,
+            SourceKind::Postgres,
+            500,
+            &tables(&["encounters"]),  // billing_items not in allowed list
+        )
+        .expect_err("disallowed double-quoted table must be denied");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn mysql_backtick_disallowed_table_is_denied() {
+        let err = validate_sql(
+            "SELECT COUNT(*) AS count FROM `billing_items` LIMIT 500",
+            SourceKind::Mysql,
+            500,
+            &tables(&["encounters"]),
+        )
+        .expect_err("disallowed backtick-quoted table must be denied");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn mssql_bracket_disallowed_table_is_denied() {
+        let err = validate_sql(
+            "SELECT COUNT(*) AS count FROM [billing_items]",
+            SourceKind::Mssql,
+            500,
+            &tables(&["encounters"]),
+        )
+        .expect_err("disallowed bracket-quoted table must be denied");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn schema_qualified_table_is_denied_when_only_bare_table_allowed() {
+        // "schema"."table" — the trim_matches only strips outermost quote chars, so
+        // the inner `"."` remains and the result is not in the bare table allowed list.
+        // This is the safe-fail-closed behavior: a qualified name requires an exact
+        // match in allowed_tables (e.g. "public.encounters"), never falls back to the
+        // bare table name.
+        let result = validate_sql(
+            r#"SELECT 1 FROM "public"."encounters" LIMIT 1"#,
+            SourceKind::Postgres,
+            1,
+            &tables(&["encounters"]),  // "public.encounters" not listed — deny
+        );
+        // Expected: denied (schema qualification is not stripped).
+        assert!(
+            result.is_err(),
+            "schema-qualified table must be denied when only bare name is allowed"
+        );
     }
 }
