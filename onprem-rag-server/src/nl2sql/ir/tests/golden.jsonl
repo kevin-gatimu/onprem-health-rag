@@ -1,0 +1,124 @@
+{"id":"pc-01","question":"How many patients do we have?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-02","question":"Tell me about patient PT-2024-0001","binding":"dev","expect_shape":"Lookup","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-03","question":"What is this patient allergic to?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-04","question":"Who has accessed this record?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-05","question":"How many new patients were registered this month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-01","question":"What is our no-show rate?","binding":"dev","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-02","question":"Which referrals are still pending?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-03","question":"How many appointments are booked this week?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-04","question":"How many appointments were missed last month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-01","question":"How many beds are free?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-02","question":"Who is admitted right now?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-03","question":"Which patients have been in over 14 days?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-04","question":"What is the average length of stay?","binding":"dev","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-05","question":"How many admissions occurred last week?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"em-01","question":"How many patients arrived in the emergency last month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"em-02","question":"How many triage assessments were done today?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"em-03","question":"What is our average triage wait time?","binding":"dev","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-01","question":"How many deliveries were there last month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-02","question":"What is our stillbirth rate?","binding":"dev","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-03","question":"How many babies were low birth weight?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-04","question":"How many caesarean deliveries were there last quarter?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-05","question":"Who is due for an antenatal visit this week?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-06","question":"How many newborns were admitted last week?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-01","question":"How many surgeries were performed this month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-02","question":"How many operations were cancelled?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-03","question":"Which surgeries have no consent recorded?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-04","question":"What is our average surgery duration?","binding":"dev","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-01","question":"Which medicines are out of stock?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-02","question":"Which medications expire within 30 days?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-03","question":"How many prescriptions were issued last week?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-04","question":"How much medication was dispensed last month?","binding":"dev","expect_shape":"Sum","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-05","question":"Which prescriptions were refused last month?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-01","question":"Which lab results are critical and unreviewed?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-02","question":"How many lab tests were done today?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-03","question":"What is our average lab turnaround time?","binding":"dev","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-04","question":"Were there any abnormal results this week?","binding":"dev","expect_shape":"Exists","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-01","question":"What is outstanding by insurer?","binding":"dev","expect_shape":"TopNGrouped","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-02","question":"Which claims were rejected?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-03","question":"How much was collected in payments last month?","binding":"dev","expect_shape":"Sum","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-04","question":"What is our average bill by department?","binding":"dev","expect_shape":"TopNGrouped","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-05","question":"How many invoices were raised this month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-01","question":"How many incidents were reported this quarter?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-02","question":"What is our inpatient mortality rate?","binding":"dev","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-03","question":"Which deaths are pending certification?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-04","question":"Show me all record access logs today","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-05","question":"How many incidents happened this month?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-01","question":"Whose practising licence expires this quarter?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-02","question":"Who is on shift tonight?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-03","question":"Which doctor saw the most patients last month?","binding":"dev","expect_shape":"TopNByActor","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-04","question":"How many providers are on the roster?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-01","question":"How many patients are on TB treatment?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-02","question":"Which patients are enrolled in the HIV program?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-03","question":"Who is due for review this week?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-04","question":"How many patients have been enrolled in chronic care programs?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fac-01","question":"Which equipment is out of service?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fac-02","question":"What equipment is overdue for servicing?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fac-03","question":"How many pieces of equipment do we have?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-01","question":"How many encounters happened today?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-02","question":"List all active admissions","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-03","question":"How many patients have type 2 diabetes?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-04","question":"Which patients missed their last appointment?","binding":"dev","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-05","question":"How many wards do we have?","binding":"dev","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-01-alt","question":"How many patients do we have?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-01-alt","question":"What is our no-show rate?","binding":"alt","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-01-alt","question":"How many deliveries were there last month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-02-alt","question":"What is our stillbirth rate?","binding":"alt","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-01-alt","question":"Which lab results are critical and unreviewed?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-01-alt","question":"What is outstanding by insurer?","binding":"alt","expect_shape":"TopNGrouped","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-01-alt","question":"How many incidents were reported this quarter?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-01-alt","question":"Which medicines are out of stock?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-01-alt","question":"How many beds are free?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-01-alt","question":"Whose practising licence expires this quarter?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["License"]}
+{"id":"pc-02-alt","question":"Tell me about patient PT-2024-0001","binding":"alt","expect_shape":"Lookup","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-03-alt","question":"What is this patient allergic to?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-05-alt","question":"How many new patients were registered this month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-02-alt","question":"Which referrals are still pending?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Referral"]}
+{"id":"fd-03-alt","question":"How many appointments are booked this week?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"fd-04-alt","question":"How many appointments were missed last month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-02-alt","question":"Who is admitted right now?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-03-alt","question":"Which patients have been in over 14 days?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-04-alt","question":"What is the average length of stay?","binding":"alt","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wb-05-alt","question":"How many admissions occurred last week?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"em-01-alt","question":"How many patients arrived in the emergency last month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"em-02-alt","question":"How many triage assessments were done today?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Triage"]}
+{"id":"em-03-alt","question":"What is our average triage wait time?","binding":"alt","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Triage"]}
+{"id":"mat-03-alt","question":"How many babies were low birth weight?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-04-alt","question":"How many caesarean deliveries were there last quarter?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-05-alt","question":"Who is due for an antenatal visit this week?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"mat-06-alt","question":"How many newborns were admitted last week?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-01-alt","question":"How many surgeries were performed this month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Surgery"]}
+{"id":"th-02-alt","question":"How many operations were cancelled?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Surgery"]}
+{"id":"th-04-alt","question":"What is our average surgery duration?","binding":"alt","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Surgery"]}
+{"id":"ph-02-alt","question":"Which medications expire within 30 days?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-03-alt","question":"How many prescriptions were issued last week?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-04-alt","question":"How much medication was dispensed last month?","binding":"alt","expect_shape":"Sum","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-02-alt","question":"How many lab tests were done today?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"dx-03-alt","question":"What is our average lab turnaround time?","binding":"alt","expect_shape":"Avg","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-02-alt","question":"Which claims were rejected?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Claim"]}
+{"id":"rev-03-alt","question":"How much was collected in payments last month?","binding":"alt","expect_shape":"Sum","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-04-alt","question":"What is our average bill by department?","binding":"alt","expect_shape":"TopNGrouped","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"rev-05-alt","question":"How many invoices were raised this month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-02-alt","question":"What is our inpatient mortality rate?","binding":"alt","expect_shape":"Rate","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"qs-03-alt","question":"Which deaths are pending certification?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Mortality"]}
+{"id":"qs-04-alt","question":"Show me all record access logs today","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["AccessLog"]}
+{"id":"qs-05-alt","question":"How many incidents happened this month?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-02-alt","question":"Who is on shift tonight?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-03-alt","question":"Which doctor saw the most patients last month?","binding":"alt","expect_shape":"TopNByActor","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"wf-04-alt","question":"How many providers are on the roster?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-01-alt","question":"How many patients are on TB treatment?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-02-alt","question":"Which patients are enrolled in the HIV program?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-03-alt","question":"Who is due for review this week?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"cc-04-alt","question":"How many patients have been enrolled in chronic care programs?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-01-alt","question":"How many encounters happened today?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-02-alt","question":"List all active admissions","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-03-alt","question":"How many patients have type 2 diabetes?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-04-alt","question":"Which patients missed their last appointment?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"gen-05-alt","question":"How many wards do we have?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"th-03-alt","question":"Which surgeries have no consent recorded?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Surgery"]}
+{"id":"fac-01-alt","question":"Which equipment is out of service?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Equipment"]}
+{"id":"fac-02-alt","question":"What equipment is overdue for servicing?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Equipment"]}
+{"id":"fac-03-alt","question":"How many pieces of equipment do we have?","binding":"alt","expect_shape":"Count","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["Equipment"]}
+{"id":"dx-04-alt","question":"Were there any abnormal results this week?","binding":"alt","expect_shape":"Exists","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"ph-05-alt","question":"Which prescriptions were refused last month?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null}
+{"id":"pc-04-alt","question":"Who has accessed this record?","binding":"alt","expect_shape":"List","expect_sql_pg":null,"expect_sql_mysql":null,"expect_sql_mssql":null,"expect_missing":["AccessLog"]}

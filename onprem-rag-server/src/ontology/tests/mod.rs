@@ -51,7 +51,7 @@ fn load_fixture(json: &str) -> Fixture {
 /// Build a minimal TableCard from the dev-postgres schema structure.
 /// We only supply enough metadata for the binder to score correctly — the full
 /// schema is too large to inline; the key signals are the column names and FKs.
-fn dev_seed_cards() -> Vec<TableCard> {
+pub(crate) fn dev_seed_cards() -> Vec<TableCard> {
     // Helper closure
     let col = |name: &str, type_: &str, pk: bool, fk: bool| CardColumn {
         name: name.to_string(),
@@ -88,6 +88,8 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("county_id", "integer", false, true),
             col("phone", "varchar", false, false),
             col("national_id", "varchar", false, false),
+            col("registered_at", "timestamp", false, false),
+            col("patient_status", "varchar", false, false),
         ], vec![fk_edge("county_id", "counties", "id")]),
         card("counties", 47, vec![
             col("id", "serial", true, false),
@@ -172,6 +174,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("patient_id", "integer", false, true),
             col("provider_id", "integer", false, true),
             col("scheduled_time", "timestamp", false, false),
+            col("scheduled_at", "timestamp", false, false),
             col("appointment_status", "varchar", false, false),
             col("appointment_type", "varchar", false, false),
             col("department_id", "integer", false, true),
@@ -184,6 +187,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("referral_date", "date", false, false),
             col("status", "varchar", false, false),
             col("specialty", "varchar", false, false),
+            col("referral_closed_at", "timestamp", false, false),
         ], vec![fk_edge("patient_id", "patients", "id")]),
         card("insurers", 30, vec![
             col("id", "serial", true, false),
@@ -270,6 +274,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![fk_edge("patient_id", "patients", "id")]),
         card("patient_documents", 50000, vec![
             col("id", "serial", true, false),
+            col("doc_no", "varchar", false, false),
             col("patient_id", "integer", false, true),
             col("document_type", "varchar", false, false),
             col("file_name", "varchar", false, false),
@@ -278,6 +283,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![fk_edge("patient_id", "patients", "id")]),
         card("admissions", 30000, vec![
             col("id", "serial", true, false),
+            col("admission_no", "varchar", false, false),
             col("patient_id", "integer", false, true),
             col("ward_id", "integer", false, true),
             col("bed_id", "integer", false, true),
@@ -285,6 +291,9 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("discharge_date", "date", false, false),
             col("admission_type", "varchar", false, false),
             col("discharge_reason", "varchar", false, false),
+            col("length_of_stay_days", "integer", false, false),
+            col("total_charges", "numeric", false, false),
+            col("admission_status", "varchar", false, false),
         ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("ward_id", "wards", "id"), fk_edge("bed_id", "beds", "id")]),
         card("bed_assignments", 80000, vec![
             col("id", "serial", true, false),
@@ -349,6 +358,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("patient_id", "integer", false, true),
             col("delivered_at", "timestamp", false, false),
             col("delivery_mode", "varchar", false, false),
+            col("delivery_status", "varchar", false, false),
             col("gestation_weeks", "integer", false, false),
             col("blood_loss", "numeric", false, false),
             col("delivered_by", "integer", false, true),
@@ -364,6 +374,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![fk_edge("delivery_id", "deliveries", "id")]),
         card("surgeries", 5000, vec![
             col("id", "serial", true, false),
+            col("surgery_no", "varchar", false, false),
             col("patient_id", "integer", false, true),
             col("scheduled_start", "timestamp", false, false),
             col("theatre_no", "varchar", false, false),
@@ -400,6 +411,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![fk_edge("patient_id", "patients", "id")]),
         card("medications", 3000, vec![
             col("id", "serial", true, false),
+            col("medication_no", "varchar", false, false),
             col("generic_name", "varchar", false, false),
             col("brand_name", "varchar", false, false),
             col("drug_class", "varchar", false, false),
@@ -407,6 +419,9 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("form", "varchar", false, false),
             col("strength", "varchar", false, false),
             col("is_formulary", "boolean", false, false),
+            col("stock_status", "varchar", false, false),
+            col("expires_on", "date", false, false),
+            col("quantity_on_hand", "integer", false, false),
         ], vec![]),
         card("prescriptions", 200000, vec![
             col("id", "serial", true, false),
@@ -475,6 +490,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
             col("unit", "varchar", false, false),
             col("sample_type", "varchar", false, false),
             col("turnaround_hours", "integer", false, false),
+            col("ordered_at", "timestamp", false, false),
         ], vec![]),
         card("lab_orders", 300000, vec![
             col("id", "serial", true, false),
@@ -488,6 +504,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("test_id", "lab_tests", "id")]),
         card("lab_results", 280000, vec![
             col("id", "serial", true, false),
+            col("result_no", "varchar", false, false),
             col("order_id", "integer", false, true),
             col("patient_id", "integer", false, true),
             col("result_value", "varchar", false, false),
@@ -580,12 +597,15 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![]),
         card("mortality_records", 1000, vec![
             col("id", "serial", true, false),
+            col("death_no", "varchar", false, false),
             col("patient_id", "integer", false, true),
+            col("national_id", "varchar", false, false),
             col("date_of_death", "date", false, false),
             col("cause_of_death", "varchar", false, false),
             col("icd_cause", "varchar", false, false),
             col("certified_by", "integer", false, true),
             col("manner", "varchar", false, false),
+            col("completed_at", "date", false, false),
         ], vec![fk_edge("patient_id", "patients", "id")]),
         card("patient_feedback", 5000, vec![
             col("id", "serial", true, false),
@@ -650,6 +670,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
         ], vec![]),
         card("equipment", 500, vec![
             col("id", "serial", true, false),
+            col("equipment_no", "varchar", false, false),
             col("name", "varchar", false, false),
             col("category", "varchar", false, false),
             col("serial_no", "varchar", false, false),
@@ -676,7 +697,7 @@ fn dev_seed_cards() -> Vec<TableCard> {
 /// deliberately different from the dev-seed canonical names to prove the
 /// binder works via PascalCase splitting, abbreviation normalization, and
 /// containment scoring rather than simple exact-string matching.
-fn alt_schema_cards() -> Vec<TableCard> {
+pub(crate) fn alt_schema_cards() -> Vec<TableCard> {
     let col = |name: &str, type_: &str, pk: bool, fk: bool| CardColumn {
         name: name.to_string(),
         type_: type_.to_string(),
@@ -712,10 +733,13 @@ fn alt_schema_cards() -> Vec<TableCard> {
             col("dob", "date", false, false),
             col("gender", "varchar", false, false),
             col("phone", "varchar", false, false),
+            col("pat_status", "varchar", false, false),
+            col("registered_at", "datetime", false, false),
         ], vec![]),
 
         // ---- encounter / appointment ----
-        // "visit" is an exact name_token for Encounter
+        // "visit" is an exact name_token for Encounter.
+        // Plan 08 §1 twist: department linked via DeptCode FK (code, not id).
         card("Visit", 100000, vec![
             col("enc_id", "int", true, false),
             col("patient_id", "int", false, true),
@@ -724,7 +748,11 @@ fn alt_schema_cards() -> Vec<TableCard> {
             col("provider_id", "int", false, true),
             col("chief_complaint", "text", false, false),
             col("status", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "PatientMaster", "pat_id")]),
+            col("dept_code", "varchar", false, true),
+        ], vec![
+            fk_edge("patient_id", "PatientMaster", "pat_id"),
+            fk_edge("dept_code", "ClinDept", "dept_id"),
+        ]),
 
         // "booking" is an exact name_token for Appointment
         card("Booking", 30000, vec![
@@ -796,6 +824,9 @@ fn alt_schema_cards() -> Vec<TableCard> {
         // "IPD_Admission": split → ["ipd","admission"] → abbrev "ipd"→"inpatient"
         // → containment of desc_token "ipd" or "inpatient" against
         //   {"ipd","admission","inpatient"} = 1.0
+        // Plan 08 §1 twist: no LOS column — duration must be computed from
+        // admitted_at and discharge_date via dialect-specific date arithmetic.
+        // No total_charges column — billing resolves via Invoice.AmountUSD.
         card("IPD_Admission", 15000, vec![
             col("adm_id", "int", true, false),
             col("patient_id", "int", false, true),
@@ -805,6 +836,7 @@ fn alt_schema_cards() -> Vec<TableCard> {
             col("ward_id", "int", false, true),
             col("bed_id", "int", false, true),
             col("discharge_reason", "varchar", false, false),
+            col("adm_status", "varchar", false, false),
         ], vec![
             fk_edge("patient_id", "PatientMaster", "pat_id"),
             fk_edge("ward_id", "IPD_Ward", "ward_id"),
@@ -882,6 +914,9 @@ fn alt_schema_cards() -> Vec<TableCard> {
             col("drug_class", "varchar", false, false),
             col("form", "varchar", false, false),
             col("strength", "varchar", false, false),
+            col("stock_status", "varchar", false, false),
+            col("expires_on", "date", false, false),
+            col("qty_on_hand", "int", false, false),
         ], vec![]),
 
         // ---- lab ----
@@ -998,6 +1033,7 @@ fn alt_schema_cards() -> Vec<TableCard> {
             col("delivery_mode", "varchar", false, false),
             col("gestation_weeks", "int", false, false),
             col("blood_loss", "decimal", false, false),
+            col("delivery_status", "varchar", false, false),
         ], vec![fk_edge("patient_id", "PatientMaster", "pat_id")]),
 
         // "OB_Baby": exact name_token "ob_baby" for Newborn

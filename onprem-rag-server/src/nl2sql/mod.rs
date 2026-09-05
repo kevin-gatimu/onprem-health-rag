@@ -1,7 +1,11 @@
 pub mod catalog;
 pub mod execute;
 pub mod generate;
+pub mod http;
+pub mod ir;
 pub mod linker;
+pub mod prepare;
 pub mod routes;
 pub mod spec;
+pub mod text;
 pub mod validate;

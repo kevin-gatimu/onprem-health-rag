@@ -232,6 +232,13 @@ pub struct Config {
     pub binding_max_hops: usize,
     /// Enable automatic schema binding on catalog refresh.
     pub binding_enabled: bool,
+    /// Enable the QuerySpec IR.  `false` (default) = shadow mode only: parse →
+    /// bind → compile → validate but never execute the IR path, log one
+    /// `ir_shadow` line per question.  `true` = IR replaces the template engine.
+    pub sql_ir_enabled: bool,
+    /// SQL Server compatibility level (100=2008, 130=2016, 150=2019 etc.).
+    /// Controls DATEFROMPARTS vs DATEADD date arithmetic in the IR compiler.
+    pub mssql_compat_level: u16,
 }
 
 impl Config {
@@ -328,6 +335,9 @@ impl Config {
             binding_enum_max: env_parse("ONPREM_BINDING_ENUM_MAX", 25_usize),
             binding_max_hops: env_parse("ONPREM_BINDING_MAX_HOPS", 3_usize),
             binding_enabled: env_parse("ONPREM_BINDING_ENABLED", true),
+            // IR defaults to false (shadow mode only).
+            sql_ir_enabled: env_parse("ONPREM_SQL_IR_ENABLED", false),
+            mssql_compat_level: env_parse("ONPREM_MSSQL_COMPAT_LEVEL", 150_u16),
         }
     }
 

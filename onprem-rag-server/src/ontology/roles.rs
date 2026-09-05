@@ -242,7 +242,7 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
     // Temporal roles — domain names first (EventTime candidates)
     RoleTokens { role: ColumnRole::BirthDate, tokens: &["birth_date", "dob", "date_of_birth", "born_on", "birthdate"], type_class: Some(TypeClass::Temporal) },
     RoleTokens { role: ColumnRole::DeathDate, tokens: &["death_date", "died_on", "date_of_death", "dod", "deceased_at"], type_class: Some(TypeClass::Temporal) },
-    RoleTokens { role: ColumnRole::StartTime, tokens: &["scheduled_start", "actual_start", "starts_at", "start_time", "start_date", "admission_date", "admitted_at", "begin_at", "commenced_at"], type_class: Some(TypeClass::Temporal) },
+    RoleTokens { role: ColumnRole::StartTime, tokens: &["scheduled_start", "actual_start", "starts_at", "start_time", "scheduled_time", "start_date", "admission_date", "admitted_at", "begin_at", "commenced_at"], type_class: Some(TypeClass::Temporal) },
     RoleTokens { role: ColumnRole::EndTime, tokens: &["scheduled_end", "actual_end", "ends_at", "end_time", "end_date", "discharge_date", "discharged_at", "completed_at", "finish_at", "closed_at"], type_class: Some(TypeClass::Temporal) },
     // Domain EventTime candidates (preferred over created_at)
     RoleTokens { role: ColumnRole::EventTime, tokens: &[
@@ -267,6 +267,12 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
         "premium", "copay", "deductible", "reimburs",
     ], type_class: Some(TypeClass::Numeric) },
     RoleTokens { role: ColumnRole::Duration, tokens: &["minutes", "hours", "days", "duration", "los", "length_of_stay", "wait_time", "turnaround"], type_class: Some(TypeClass::Numeric) },
+    // Quantity role — stock / dispensed units (must precede Measure so "quantity_on_hand", "qty_*"
+    // aren't swallowed by the generic "quantity" token inside Measure).
+    RoleTokens { role: ColumnRole::Quantity, tokens: &[
+        "quantity_on_hand", "qty_on_hand", "stock_qty", "available_qty",
+        "units_dispensed", "qty_dispensed",
+    ], type_class: Some(TypeClass::Numeric) },
     RoleTokens { role: ColumnRole::Measure, tokens: &[
         "weight", "height", "bmi", "temperature", "pulse", "bp_", "spo2", "resp_rate",
         "volume", "count", "score", "grade", "level", "result_value", "quantity",
@@ -285,15 +291,20 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
         "delivery_mode", "onset", "urgency", "reason",
     ], type_class: Some(TypeClass::Text) },
     RoleTokens { role: ColumnRole::Category, tokens: &["category", "chapter", "group", "class"], type_class: Some(TypeClass::Text) },
-    // Codes
-    RoleTokens { role: ColumnRole::Code, tokens: &[
-        "icd", "atc_code", "procedure_code", "drug_code", "code", "_no", "_number",
-    ], type_class: None },
-    // Business IDs
+    // Business IDs — must precede Code so specific names like patient_no, rx_number
+    // are not swallowed by Code's broad "_no" / "_number" suffix tokens.
     RoleTokens { role: ColumnRole::BusinessId, tokens: &[
         "patient_no", "encounter_no", "rx_number", "claim_no", "bill_no", "unit_no",
         "employee_no", "batch_no", "license_no", "order_no", "ref_no",
-        "birth_notification_no",
+        "birth_notification_no", "admission_no", "equipment_no", "result_no",
+        "surgery_no", "medication_no", "doc_no", "death_no",
+        // MRN (Medical Record Number) is standard hospital patient-identifier
+        // vocabulary in clinical information systems; maps to BusinessId role.
+        "mrn",
+    ], type_class: None },
+    // Codes
+    RoleTokens { role: ColumnRole::Code, tokens: &[
+        "icd", "atc_code", "procedure_code", "drug_code", "code", "_no", "_number",
     ], type_class: None },
     // Name columns (PII)
     RoleTokens { role: ColumnRole::PersonFullName, tokens: &["full_name", "fullname", "name"], type_class: Some(TypeClass::Text) },

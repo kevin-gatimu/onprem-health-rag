@@ -10,7 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::ontology::concepts::EntityConcept;
+use crate::ontology::concepts::{EntityConcept, SHARED_CONCEPTS};
 use crate::ontology::roles::ColumnRole;
 use crate::ontology::service_line::ServiceLine;
 
@@ -115,13 +115,19 @@ impl SchemaBinding {
     fn line_is_usable(&self, line: ServiceLine) -> bool {
         // A line is usable if ≥1 of its *owned* concepts is bound at ≥0.55.
         // Shared concepts (Patient, Encounter, Provider, Department, DiagnosisCode)
-        // are not counted here — they are accessible by all lines but do not
-        // make a line independently usable by themselves.
-        line.concepts().iter().any(|&concept| {
-            self.tables
-                .iter()
-                .any(|t| t.concept == concept && t.confidence >= 0.55)
-        })
+        // are explicitly excluded: they are accessible by all service lines but
+        // do not make a line independently usable on their own.
+        // NOTE: ServiceLine::concepts() is NOT edited here; those lists correctly
+        // describe what each line may *read* (used by plan-05 linker scoping).
+        // Usability is a separate, stricter question over the same list.
+        line.concepts()
+            .iter()
+            .filter(|&&c| !SHARED_CONCEPTS.contains(&c))
+            .any(|&concept| {
+                self.tables
+                    .iter()
+                    .any(|t| t.concept == concept && t.confidence >= 0.55)
+            })
     }
 
     /// First table binding with the given concept, if any.
