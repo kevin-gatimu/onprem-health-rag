@@ -49,14 +49,10 @@ pub fn classify_lexical(question: &str) -> Option<QueryIntent> {
         return Some(QueryIntent::Enumeration);
     }
 
-    // Aggregation markers — plus a targeted word-boundary check for "rate" at
-    // end of sentence.  "What is our no-show rate?" ends with "rate?" (no space
-    // after) so the space-delimited marker `" rate "` does not match; stripping
-    // trailing punctuation and checking `ends_with(" rate")` handles this
-    // precisely without the false positive of broadening the substring to " rate"
-    // (which would also match " rated", " rates", " rateable", etc.).
-    let q_stripped = q.trim_end_matches(|c: char| matches!(c, '.' | '?' | '!' | ','));
-    if contains_any(&q, AGGREGATION_MARKERS) || q_stripped.ends_with(" rate") {
+    // Aggregation markers. `contains_any` now uses boundary-aware matching, so
+    // the `" rate "` marker fires even when "rate" is immediately followed by
+    // `?` or end-of-input. The old `ends_with(" rate")` special case is gone.
+    if contains_any(&q, AGGREGATION_MARKERS) {
         return Some(QueryIntent::Aggregation);
     }
 
@@ -81,6 +77,14 @@ pub fn classify_lexical(question: &str) -> Option<QueryIntent> {
         return Some(QueryIntent::Aggregation);
     }
 
+    // "What [verb] …?" — interrogative-pronoun-as-subject Enumeration, same
+    // grammatical pattern as "which "/"who is "/"whose " in ENUMERATION_MARKERS.
+    // Guard: copula/auxiliary after "what" routes to earlier checks (Aggregation
+    // or Narrative), so only plain predicates like "expires"/"arrived" reach here.
+    if what_verb_is_enumeration(&q) {
+        return Some(QueryIntent::Enumeration);
+    }
+
     if contains_any(&q, NARRATIVE_MARKERS) {
         return Some(QueryIntent::Narrative);
     }
@@ -89,8 +93,108 @@ pub fn classify_lexical(question: &str) -> Option<QueryIntent> {
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| haystack.contains(n))
+    needles.iter().any(|n| matches_needle(haystack, n))
 }
+
+/// Match a single needle against the haystack, honouring boundary assertions
+/// encoded as leading/trailing spaces in the needle.
+///
+/// A leading space means "word boundary on the left": the character immediately
+/// before the match position must be whitespace, one of `?.!,;:'`, or the match
+/// must start at position 0.
+///
+/// A trailing space means "word boundary on the right": the character
+/// immediately after the match must be whitespace, one of `?.!,;:'`, or the
+/// match must end at the end of the string.
+///
+/// Needles with no surrounding space are checked as plain substrings — this is
+/// intentional: `"explain"` must match "explaining", `"average"` → "averages",
+/// `"trend"` → "trending".
+fn matches_needle(haystack: &str, needle: &str) -> bool {
+    let left_bound = needle.starts_with(' ');
+    let right_bound = needle.ends_with(' ');
+
+    if !left_bound && !right_bound {
+        return haystack.contains(needle);
+    }
+
+    // Strip boundary-space(s) to get the searchable core.
+    let core = needle.trim_matches(' ');
+    if core.is_empty() {
+        return false;
+    }
+
+    let hlen = haystack.len();
+    let clen = core.len();
+    let mut start = 0;
+
+    while let Some(rel) = haystack[start..].find(core) {
+        let pos = start + rel; // absolute start of core in haystack
+        let end = pos + clen;  // exclusive end
+
+        let left_ok = !left_bound
+            || pos == 0
+            || is_word_boundary(haystack.as_bytes()[pos - 1] as char);
+
+        let right_ok = !right_bound
+            || end == hlen
+            || is_word_boundary(haystack.as_bytes()[end] as char);
+
+        if left_ok && right_ok {
+            return true;
+        }
+
+        start = pos + 1; // advance past this occurrence and keep scanning
+    }
+
+    false
+}
+
+/// Characters that satisfy a word-boundary assertion on either side of a
+/// space-delimited marker: whitespace and common sentence-ending / separating
+/// punctuation that appears after (or before) a word in natural queries.
+#[inline]
+fn is_word_boundary(c: char) -> bool {
+    c.is_ascii_whitespace() || matches!(c, '?' | '.' | '!' | ',' | ';' | ':' | '\'')
+}
+
+/// Returns true when the question has the form "what [verb] …?" where the
+/// first token after "what" is NOT a copula or auxiliary verb.
+///
+/// This completes the interrogative-pronoun-as-subject Enumeration family that
+/// already covers `"which "`, `"who is "`, `"who has "`, `"who was "`, `"whose "`.
+/// "What expires within 30 days?" and "What arrived today?" select a set of
+/// records the same way "Which medicines are out of stock?" does.
+///
+/// Guard: placed in `classify_lexical` AFTER all more-specific checks
+/// (Trend, Enumeration-markers, Aggregation, Lookup, "what is/are X by Y") so
+/// those always win.  Placed BEFORE NARRATIVE_MARKERS so "what is"/"what are"
+/// still fall through to Narrative when they reach it without a copula guard here.
+fn what_verb_is_enumeration(q: &str) -> bool {
+    // Only the "what " prefix (with space) — excludes "whatever", "what's", etc.
+    let rest = match q.strip_prefix("what ") {
+        Some(r) => r,
+        None => return false,
+    };
+    let first = rest.split_ascii_whitespace().next().unwrap_or("");
+    if first.is_empty() {
+        return false;
+    }
+    // If the first word is a copula or auxiliary, this is a narrative or aggregation
+    // form ("what is X", "what are Y", "what does Z mean") — not the enumeration form.
+    !WHAT_COPULAS_AND_AUXILIARIES.contains(&first)
+}
+
+/// Copulas and auxiliary verbs that may follow "what" in non-enumeration
+/// questions.  Extending this list narrows the what-verb Enumeration rule;
+/// shrinking it widens it.
+const WHAT_COPULAS_AND_AUXILIARIES: &[&str] = &[
+    "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "done",
+    "can", "could", "shall", "should", "will", "would",
+    "may", "might", "must",
+    "has", "have", "had",
+];
 
 /// True when the question carries a narrative marker ("summarise", "explain",
 /// "describe", …). Exposed for the intent router's hybrid detection: a question
@@ -165,11 +269,24 @@ const AGGREGATION_MARKERS: &[&str] = &[
     "total number",
     "total count",
     "average",
-    "mean ",
-    // Space-delimited so " rated" / " rates" can never match. This catches only
-    // mid-sentence rates; end-of-sentence ones ("no-show rate?") are handled by
-    // the ends_with(" rate") check in classify_lexical — `q` is only lowercased
-    // here, no trailing space is appended.
+    // Narrowed from a bare `"mean "` to the determiner/partitive forms only.
+    // English "mean" is both the statistic and the verb "to mean", and a
+    // boundary-aware matcher cannot tell them apart: once `matches_needle`
+    // honoured the right boundary at end-of-sentence, `"mean "` began firing on
+    // "What does this mean?" — a definitional question — and classified it as
+    // Aggregation. The statistic is nearly always determined ("the mean length
+    // of stay") or partitive ("the mean of the readings"); the verb is not. And
+    // `"average"` / `"median"` in this same list already carry the statistical
+    // sense for ordinary phrasing, so the bare form earned little and cost a
+    // misclassification. "What does this mean?" now returns None and fails open
+    // to semantic retrieval, which is where a definitional question belongs.
+    "the mean ",
+    " mean of ",
+    // Both boundary spaces are assertions (see matches_needle): the left space
+    // requires whitespace/punctuation before "rate", and the right space requires
+    // the same after — so "rated"/"rates" cannot match (the `d`/`s` is not a
+    // boundary char), but "rate?" and "rate" at end-of-input both DO match because
+    // `?` and end-of-string are valid right boundaries. No special case needed.
     " rate ",
     "distribution",
     "most common",
@@ -384,22 +501,23 @@ mod tests {
     /// Rate nouns ("no-show rate", "readmission rate") signal a statistical
     /// metric — they are aggregations, not narrative explanations.
     ///
-    /// Rates mid-sentence are caught by the space-delimited `" rate "` marker.
-    /// Rates at end of sentence (before "?" or end-of-input) are caught by
-    /// `q_stripped.ends_with(" rate")` — stripping trailing punctuation first.
+    /// Both mid-sentence and end-of-sentence rates are now handled by the
+    /// boundary-aware `" rate "` marker: `?` and end-of-input satisfy the right
+    /// word-boundary assertion, while `d` in "rated" does not — no special case needed.
     #[test]
     fn rate_noun_is_aggregation() {
-        // End of sentence before "?" — the rate-specific ends_with check fires.
+        // End of sentence before "?" — `?` is a right word-boundary char, so the
+        // `" rate "` marker fires via matches_needle.
         assert_eq!(
             classify_lexical("What is our no-show rate?"),
             Some(QueryIntent::Aggregation)
         );
-        // Mid-sentence "rate for..." — the " rate " marker fires.
+        // Mid-sentence "rate for..." — space satisfies both boundary assertions.
         assert_eq!(
             classify_lexical("What is the readmission rate for cardiac patients?"),
             Some(QueryIntent::Aggregation)
         );
-        // End of input, no punctuation.
+        // End of input, no punctuation — end-of-string satisfies the right boundary.
         assert_eq!(
             classify_lexical("What is the complication rate"),
             Some(QueryIntent::Aggregation)
@@ -465,29 +583,38 @@ mod tests {
     // `"what is on "` and `" expires"` were removed: they match only one fixture
     // question each and are domain predicates rather than intent-class signals.
     //
-    // "What is on tomorrow's list?" falls through to NARRATIVE: "what is"
-    // fires in NARRATIVE_MARKERS. The "list " ENUMERATION marker does not
-    // match because "list?" (end-of-string with trailing "?") has no space
-    // after "list". This costs one fixture row (theatre-list-tomorrow → Semantic).
+    // "What is on tomorrow's list?" now classifies as ENUMERATION: the
+    // boundary-aware matcher treats `?` as a valid right-boundary char for
+    // the `"list "` marker, which fires before "what is" can reach NARRATIVE.
+    // Honest cost for theatre-list-tomorrow: 0 (now routes correctly).
     //
-    // "What expires within 30 days?" returns None — no intent marker applies;
-    // it must escalate to Tier 2 or fail-open to Semantic. This costs one more
-    // fixture row (pharmacy-expiry → Semantic). Total honest cost: 2 rows → 30/32.
+    // "What expires within 30 days?" — the `what`-verb Enumeration rule
+    // (added in task 2) fires because "expires" is not a copula/auxiliary.
+    // Honest cost for pharmacy-expiry: still 1 row — correct intent now, but
+    // the service-line vocabulary is owned by a separate workstream; expect
+    // that fixture row to remain red until both intent and ontology are fixed.
+    // Total route accuracy: 31/32 from the intent side alone.
     #[test]
-    fn what_is_on_falls_to_narrative_after_marker_removal() {
+    fn what_is_on_classifies_as_enumeration() {
+        // The boundary-aware `"list "` marker fires: `?` satisfies the right
+        // word-boundary assertion. ENUMERATION is checked before NARRATIVE so
+        // "what is" does not steal this query.
         assert_eq!(
             classify_lexical("What is on tomorrow's list?"),
-            Some(QueryIntent::Narrative),
-            "'what is on' removed; 'what is' NARRATIVE fires; route becomes semantic (honest cost)"
+            Some(QueryIntent::Enumeration),
+            "'list?' — trailing `?` satisfies the right boundary of the `list ` marker"
         );
     }
 
     #[test]
-    fn expires_predicate_falls_through_to_none() {
+    fn expires_predicate_classifies_as_enumeration() {
+        // "expires" is not a copula/auxiliary, so the what-verb Enumeration rule
+        // fires. Intent is now correct; pharmacy-expiry may still fail the fixture
+        // for unrelated ontology reasons (separate workstream).
         assert_eq!(
             classify_lexical("What expires within 30 days?"),
-            None,
-            "no intent marker applies; escalate to Tier 2"
+            Some(QueryIntent::Enumeration),
+            "what + non-copula verb → Enumeration (what-verb rule)"
         );
     }
 
@@ -537,6 +664,97 @@ mod tests {
         assert_eq!(
             classify_lexical("share information about patient Jane Chebet"),
             Some(QueryIntent::Lookup)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // "what [verb]" Enumeration — task-2 tests
+    // -----------------------------------------------------------------------
+
+    /// "what + non-copula verb" introduces a predicate-filtered entity set, the
+    /// same grammatical pattern as "which "/"who is "/"whose " → Enumeration.
+    #[test]
+    fn what_verb_is_enumeration_rule() {
+        assert_eq!(
+            classify_lexical("What expires within 30 days?"),
+            Some(QueryIntent::Enumeration),
+            "'expires' is not a copula; what-verb rule fires"
+        );
+        assert_eq!(
+            classify_lexical("What arrived today?"),
+            Some(QueryIntent::Enumeration),
+            "'arrived' is not a copula; what-verb rule fires"
+        );
+        assert_eq!(
+            classify_lexical("What broke last week?"),
+            Some(QueryIntent::Enumeration),
+            "'broke' is not a copula; what-verb rule fires"
+        );
+    }
+
+    /// Copula/auxiliary forms must NOT be stolen by the what-verb rule.
+    ///
+    /// Debatable case flagged honestly: "What happened yesterday?" would also
+    /// classify as Enumeration via the what-verb rule — "happened" is not in
+    /// WHAT_COPULAS_AND_AUXILIARIES.  In a health-records context this is
+    /// probably acceptable (it selects events), but it is listed here so the
+    /// caller can add it to the test if they want to gate it differently.
+    #[test]
+    fn what_copula_stays_in_original_class() {
+        // "what is" → NARRATIVE_MARKERS, checked AFTER the what-verb rule; the
+        // what-verb rule returns false because "is" is a copula.
+        assert_eq!(
+            classify_lexical("What is diabetes?"),
+            Some(QueryIntent::Narrative)
+        );
+        assert_eq!(
+            classify_lexical("What are the side effects?"),
+            Some(QueryIntent::Narrative)
+        );
+        // "What does this mean?" — "does" is an auxiliary, so the what-verb rule
+        // does not fire, and the AGGREGATION marker was narrowed to `"the mean "`
+        // / `" mean of "` precisely so the *verb* "mean" no longer matches it.
+        // None is correct here: no lexical intent, so the question fails open to
+        // semantic retrieval, which is the right destination for a definitional
+        // question. Asserted explicitly because the boundary fix briefly made
+        // this Aggregation, and a definitional question answered by an
+        // aggregation is a worse failure than no classification at all.
+        assert_eq!(
+            classify_lexical("What does this mean?"),
+            None,
+            "verb 'mean' must not fire the statistical marker"
+        );
+        // The statistic itself must still classify.
+        assert_eq!(
+            classify_lexical("What is the mean length of stay?"),
+            Some(QueryIntent::Aggregation),
+            "determined 'the mean' is the statistic"
+        );
+        assert_eq!(
+            classify_lexical("What is the mean of the last five readings?"),
+            Some(QueryIntent::Aggregation),
+            "partitive 'mean of' is the statistic"
+        );
+        // Aggregation wins before the what-verb check is even reached.
+        assert_eq!(
+            classify_lexical("What is our no-show rate?"),
+            Some(QueryIntent::Aggregation)
+        );
+        assert_eq!(
+            classify_lexical("What percentage of patients were readmitted?"),
+            Some(QueryIntent::Aggregation)
+        );
+        assert_eq!(
+            classify_lexical("What is outstanding by insurer?"),
+            Some(QueryIntent::Aggregation)
+        );
+        // "What is on tomorrow's list?" — the `"list "` boundary-fix (task 1)
+        // fires via ENUMERATION_MARKERS, long before the what-verb rule is reached.
+        // The what-verb rule would return false anyway ("is" is a copula), so both
+        // rules agree: the `"list "` marker is what actually fires it.
+        assert_eq!(
+            classify_lexical("What is on tomorrow's list?"),
+            Some(QueryIntent::Enumeration)
         );
     }
 }
