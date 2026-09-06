@@ -28,6 +28,7 @@ pub mod clarify;
 pub mod conversational;
 pub mod entities;
 pub mod focus;
+pub mod focus_resolve;
 pub mod time;
 
 use std::collections::{HashMap, VecDeque};

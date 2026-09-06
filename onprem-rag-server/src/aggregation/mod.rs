@@ -8,9 +8,11 @@
 //! - `execute`  — aggregation pipeline builder + async runner (`AggRow` result shape)
 //! - `list`     — paginated list executor + `validate_list`
 //! - `intent`   — lexical `QueryIntent` classifier
+//! - `from_ir`  — deterministic `QuerySpec` (IR) -> `RunAggregation`/`RunList`
 
 pub mod catalog;
 pub mod execute;
+pub mod from_ir;
 pub mod intent;
 pub mod list;
 pub mod spec;

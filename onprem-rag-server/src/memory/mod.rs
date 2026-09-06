@@ -20,6 +20,15 @@ use crate::foundry::router::ModelSpec;
 use crate::rag::ChatTurn;
 use crate::routes::conversations::parse_oid;
 
+pub mod focus;
+
+pub use focus::ConversationFocus;
+
+/// Conversation-document field holding the serialised [`ConversationFocus`].
+/// One constant so the writer (`routes::conversations`) and the reader here can
+/// never drift apart.
+pub const FOCUS_FIELD: &str = "focus_json";
+
 /// Batch cap on a single compaction pass's overflow fetch. Keeps the query
 /// bounded even if compaction has stalled for a while (a CAS race, a transient
 /// model failure) and the un-summarized tail has grown large — the next pass
@@ -84,16 +93,42 @@ impl WorkingMemory {
 /// the caller (`routes::conversations::verify_owned`). Best-effort: any DB error
 /// yields an empty `WorkingMemory` — the turn still proceeds, just without
 /// continuity, matching the old `load_history`'s fail-open behaviour.
+///
+/// Thin wrapper over [`load_context`] for callers that have no use for the focus.
+/// Kept so the two memories can be adopted independently — a caller that only
+/// prompts a model needs no focus, and forcing it to name one would be noise.
 pub async fn load_working_memory(
     db: &DocumentDb,
     conversation_id: &str,
     config: &Config,
 ) -> WorkingMemory {
+    load_context(db, conversation_id, config).await.0
+}
+
+/// Load both memories in **one** conversation-document round-trip (plan 06 §2):
+/// the rolling summary + tail, and the typed [`ConversationFocus`].
+///
+/// The focus is stored on the conversation document, which this function already
+/// reads for `summary`/`summary_upto`, so continuity costs no extra query.
+///
+/// Fail-open on every axis: a bad id, a DB error, a missing focus, or a focus
+/// written by an older shape all yield `Default`. A conversation must never be
+/// unanswerable because its remembered context could not be parsed.
+pub async fn load_context(
+    db: &DocumentDb,
+    conversation_id: &str,
+    config: &Config,
+) -> (WorkingMemory, ConversationFocus) {
     let Ok(oid) = parse_oid(conversation_id) else {
-        return WorkingMemory::default();
+        return (WorkingMemory::default(), ConversationFocus::default());
     };
     let Ok(Some(conv)) = db.chat_conversations().find_one(doc! { "_id": oid }).await else {
-        return WorkingMemory::default();
+        return (WorkingMemory::default(), ConversationFocus::default());
+    };
+    let focus = if config.focus_enabled {
+        focus_from_conv_doc(&conv)
+    } else {
+        ConversationFocus::default()
     };
     let (summary, _, filter) = summary_state(&conv, conversation_id);
 
@@ -135,7 +170,20 @@ pub async fn load_working_memory(
     }
     tail.reverse();
 
-    WorkingMemory { summary, tail }
+    (WorkingMemory { summary, tail }, focus)
+}
+
+/// Read the persisted focus off a conversation document.
+///
+/// Stored as a compact JSON **string** under `focus_json`, following the same
+/// convention as `citations_json` / `structured_json` / `verify_json`: a nested
+/// `QuerySpec` (tagged enums, `NaiveDate`, `f64`) round-trips through serde_json
+/// exactly and through BSON only approximately.
+pub(crate) fn focus_from_conv_doc(conv: &Document) -> ConversationFocus {
+    conv.get_str(FOCUS_FIELD)
+        .ok()
+        .and_then(ConversationFocus::from_json_str)
+        .unwrap_or_default()
 }
 
 /// First `max_words` words of `text` plus that returned string's own word
@@ -234,10 +282,17 @@ async fn compact_if_needed(
         across a long conversation. Update the summary with the new turns below. Preserve \
         patient names/ids, dates, numeric findings, and open questions. Be entity-dense and \
         concise (150 words max). Output ONLY the updated summary, no preamble.";
-    let user = match &prior_summary {
-        Some(s) => format!("Current summary: {s}\n\nNew turns:\n{transcript}\n\nUpdated summary:"),
-        None => format!("New turns:\n{transcript}\n\nSummary:"),
+    // Plan 06 section 6: the summariser also sees the typed focus, so the summary
+    // names the patient and period explicitly instead of inheriting whatever
+    // pronoun the transcript happened to use. Read from the conversation document
+    // this function already fetched -- no extra query, and no signature change for
+    // the two route modules that call `maybe_spawn_compaction`.
+    let focus = if config.focus_enabled {
+        focus_from_conv_doc(&conv)
+    } else {
+        ConversationFocus::default()
     };
+    let user = compaction_user_prompt(prior_summary.as_deref(), &focus, &transcript);
 
     let mut spec = spec.clone();
     spec.temperature = 0.1;
@@ -261,6 +316,41 @@ async fn compact_if_needed(
         )
         .await?;
     Ok(())
+}
+
+/// Build the summariser's user prompt (plan 06 section 6).
+///
+/// A free function so the focus block's placement is assertable without a model
+/// or a database: the interesting property is that the focus appears *before* the
+/// transcript, where it acts as a glossary for the pronouns inside it, rather than
+/// after, where the model has already had to guess.
+///
+/// PHI note: this prompt does carry the focus patient's display name. That is the
+/// same handling the transcript itself already has -- both go only to the local
+/// Foundry model, and no part of this crate sends either off the host.
+fn compaction_user_prompt(
+    prior_summary: Option<&str>,
+    focus: &ConversationFocus,
+    transcript: &str,
+) -> String {
+    let mut prompt = String::new();
+    if let Some(summary) = prior_summary {
+        prompt.push_str("Current summary: ");
+        prompt.push_str(summary);
+        prompt.push_str("\n\n");
+    }
+    if let Some(block) = focus.prompt_block() {
+        prompt.push_str(&block);
+        prompt.push_str("\n\n");
+    }
+    prompt.push_str("New turns:\n");
+    prompt.push_str(transcript);
+    prompt.push_str(if prior_summary.is_some() {
+        "\n\nUpdated summary:"
+    } else {
+        "\n\nSummary:"
+    });
+    prompt
 }
 
 // ---------------------------------------------------------------------------

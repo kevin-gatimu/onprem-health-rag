@@ -64,7 +64,19 @@ pub async fn run(
     auth: &AuthUser,
     spec: &RunAggregation,
 ) -> AppResult<(Vec<AggRow>, Vec<Document>)> {
-    let pipeline = build_pipeline(auth, spec);
+    run_scoped(db, auth, spec, &[]).await
+}
+
+/// Like [`run`] but additionally restricts the pipeline to `scope_sources`
+/// (plan 04 §3). An empty slice means "every registered source", which is what
+/// `/chat` without an agent scope wants.
+pub async fn run_scoped(
+    db: &DocumentDb,
+    auth: &AuthUser,
+    spec: &RunAggregation,
+    scope_sources: &[String],
+) -> AppResult<(Vec<AggRow>, Vec<Document>)> {
+    let pipeline = build_pipeline_scoped(auth, spec, scope_sources);
     let stored_pipeline = pipeline.clone(); // provenance copy
 
     let mut cursor = db
@@ -97,6 +109,21 @@ pub async fn run(
 /// Build the full aggregation pipeline for `spec`. Pure function: no I/O,
 /// fully testable. Called by `run` above and exercised directly in unit tests.
 pub fn build_pipeline(auth: &AuthUser, spec: &RunAggregation) -> Vec<Document> {
+    build_pipeline_scoped(auth, spec, &[])
+}
+
+/// [`build_pipeline`] plus a source-ownership narrowing (plan 04 §3).
+///
+/// When an agent's scope names one or more registered sources, stage 1 gains
+/// `source_id: { $in: [...] }` so a Maternity agent can never aggregate over a
+/// billing source that happens to expose a same-named table. This is a
+/// *relevance* boundary, not the security boundary (that stays in `src/auth/`).
+/// An empty `scope_sources` adds no condition.
+pub fn build_pipeline_scoped(
+    auth: &AuthUser,
+    spec: &RunAggregation,
+    scope_sources: &[String],
+) -> Vec<Document> {
     let mut pipeline: Vec<Document> = Vec::new();
 
     // --- Stage 1: $match (authz AND table scope AND user filter) ---
@@ -107,6 +134,13 @@ pub fn build_pipeline(auth: &AuthUser, spec: &RunAggregation) -> Vec<Document> {
     let mut match_doc = build_authz_filter(auth);
     match_doc.insert("active", true);
     match_doc.insert("table", &spec.collection); // physical table scope
+    if !scope_sources.is_empty() {
+        // Scope names a source (or several): only those may contribute rows.
+        match_doc.insert(
+            "source_id",
+            doc! { "$in": scope_sources.iter().map(|s| Bson::String(s.clone())).collect::<Vec<Bson>>() },
+        );
+    }
     for (k, v) in translate_filter(&spec.filter) {
         match_doc.insert(k, v);
     }

@@ -83,6 +83,18 @@ pub struct RouterConfig {
     /// Keeps SQL planning latency bounded and protects smaller role overrides.
     pub nl2sql_prompt_token_budget: usize,
 
+    // --- structured executor ladder (plan 04) -------------------------------
+    /// Wall-clock ceiling on the whole `answer::executor` ladder. When it is
+    /// exhausted the executor skips straight to retrieval with
+    /// `Rung::*(Skipped("budget"))` so the downgrade is visible (plan 04a §6).
+    pub exec_total_timeout_secs: u64,
+    /// Maximum cohort keys carried from a Hybrid cohort query into the retrieval
+    /// filter. Beyond this the narrator is told "first N of M".
+    pub hybrid_cohort_max: usize,
+    /// Allow one unfiltered retry when an *inferred* (not user-stated) retrieval
+    /// filter empties the result set.
+    pub retrieval_filter_relax: bool,
+
     pub extract_enabled: bool,
     pub extract_min_words: usize,
     pub extract_concurrency: usize,
@@ -133,6 +145,10 @@ impl RouterConfig {
             // Keep planning latency bounded even when the selected GPU model has a
             // larger context window; role overrides may also have smaller windows.
             nl2sql_prompt_token_budget: env_parse("ONPREM_NL2SQL_PROMPT_TOKEN_BUDGET", 3200_usize),
+
+            exec_total_timeout_secs: env_parse("ONPREM_EXEC_TOTAL_TIMEOUT_SECS", 120_u64),
+            hybrid_cohort_max: env_parse("ONPREM_HYBRID_COHORT_MAX", 200_usize),
+            retrieval_filter_relax: env_parse("ONPREM_RETRIEVAL_FILTER_RELAX", true),
 
             extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
             extract_min_words: env_parse("ONPREM_EXTRACT_MIN_WORDS", 40_usize),
@@ -246,6 +262,19 @@ pub struct Config {
     /// Byte cap on a stored message's content; longer content is clipped with a marker.
     pub message_max_bytes: usize,
 
+    // Conversation focus and suggestions (plan 06 §7)
+    /// Master switch for `ConversationFocus`. When false, `focus::apply` returns
+    /// `Default` every turn, so no focus is ever accumulated, persisted, or used
+    /// to resolve a follow-up — the pre-focus behaviour, exactly.
+    pub focus_enabled: bool,
+    /// Hard cap on suggested follow-ups emitted with an answer.
+    pub suggestions_max: usize,
+    /// Turns a focus patient survives without being mentioned again.
+    /// `0` (default) = keep until a different patient replaces it.
+    pub focus_patient_ttl_turns: u32,
+    /// Cap on `ResultDigest::top_labels` retained from a grouped result.
+    pub focus_top_labels: usize,
+
     // Schema metadata maintenance
     /// Seconds between structural drift checks. Zero disables background polling.
     pub schema_poll_interval_secs: u64,
@@ -358,6 +387,11 @@ impl Config {
             compact_after_turns: env_parse("ONPREM_COMPACT_AFTER_TURNS", 12_i64),
             conversation_retention_days: env_parse("ONPREM_CONVERSATION_RETENTION_DAYS", 0_i64),
             message_max_bytes: env_parse("ONPREM_MESSAGE_MAX_BYTES", 32768_usize),
+
+            focus_enabled: env_parse("ONPREM_FOCUS_ENABLED", true),
+            suggestions_max: env_parse("ONPREM_SUGGESTIONS_MAX", 4_usize),
+            focus_patient_ttl_turns: env_parse("ONPREM_FOCUS_PATIENT_TTL_TURNS", 0_u32),
+            focus_top_labels: env_parse("ONPREM_FOCUS_TOP_LABELS", 5_usize),
 
             schema_poll_interval_secs: env_parse("ONPREM_SCHEMA_POLL_INTERVAL_SECS", 300_u64),
             schema_poll_concurrency: env_parse("ONPREM_SCHEMA_POLL_CONCURRENCY", 2_usize).max(1),

@@ -235,6 +235,50 @@ mod golden_tests {
         Some((shape, validated.sql))
     }
 
+    /// Compare the blessed MySQL and SQL Server statements for `entry` against
+    /// freshly compiled output, returning one human-readable line per mismatch.
+    ///
+    /// **Harness hole closed 2026-09-06.**  `expect_sql_mysql` and
+    /// `expect_sql_mssql` were written by bless mode but never compared, so two
+    /// thirds of every blessed statement in this suite carried no verification at
+    /// all — a per-dialect compiler regression (quoting, LIMIT/TOP, date
+    /// arithmetic) could not fail the suite.  Postgres stays compared inline
+    /// because it also drives `shape_ok` and the `verified` counter; this helper
+    /// covers the other two dialects.
+    ///
+    /// A non-null expectation with a refusing pipeline is reported as a mismatch,
+    /// not skipped: the whole point of §1 of plans/new/03h-harness-invariants.md is
+    /// that "no SQL where SQL was expected" must not pass silently.
+    fn dialect_mismatches(
+        entry: &GoldenEntry,
+        cards: &[crate::nl2sql::spec::TableCard],
+        binding: &SchemaBinding,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        for (label, dialect, expected) in [
+            ("mysql", SourceKind::Mysql, entry.expect_sql_mysql.as_deref()),
+            ("mssql", SourceKind::Mssql, entry.expect_sql_mssql.as_deref()),
+        ] {
+            let Some(expected) = expected else { continue };
+            match try_pipeline(&entry.question, cards, binding, dialect).map(|(_, s)| s) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => out.push(format!(
+                    "[{}] {} SQL mismatch:
+  expected: {}
+  actual:   {}",
+                    entry.id, label, expected, actual
+                )),
+                None => out.push(format!(
+                    "[{}] {} SQL mismatch: expectation is non-null but pipeline refused
+                       expected: {}
+  actual:   (refused)",
+                    entry.id, label, expected
+                )),
+            }
+        }
+        out
+    }
+
     /// Merge `blessed_by_id` (keyed by entry id) into the on-disk `golden.jsonl`,
     /// replacing only entries whose `binding` matches `binding_filter`.
     ///
@@ -350,6 +394,17 @@ mod golden_tests {
                 _ => true,
             };
 
+            // MySQL / SQL Server: same byte-comparison, previously absent entirely.
+            // See `dialect_mismatches`.  Skipped in bless mode, which rewrites rather
+            // than validates.
+            let dialect_misses = if bless_mode {
+                Vec::new()
+            } else {
+                dialect_mismatches(&entry, &cards, &binding)
+            };
+            let dialects_ok = dialect_misses.is_empty();
+            failures.extend(dialect_misses);
+
             // Track refused rows (honest miss, not a defect, not an expected miss).
             if !is_expected_miss && result_pg.is_none() && !bless_mode {
                 refused += 1;
@@ -362,8 +417,9 @@ mod golden_tests {
                 // In bless mode we update the fixture, not validate it.
                 result_pg.is_some()
             } else {
-                // Normal mode: pipeline must succeed AND shape/SQL must match.
-                result_pg.is_some() && shape_ok && sql_ok
+                // Normal mode: pipeline must succeed AND shape/SQL must match in
+                // every dialect the fixture blesses, not only Postgres.
+                result_pg.is_some() && shape_ok && sql_ok && dialects_ok
             };
 
             if !bless_mode
@@ -371,6 +427,7 @@ mod golden_tests {
                 && result_pg.is_some()
                 && shape_ok
                 && sql_ok
+                && dialects_ok
             {
                 verified += 1;
             }
@@ -415,7 +472,7 @@ mod golden_tests {
                         "[{}] shape mismatch: expected {:?}, got {:?}: {}",
                         entry.id, entry.expect_shape, actual_key, entry.question
                     ));
-                } else {
+                } else if !sql_ok {
                     let actual_sql = result_pg.as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
                     failures.push(format!(
                         "[{}] SQL mismatch:\n  expected: {}\n  actual:   {}",
@@ -673,6 +730,16 @@ mod golden_tests {
                 _ => true,
             };
 
+            // MySQL / SQL Server: same byte-comparison, previously absent entirely.
+            // See `dialect_mismatches`.
+            let dialect_misses = if bless_mode {
+                Vec::new()
+            } else {
+                dialect_mismatches(&entry, &cards, &binding)
+            };
+            let dialects_ok = dialect_misses.is_empty();
+            failures.extend(dialect_misses);
+
             // Track refused rows (honest miss, not a defect, not an expected miss).
             if !is_expected_miss && result.is_none() && !bless_mode {
                 refused += 1;
@@ -683,7 +750,7 @@ mod golden_tests {
             } else if bless_mode {
                 result.is_some()
             } else {
-                result.is_some() && shape_ok && sql_ok
+                result.is_some() && shape_ok && sql_ok && dialects_ok
             };
 
             if !bless_mode
@@ -691,6 +758,7 @@ mod golden_tests {
                 && result.is_some()
                 && shape_ok
                 && sql_ok
+                && dialects_ok
             {
                 verified += 1;
             }
@@ -735,7 +803,7 @@ mod golden_tests {
                         "[{}] shape mismatch: expected {:?}, got {:?}: {}",
                         entry.id, entry.expect_shape, actual_key, entry.question
                     ));
-                } else {
+                } else if !sql_ok {
                     let actual_sql = result.as_ref().map(|(_, s)| s.as_str()).unwrap_or("");
                     failures.push(format!(
                         "[{}] SQL mismatch:\n  expected: {}\n  actual:   {}",
@@ -859,5 +927,354 @@ mod golden_tests {
         );
     }
 
-}
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Harness invariants — plans/new/03h-harness-invariants.md §1 and §3
+    //
+    // Only §1 and §3 are implemented in this pass; §2 (no-op predicates) and
+    // §4 (name_hint-miss regression guard) are deliberately out of scope and
+    // are NOT covered below.  Do not read a green run here as evidence for them.
+    //
+    // Both invariants run over *every* golden row of *both* bindings, including
+    // rows that refuse — §5 requires it, because §1's whole subject is the
+    // refusing rows the main comparison skips.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// The two fixture bindings, each with the cards it was built from.
+    ///
+    /// `alt_schema_cards` / `alt_schema_enum_values` are the control binding and
+    /// are read here, never modified.
+    fn fixture_bindings() -> Vec<(&'static str, Vec<crate::nl2sql::spec::TableCard>, SchemaBinding)> {
+        let dev_cards = dev_seed_cards();
+        let dev_binding = make_binding(&dev_cards, "dev", &dev_seed_enum_values());
+        let alt_cards = alt_schema_cards();
+        let alt_binding = make_binding(&alt_cards, "alt", &alt_schema_enum_values());
+        vec![("dev", dev_cards, dev_binding), ("alt", alt_cards, alt_binding)]
+    }
+
+    // ── §1 ────────────────────────────────────────────────────────────────────
+    /// A row with no SQL expectation at all, not marked `defect: true`, must not
+    /// emit SQL.
+    ///
+    /// Null expectations on such a row mean one of two things, and both forbid
+    /// SQL: either the previously-blessed statement was withdrawn as a false
+    /// blessing (`qs-03`, `dx-01-alt`, `dx-02`, `gen-04`) and refusal is now the
+    /// correct outcome, or the row has never been audited and no statement it
+    /// emits has ever been read by a human.  The main comparison *skips* both
+    /// cases — `sql_ok` is `true` when the expectation is `None` — which is the
+    /// same asymmetry that produced the original 52 wrong rows: the suite checked
+    /// that expected SQL appeared and never checked that unexpected SQL did not.
+    ///
+    /// Reads the fixture and the emitted SQL string (that string is the artefact
+    /// under audit); the IR is not inspected, because "emitted anything at all"
+    /// is the whole property.
+    ///
+    /// A firing row is a **finding to report, not a number to restore**
+    /// (03h §5).  Never silence it by blessing the emitted SQL, marking the row
+    /// `defect: true`, or deleting the row.
+    #[test]
+    fn invariant_null_sql_expectation_row_must_refuse() {
+        let mut violations: Vec<String> = Vec::new();
+
+        for (name, cards, binding) in fixture_bindings() {
+            for entry in load_golden().iter().filter(|e| e.binding == name) {
+                if entry.defect {
+                    continue;
+                }
+                let no_expectation = entry.expect_sql_pg.is_none()
+                    && entry.expect_sql_mysql.is_none()
+                    && entry.expect_sql_mssql.is_none();
+                if !no_expectation {
+                    continue;
+                }
+                if let Some((shape, sql)) =
+                    try_pipeline(&entry.question, &cards, &binding, SourceKind::Postgres)
+                {
+                    violations.push(format!(
+                        "[{}] ({}) shape={} emitted SQL but carries NO blessed expectation \
+                         and is not marked defect\n    question: {}\n    emitted:  {}",
+                        entry.id, name, shape_key(shape), entry.question, sql
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "03h §1 — {} unblessed row(s) emitted SQL. Each statement below has never been \
+             audited against its question; a null expectation is not permission to emit. \
+             Report these; do NOT bless the emitted SQL to make this pass.\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    // ── §3 ────────────────────────────────────────────────────────────────────
+    /// Columns whose value domain is genuinely open, so a string literal compared
+    /// against them cannot be checked against a label set.
+    ///
+    /// Physical names appear here because this is fixture code (`#[cfg(test)]`),
+    /// which is where 03h says the exemption list belongs — never in
+    /// `src/nl2sql/ir/**` rule code.  Format: `(table, column, why)`.
+    ///
+    /// `invariant_open_domain_exemptions_are_live` asserts every row below names a
+    /// column that really exists in a fixture binding, so this list cannot rot
+    /// into the dead guard this workstream already shipped once (a check written
+    /// against `mortality_records.national_id`, a column that does not exist).
+    const OPEN_DOMAIN_EXEMPTIONS: &[(&str, &str, &str)] = &[
+        // dev — `patients.patient_no VARCHAR(20) UNIQUE NOT NULL`
+        // (docker/dev-postgres/init/01_schema.sql:236).  A minted per-patient
+        // identifier: UNIQUE, no CHECK, no ENUM.  Its label set is the patient
+        // population, which lives in data.
+        ("patients", "patient_no", "minted patient identifier; UNIQUE, no CHECK domain"),
+        // alt — `PatientMaster.mrn` (src/ontology/tests/mod.rs:109), the alt
+        // fixture's rename of the same identifier.  Same reason.
+        ("PatientMaster", "mrn", "minted patient identifier; alt rename of patient_no"),
+        // dev — `diagnoses.icd10_code VARCHAR(10) NOT NULL REFERENCES
+        // icd10_codes(code)` (docker/dev-postgres/init/01_schema.sql:417).  An FK
+        // into a reference table, so the domain is table contents, not a schema
+        // constraint — no derived label set exists or can exist.  This is the
+        // `gen-03` ruling: mapping "type 2 diabetes" to `E11*` asserts a
+        // terminology fact that lives in data, not schema.
+        ("diagnoses", "icd10_code", "FK into icd10_codes reference table; domain is data, not schema"),
+        // alt — `PatientDx.icd_code` (src/ontology/tests/mod.rs:257), the alt
+        // fixture's rename of the same coded column.  Same reason.
+        ("PatientDx", "icd_code", "coded diagnosis; alt rename of icd10_code, same open domain"),
+    ];
+
+    /// Decide whether one comparison's literals are acceptable against one
+    /// column's derived label set.  `None` = acceptable; `Some(why)` = violation.
+    ///
+    /// Split out from the invariant so the decision itself is unit-testable (see
+    /// `literal_check_*` below) — an invariant that has never been observed to
+    /// fail is indistinguishable from one that cannot fail.
+    fn check_literals_against_domain(
+        table: &str,
+        column: &str,
+        literals: &[String],
+        domain: &[String],
+    ) -> Option<String> {
+        if domain.is_empty() {
+            // Domain unknown.  Legitimate only for an explicitly enumerated
+            // open-domain column; otherwise the literal is unverifiable, and on a
+            // `VARCHAR ... CHECK` column an unverifiable literal is silently false
+            // — it matches nothing and returns an empty result indistinguishable
+            // from a truthful "none".
+            let exempt = OPEN_DOMAIN_EXEMPTIONS.iter().any(|(t, c, _)| {
+                t.eq_ignore_ascii_case(table) && c.eq_ignore_ascii_case(column)
+            });
+            return if exempt {
+                None
+            } else {
+                Some(format!(
+                    "{table}.{column} has no derived label set and is not on the \
+                     open-domain exemption list; literals {literals:?} are unverifiable"
+                ))
+            };
+        }
+        let bad: Vec<&String> = literals
+            .iter()
+            .filter(|l| !domain.iter().any(|d| d.eq_ignore_ascii_case(l)))
+            .collect();
+        if bad.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "{table}.{column} literals {bad:?} are not in its derived domain {domain:?}"
+            ))
+        }
+    }
+
+    /// Every string literal in an emitted `=`, `<>` or `IN` comparison must exist
+    /// in the bound column's derived label set, or the column must be exempt.
+    ///
+    /// Inspects the **bound IR**, not the emitted SQL string: the literal, the
+    /// physical table and the physical column all come from the bound `Filter`,
+    /// and the label set from `ColumnBinding.enum_values` (derived from the real
+    /// DDL by `ontology::tests::ddl` for the dev binding).  A text-comparison
+    /// harness cannot see this — `status = 'out_of_service'` is well-formed SQL
+    /// against a column whose CHECK constraint has no such label, and Postgres
+    /// answers it with silence rather than an error.
+    ///
+    /// `Ne` is included alongside `Eq` and `In` because a bogus literal is the
+    /// same defect there, only inverted: `<> 'nonexistent'` excludes nothing.
+    /// `Like`/`ILike` are excluded — a substring pattern is not a domain label.
+    ///
+    /// Scope honesty: for `In`, `bind::apply_in_domain_narrowing` already refuses
+    /// (`UnsatisfiableFilter`) when no candidate is in domain, and narrows the list
+    /// otherwise, so an out-of-domain `In` literal cannot reach here today.  This
+    /// invariant is therefore a backstop on that path and the *only* check on the
+    /// `Eq`/`Ne` path, which nothing else guards.
+    #[test]
+    fn invariant_filter_literals_exist_in_bound_domain() {
+        use crate::nl2sql::ir::spec::{Filter, FilterOp, FilterValue};
+
+        /// The string literals a comparison actually compares against; empty for
+        /// comparison forms this invariant does not cover.
+        fn string_literals(f: &Filter) -> Vec<String> {
+            match (&f.op, &f.value) {
+                (FilterOp::Eq | FilterOp::Ne, FilterValue::Str(s)) => vec![s.clone()],
+                (FilterOp::In, FilterValue::List(items)) => items
+                    .iter()
+                    .filter_map(|v| match v {
+                        FilterValue::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
+        let mut violations: Vec<String> = Vec::new();
+
+        for (name, cards, binding) in fixture_bindings() {
+            let allowed: Vec<String> = cards.iter().map(|c| c.table_name.clone()).collect();
+            for entry in load_golden().iter().filter(|e| e.binding == name) {
+                // parse → bind runs on every row, refusing ones included: a row
+                // that refuses simply contributes no filters.  Compilation is
+                // skipped — the bound IR carries everything this invariant reads.
+                let spec = match parse(&entry.question, None, &binding, &allowed) {
+                    ParseOutcome::Parsed { spec, .. } => spec,
+                    ParseOutcome::NoParse => continue,
+                };
+                let Ok(bound) = bind(spec, &binding, &cards, &allowed, &entry.question) else {
+                    continue;
+                };
+
+                let mut filters: Vec<&Filter> = bound.filters.iter().collect();
+                // Reverse-FK scopes (03f) carry their own filters inside the
+                // EXISTS subquery; a bogus literal there is exactly as dangerous.
+                for scope in &bound.related {
+                    filters.extend(scope.filters.iter());
+                }
+
+                for f in filters {
+                    let literals = string_literals(f);
+                    if literals.is_empty() {
+                        continue;
+                    }
+                    let Some((table, column)) = f.column.physical.as_ref() else {
+                        violations.push(format!(
+                            "[{}] ({}) filter on {:?}/{:?} survived bind with no physical \
+                             column but carries literals {:?}",
+                            entry.id, name, f.column.concept, f.column.role, literals
+                        ));
+                        continue;
+                    };
+                    let domain = binding
+                        .tables
+                        .iter()
+                        .find(|t| t.table_name.eq_ignore_ascii_case(table))
+                        .and_then(|t| {
+                            t.columns
+                                .iter()
+                                .find(|c| c.column_name.eq_ignore_ascii_case(column))
+                        })
+                        .map(|c| c.enum_values.clone())
+                        .unwrap_or_default();
+
+                    if let Some(why) =
+                        check_literals_against_domain(table, column, &literals, &domain)
+                    {
+                        violations.push(format!(
+                            "[{}] ({}) {}\n    question: {}",
+                            entry.id, name, why, entry.question
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "03h §3 — {} comparison(s) use a literal outside the bound column's domain. \
+             On a `VARCHAR ... CHECK` column such a literal is silently false: it matches \
+             nothing and returns an empty result indistinguishable from a truthful \"none\". \
+             Fix the predicate or add a justified exemption; do NOT bless the SQL.\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
+    /// The §3 exemption list must name columns that exist.
+    ///
+    /// Written because this workstream already shipped a guard asserting over
+    /// `mortality_records.national_id` — a column that does not exist — so the
+    /// guard could never fire.  An exemption naming a nonexistent column is the
+    /// same failure with the opposite sign: it exempts nothing today and silently
+    /// exempts a real column tomorrow if that name is ever created.
+    #[test]
+    fn invariant_open_domain_exemptions_are_live() {
+        let bindings = fixture_bindings();
+        for (table, column, why) in OPEN_DOMAIN_EXEMPTIONS {
+            let found = bindings.iter().any(|(_, _, b)| {
+                b.tables.iter().any(|t| {
+                    t.table_name.eq_ignore_ascii_case(table)
+                        && t.columns
+                            .iter()
+                            .any(|c| c.column_name.eq_ignore_ascii_case(column))
+                })
+            });
+            assert!(
+                found,
+                "§3 exemption {table}.{column} ({why}) names no column in either fixture \
+                 binding — a dead exemption. Correct the name or remove the entry."
+            );
+        }
+    }
+
+    // ── §3 self-tests: proof the check fires ─────────────────────────────────
+    // `invariant_filter_literals_exist_in_bound_domain` passes on the current
+    // fixture, so on its own it is indistinguishable from a check that cannot
+    // fail.  These exercise the decision function directly in all four states.
+
+    #[test]
+    fn literal_check_accepts_in_domain_label() {
+        let domain = vec!["available".to_string(), "occupied".to_string()];
+        assert_eq!(
+            check_literals_against_domain("beds", "status", &["available".into()], &domain),
+            None
+        );
+    }
+
+    #[test]
+    fn literal_check_rejects_out_of_domain_label() {
+        // The historical case: `equipment.status` really allows
+        // ('in_service','under_repair','standby','decommissioned','awaiting_parts'),
+        // and the fixture blessed an IN list of 'out_of_service'/'faulty'/'broken'
+        // for three consecutive passes.
+        let domain = vec![
+            "in_service".to_string(),
+            "under_repair".to_string(),
+            "standby".to_string(),
+            "decommissioned".to_string(),
+            "awaiting_parts".to_string(),
+        ];
+        let why = check_literals_against_domain(
+            "equipment",
+            "status",
+            &["out_of_service".into(), "faulty".into()],
+            &domain,
+        )
+        .expect("out-of-domain literals must be reported");
+        assert!(why.contains("out_of_service"), "report must name the bad literal: {why}");
+        assert!(why.contains("in_service"), "report must show the real domain: {why}");
+    }
+
+    #[test]
+    fn literal_check_rejects_unknown_domain_when_not_exempt() {
+        let why = check_literals_against_domain("beds", "status", &["available".into()], &[])
+            .expect("a literal on a column with no derived domain must be reported");
+        assert!(why.contains("exemption list"), "report must point at the exemption list: {why}");
+    }
+
+    #[test]
+    fn literal_check_accepts_unknown_domain_when_exempt() {
+        // patient_no is on the list; a lookup by patient number is legitimate.
+        assert_eq!(
+            check_literals_against_domain("patients", "patient_no", &["PT-2024-0001".into()], &[]),
+            None
+        );
+    }
+
+}
