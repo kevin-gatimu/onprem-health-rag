@@ -1,6 +1,10 @@
 mod commands;
 mod state;
 
+// Wire-format assertions for the bridge mirrors (JSON text, not Rust round-trips).
+#[cfg(test)]
+mod wire_tests;
+
 use state::Bridge;
 
 /// Default server URL when the app hasn't been pointed elsewhere. Overridable at
@@ -101,7 +105,12 @@ pub fn run() {
             commands::cancel_run,
             commands::start_log_stream,
             commands::list_conversations,
+            commands::list_agents,
             commands::list_agent_conversations,
+            commands::get_source_binding,
+            commands::rebuild_source_binding,
+            commands::get_catalog_overrides,
+            commands::save_catalog_overrides,
             commands::create_conversation,
             commands::rename_conversation,
             commands::delete_conversation,

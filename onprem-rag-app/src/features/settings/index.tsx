@@ -29,6 +29,7 @@ import { useSession } from '../../stores/session';
 import { Button, Badge, Card, cn } from '../../components/ui';
 import { PageContainer } from '../../components/layout/PageContainer';
 import ServiceConsole from '../../components/ServiceConsole';
+import DataBindingSection from './DataBindingSection';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
 
@@ -284,6 +285,11 @@ export default function Settings() {
               )}
             </div>
           </Card>
+
+          {/* ── Data Binding (plan 07 §4) ──────────────────────────────────────── */}
+          {/* Admin-only: gated on the REAL role, like every other mutating control
+              on this page — a "Preview as" role must not unlock a real rebuild. */}
+          {isAdmin && <DataBindingSection />}
 
           {/* ── Activity ───────────────────────────────────────────────────────── */}
           <ServiceConsole />

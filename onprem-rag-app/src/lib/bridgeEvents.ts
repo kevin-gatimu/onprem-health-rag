@@ -9,7 +9,7 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type StageEvent, type VerifyReport } from "./bridge";
+import { startLogStream, parseRoutedPayload, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type Provenance, type RoutedEvent, type StageEvent, type Suggestion, type VerifyReport, type ClarifyPayload } from "./bridge";
 import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
 import { notifyBackground } from "./notify";
@@ -148,6 +148,18 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // The `/chat` route emits the FULL routed decision object (verified:
+  // `RouteDecision::to_sse_json()` in onprem-rag-server/src/rag/routes.rs), which is
+  // what carries `service_line` and `deterministic`. The agent route, by contrast,
+  // still emits a bare kind string — see the agent://routed listener below.
+  unlisteners.push(
+    await listen<ChatEvent>("chat://routed", (ev) => {
+      const { run_id, data } = ev.payload;
+      const parsed = parseRoutedPayload(data);
+      if (parsed) useChat.getState().setRouted(run_id, parsed);
+    }),
+  );
+
   unlisteners.push(
     await listen<ChatEvent>("chat://citations", (ev) => {
       const { run_id, data } = ev.payload;
@@ -255,8 +267,18 @@ export async function initBridgeEvents(): Promise<void> {
     await listen<ChatEvent>("agent://routed", (ev) => {
       const { run_id, data } = ev.payload;
       try {
-        const kind = JSON.parse(data) as AgentKind;
-        useAgents.getState().setRouted(run_id, kind);
+        const parsed = JSON.parse(data);
+        if (typeof parsed === "string") {
+          // Legacy: server emits a bare kind string.
+          useAgents.getState().setRouted(run_id, parsed as AgentKind);
+        } else if (parsed && typeof parsed === "object" && "route" in parsed) {
+          // Plan 07: full RoutedEvent object with backend, deterministic, focus_used, etc.
+          useAgents.getState().setRoutedFull(run_id, parsed as RoutedEvent);
+        } else {
+          // Unexpected shape — extract kind best-effort.
+          const kind = (parsed as Record<string, unknown>).route ?? parsed;
+          useAgents.getState().setRouted(run_id, String(kind) as AgentKind);
+        }
       } catch {
         /* ignore malformed routed payload */
       }
@@ -274,11 +296,49 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // Plan 07 §3: an agent run can carry a live SQL result. SPEC-DERIVED — today's
+  // agents route emits neither `sql` nor `columns`, so these two never fire; they
+  // exist so the accumulator is complete when the source_sql backend reaches the
+  // agents route.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://sql", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const metadata = JSON.parse(data) as { source_id: string; sql: string };
+        useAgents.getState().setSqlMetadata(run_id, metadata.source_id, metadata.sql);
+      } catch {
+        /* ignore malformed SQL metadata */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://columns", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setSqlColumns(run_id, JSON.parse(data) as string[]);
+      } catch {
+        /* ignore malformed SQL columns */
+      }
+    }),
+  );
+
+  // `rows` is the one ambiguous agent event: the structured path sends chart rows
+  // (`[{label, value}]`) while a SQL result would send positional rows
+  // (`[[...], ...]`). They are told apart STRUCTURALLY — an array-of-arrays is a
+  // SQL result — not by guessing which one the server meant. Today only the chart
+  // shape is ever emitted (`onprem-rag-server/src/agents/routes.rs`).
   unlisteners.push(
     await listen<ChatEvent>("agent://rows", (ev) => {
       const { run_id, data } = ev.payload;
       try {
-        useAgents.getState().setRows(run_id, JSON.parse(data) as AggRow[]);
+        const parsed = JSON.parse(data) as unknown;
+        if (!Array.isArray(parsed)) return;
+        if (parsed.length > 0 && Array.isArray(parsed[0])) {
+          useAgents.getState().setSqlRows(run_id, parsed as unknown[][]);
+        } else {
+          useAgents.getState().setRows(run_id, parsed as AggRow[]);
+        }
       } catch {
         /* ignore malformed rows payload */
       }
@@ -332,6 +392,82 @@ export async function initBridgeEvents(): Promise<void> {
       const { run_id } = ev.payload;
       agentTokenBuffer.flushNow(run_id);
       useAgents.getState().finish(run_id);
+    }),
+  );
+
+  // ── Plan 06 / 07: provenance, suggestions, clarify (agent stream) ─────────────
+  // These events only arrive when the server implements plan 06; until then they
+  // are simply never emitted, and the listeners are no-ops.
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://provenance", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setProvenance(run_id, JSON.parse(data) as Provenance);
+      } catch {
+        /* ignore malformed provenance payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://suggestions", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setSuggestions(run_id, JSON.parse(data) as Suggestion[]);
+      } catch {
+        /* ignore malformed suggestions payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://clarify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const payload = JSON.parse(data) as ClarifyPayload;
+        useAgents.getState().setClarify(run_id, payload);
+      } catch {
+        /* ignore malformed clarify payload */
+      }
+    }),
+  );
+
+  // ── Plan 06 / 07: provenance, suggestions, clarify (chat stream) ─────────────
+  // The Ask tab on /chat uses the same server executor and emits the same events
+  // on the chat:// channel.
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://provenance", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setProvenance(run_id, JSON.parse(data) as Provenance);
+      } catch {
+        /* ignore malformed provenance payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://suggestions", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSuggestions(run_id, JSON.parse(data) as Suggestion[]);
+      } catch {
+        /* ignore malformed suggestions payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://clarify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const payload = JSON.parse(data) as ClarifyPayload;
+        useChat.getState().setClarify(run_id, payload);
+      } catch {
+        /* ignore malformed clarify payload */
+      }
     }),
   );
 }

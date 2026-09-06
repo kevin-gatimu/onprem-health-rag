@@ -5,6 +5,7 @@ import { Badge, Button, Input, Modal } from '../../components/ui';
 import {
   getSchemaCatalog,
   getSchemaCatalogHistory,
+  EMPTY_METADATA_OVERRIDES,
   getSchemaMetadataOverrides,
   refreshSchemaCatalog,
   saveSchemaMetadataOverrides,
@@ -49,7 +50,11 @@ export default function SchemaMetadataModal({ source, onClose }: SchemaMetadataM
     enabled: source !== null && catalogQuery.isSuccess,
     retry: false,
   });
-  const [overrides, setOverrides] = useState<MetadataOverrides>({ aliases: [], relationships: [] });
+  // Seeded from EMPTY_METADATA_OVERRIDES, not a two-field literal: this modal
+  // PUTs the whole document back, and the server replaces it wholesale, so any
+  // field missing here would erase the admin's concept / column-role /
+  // service-line overrides set on the Settings Data Binding page.
+  const [overrides, setOverrides] = useState<MetadataOverrides>(EMPTY_METADATA_OVERRIDES);
   useEffect(() => {
     if (overridesQuery.data) setOverrides(overridesQuery.data);
   }, [overridesQuery.data]);
