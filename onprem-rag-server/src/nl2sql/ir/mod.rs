@@ -16,8 +16,6 @@ pub use bind::bind;
 pub use compile::compile;
 pub use parse::{parse, ParseOutcome};
 pub use plan_dto::PlannedSpec;
-pub use predicates::{lookup_predicate, predicate_to_filter};
-pub use spec::QuerySpec;
 
 #[cfg(test)]
 mod golden_tests {

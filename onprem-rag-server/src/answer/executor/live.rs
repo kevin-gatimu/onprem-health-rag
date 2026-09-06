@@ -27,6 +27,16 @@
 //! this module exists to avoid. The cost is one extra deterministic compile —
 //! cheap and model-free — and it is visible in `provenance.elapsed_ms`.
 
+// Plan-04 live-rungs subsystem: `LiveRungs` is the only `Rungs` implementation
+// that touches the database, model, or clock. It is complete but not yet
+// reachable from the live request path — `answer::executor::run` is the entry
+// point, but no route handler calls it yet. Wiring is gated on the golden suite
+// reaching 55/60 (currently 28/62); see TODO(plan03-live) in `nl2sql::prepare`.
+// Until then every public item here is dead from the binary's point of view, and
+// the resulting warning wall drowns out real signal — so the gate is recorded
+// here instead of in build output.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

@@ -31,6 +31,15 @@
 //! `fields.` prefix, and `aggregation::validate` checks bare names against the
 //! catalog. Emitting the prefix here would fail validation.
 
+// Plan-04 §3 subsystem: deterministic QuerySpec -> RunAggregation/RunList
+// translation, not yet reachable from the live request path. Used only by
+// `answer::executor::live::LiveRungs` (rung 4 of the executor ladder), which is
+// itself unwired; see TODO(plan03-live) in `nl2sql::prepare`. Wiring is gated on
+// the golden suite reaching 55/60 (currently 28/62). Until then every public item
+// here is dead from the binary's point of view, and the resulting warning wall
+// drowns out real signal — so the gate is recorded here instead of in build output.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use serde_json::{Map, Value};
 

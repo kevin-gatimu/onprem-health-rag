@@ -32,6 +32,15 @@
 //! and may carry a patient name, an MRN, or a national ID. Reason strings are produced by
 //! the helpers in this module and by fixed `&'static str` literals at the rung call sites.
 
+// Plan-04 §2 / plan-04a §9 subsystem: execution provenance types (Rung,
+// RungResult, Provenance), complete and unit-tested but not yet reachable from
+// the live request path. Wiring is gated on the golden suite reaching 55/60
+// (currently 28/62); see TODO(plan03-live) in `nl2sql::prepare`. Until then every
+// public item here is dead from the binary's point of view, and the resulting
+// warning wall drowns out real signal — so the gate is recorded here instead of in
+// build output.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
 use serde::Serialize;

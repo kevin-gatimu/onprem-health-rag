@@ -46,7 +46,7 @@ use crate::foundry::router::ModelSpec;
 use crate::nl2sql::ir::spec::{MissingSlot, QuerySpec};
 use crate::ontology::{binding::SchemaBinding, service_line::ServiceLine};
 
-pub use entities::{MetricHint, RouteEntities};
+pub use entities::RouteEntities;
 
 /// Warm, identity-aware system prompt for the conversational path. One cheap
 /// streamed reply covers greetings, thanks, identity/capability, and off-topic
@@ -242,7 +242,7 @@ impl RouteDecision {
 /// converted to the typed `RouteEntities` by `from_wire` before storage.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[allow(dead_code)]
-struct RouteEntitiesWire {
+pub(crate) struct RouteEntitiesWire {
     #[serde(default)]
     pub tables: Vec<String>,
     #[serde(default)]
