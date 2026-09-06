@@ -399,3 +399,185 @@ fn metadata_overrides_parses_legacy_two_field_document() {
     assert!(parsed.column_roles.is_empty());
     assert!(parsed.service_lines.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// `routed` SSE payload (`chat://routed` / `agent://routed`)
+// ---------------------------------------------------------------------------
+//
+// The bridge relays this event's `data` VERBATIM (see the `POST /agents/<kind>`
+// command in `commands.rs`), so there is no Rust mirror struct to round-trip —
+// which is the point: the only thing that can be wrong is the JSON text itself
+// and what `bridge.ts::RoutedPayload` claims about it. These tests therefore
+// assert on literal payload TEXT and on its exact key set.
+//
+// Server source of truth: `RouteDecision::to_sse_json`
+// (`onprem-rag-server/src/router/mod.rs` L179-235), emitted first by
+// `onprem-rag-server/src/rag/routes.rs` L332 and by
+// `onprem-rag-server/src/agents/routes.rs` L408.
+
+/// Every key `bridge.ts::RoutedPayload` declares. A payload key outside this set
+/// is a field the TypeScript mirror would silently drop.
+const ROUTED_PAYLOAD_KEYS: &[&str] = &[
+    "route",
+    "intent",
+    "backend",
+    "tier",
+    "cached",
+    "tier2_attempted",
+    "service_line",
+    "deterministic",
+    "scope_size",
+    "source_id",
+    "question",
+    "slot",
+];
+
+fn assert_routed_keys_are_mirrored(payload: &str) {
+    let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+    let obj = v
+        .as_object()
+        .unwrap_or_else(|| panic!("routed payload must be a JSON object: {payload}"));
+    for key in obj.keys() {
+        assert!(
+            ROUTED_PAYLOAD_KEYS.contains(&key.as_str()),
+            "routed payload key `{key}` is not declared in bridge.ts::RoutedPayload"
+        );
+    }
+}
+
+/// The `routed` payload is a JSON **object**, not the pre-plan-05 JSON-encoded
+/// agent-kind string. Asserted on the literal text of both shapes, because the
+/// client discriminates on exactly this (`typeof parsed === "string"` vs
+/// `"route" in parsed`, `bridgeEvents.ts`).
+#[test]
+fn routed_payload_is_an_object_not_a_bare_kind_string() {
+    // What a plan-05 server sends for a line agent answering a capability question:
+    // `capability_decision` (onprem-rag-server/src/agents/routes.rs L585-597) sets
+    // `service_line: kind.line()`, which is `Some(_)` for `AgentKind::Line`, so the
+    // v3 block in `to_sse_json` IS inserted.
+    let current = r#"{"route":"capability","intent":null,"backend":null,"tier":0,"cached":false,"tier2_attempted":false,"service_line":"pharmacy","deterministic":false,"scope_size":0,"source_id":null}"#;
+
+    // The legacy payload the same event used to carry.
+    let legacy = r#""pharmacy""#;
+
+    // The two shapes must be genuinely incompatible, or a mismatch stays invisible.
+    assert!(
+        serde_json::from_str::<String>(current).is_err(),
+        "the current payload must NOT read as a JSON string — decoding it like a \
+         `token` frame would mangle it: {current}"
+    );
+    assert_eq!(
+        serde_json::from_str::<String>(legacy).unwrap(),
+        "pharmacy",
+        "the legacy shape is a JSON string; the compatibility floor in \
+         bridgeEvents.ts depends on that staying true"
+    );
+
+    let v: serde_json::Value = serde_json::from_str(current).unwrap();
+    assert_eq!(v["route"], "capability");
+    assert_eq!(v["service_line"], "pharmacy");
+    assert_eq!(v["tier"], 0);
+    assert_eq!(v["cached"], false);
+    assert_eq!(v["tier2_attempted"], false);
+    assert_eq!(v["deterministic"], false);
+    assert_eq!(v["scope_size"], 0);
+    assert!(v["backend"].is_null());
+    assert!(v["source_id"].is_null());
+    assert_routed_keys_are_mirrored(current);
+}
+
+/// `"capability"` is a real route label (`RouteDecision::route_label`,
+/// `onprem-rag-server/src/router/mod.rs` L155). It must be in `RouteLabel` in
+/// `bridge.ts`, alongside the other six.
+#[test]
+fn every_route_label_the_server_emits_is_mirrored() {
+    // Exhaustive against the `match` in `route_label()`.
+    const SERVER_LABELS: &[&str] = &[
+        "conversational",
+        "capability",
+        "conversation_meta",
+        "structured",
+        "semantic",
+        "hybrid",
+        "clarify",
+    ];
+    for label in SERVER_LABELS {
+        let payload = format!(
+            r#"{{"route":"{label}","intent":null,"backend":null,"tier":1,"cached":false,"tier2_attempted":false}}"#
+        );
+        assert_routed_keys_are_mirrored(&payload);
+        let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(v["route"], *label);
+    }
+    assert_eq!(
+        SERVER_LABELS.len(),
+        7,
+        "a new RouteClass arm needs a matching member in bridge.ts::RouteLabel"
+    );
+}
+
+/// A structured v3 payload carries the fields the activity strip reads. The v3
+/// block is conditional server-side, so `deterministic` / `service_line` /
+/// `scope_size` / `source_id` are genuinely optional on the wire — which is why
+/// they are optional in `bridge.ts::RoutedPayload`.
+#[test]
+fn routed_payload_v3_and_clarify_fields_are_all_mirrored() {
+    let structured = r#"{"route":"structured","intent":"count","backend":"source_sql","tier":1,"cached":false,"tier2_attempted":false,"service_line":"revenue","deterministic":true,"scope_size":3,"source_id":"pg-dev"}"#;
+    assert_routed_keys_are_mirrored(structured);
+    let v: serde_json::Value = serde_json::from_str(structured).unwrap();
+    // The bridge mirror narrows `backend` to these two spellings; `"doc_db"` is the
+    // spelling of the *other* endpoint (`POST /route`), never of this event.
+    assert_eq!(v["backend"], "source_sql");
+    assert_eq!(v["deterministic"], true);
+    assert_eq!(v["scope_size"], 3);
+    assert_eq!(v["source_id"], "pg-dev");
+
+    // A v2 payload omits the whole v3 block rather than sending nulls.
+    let v2 = r#"{"route":"semantic","intent":null,"backend":null,"tier":2,"cached":true,"tier2_attempted":true}"#;
+    assert_routed_keys_are_mirrored(v2);
+    let v: serde_json::Value = serde_json::from_str(v2).unwrap();
+    assert!(
+        v.get("service_line").is_none(),
+        "v2 payloads must omit the v3 keys, not null them"
+    );
+
+    // Clarify adds two more keys; `slot` is `MissingSlot` under
+    // `#[serde(rename_all = "snake_case")]` (`nl2sql/ir/spec.rs` L564-577).
+    let clarify = r#"{"route":"clarify","intent":null,"backend":null,"tier":3,"cached":false,"tier2_attempted":true,"question":"Which ward?","slot":"time_range"}"#;
+    assert_routed_keys_are_mirrored(clarify);
+    let v: serde_json::Value = serde_json::from_str(clarify).unwrap();
+    assert_eq!(v["question"], "Which ward?");
+    assert_eq!(v["slot"], "time_range");
+}
+
+/// `GET /sources/<id>/binding` carries `orphans` (`BindingResponse.orphans`,
+/// `onprem-rag-server/src/ontology/routes.rs` L40). The bridge command returns the
+/// body as raw `serde_json::Value`, so nothing can drop it in Rust; this pins that
+/// the key is present in the real body under the name `bridge.ts` uses
+/// (`SourceBinding.orphans`) and is the table LIST, not the coverage count.
+#[test]
+fn binding_response_carries_orphans_by_that_name() {
+    let json = r#"{
+        "source_id": "pg-dev",
+        "bound_at": "2026-01-15T08:00:00+00:00",
+        "degraded": false,
+        "coverage": {"total_tables": 2, "bound_tables": 1, "orphan_tables": 1,
+                     "exact_concepts": 1, "usable_lines": ["patient_chart"]},
+        "usable_lines": ["patient_chart"],
+        "orphans": ["tmp_scratch"],
+        "tables": [
+            {"table_name":"patient","concept":"patient","confidence":0.94,
+             "service_lines":["patient_chart"],"event_time_col":null,"patient_path_hops":0}
+        ]
+    }"#;
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        v["orphans"],
+        serde_json::json!(["tmp_scratch"]),
+        "`orphans` is a top-level array of table names, NOT the `coverage.orphan_tables` count"
+    );
+    assert_eq!(v["coverage"]["orphan_tables"], 1);
+    // The subset mirror the roster uses must still parse the same body.
+    let b: BindingTablesResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(b.tables.len(), 1);
+}
