@@ -90,5 +90,6 @@ Appimages/
 .agents
 .playwright-mcp
 
-plans/*
 blogs/*
+# Exported archives — docs live in plans/docs/, not in a zip beside it
+*.zip
