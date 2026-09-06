@@ -246,20 +246,23 @@ async fn refresh_catalog_inner(
     // (fixes the "write-only hook" defect — plan 07 agent tabs read from
     // AppState::bindings, not from DocumentDB).
     //
-    // Descriptor vectors stay None (degraded mode): re-embedding every concept
-    // for each catalog refresh would be expensive and is not needed for correctness.
-    // The binding is marked degraded: true to signal this.
+    // Descriptor vectors are concept-level (not source-specific) and computed once
+    // per process via the module-level cache in ontology::binder.  The per-refresh
+    // cost objection no longer applies.  Bindings are degraded only when fastembed
+    // is not loaded (i.e. during the warm-up window before the first embed succeeds).
     //
     // Overrides ARE applied: they are read from the persisted `schema_metadata_overrides`
     // document so an admin's concept or role override survives every catalog refresh.
     if config.binding_enabled {
+        let dv_arc = crate::ontology::binder::descriptor_vectors_cached(config).await;
+        let dv_ref = dv_arc.as_deref();
         let overrides = load_binding_overrides(db, source_id).await;
         match crate::ontology::binder::build_binding(
             &cards,
             db,
             config,
             source_id,
-            None,
+            dv_ref,
             overrides.as_ref(),
         )
         .await
@@ -274,7 +277,7 @@ async fn refresh_catalog_inner(
                         tracing::info!(
                             source_id,
                             tables = tables_count,
-                            "schema binding rebuilt, persisted, and cached after catalog refresh (degraded)"
+                            "schema binding rebuilt, persisted, and cached after catalog refresh"
                         );
                     }
                     Err(_) => {

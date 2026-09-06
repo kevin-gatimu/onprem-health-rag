@@ -11,7 +11,6 @@ use crate::error::{AppError, AppResult};
 use crate::foundry::FoundryManager;
 use crate::ontology::binder::BindingOverrides;
 use crate::ontology::binding::SchemaBinding;
-use crate::ontology::concepts::EntityConcept;
 
 /// Cheaply-cloneable handle to the per-source schema binding cache.
 ///
@@ -66,10 +65,6 @@ pub struct AppState {
     /// Built on first `build_binding` call and updated on each catalog refresh.
     bindings: Arc<RwLock<HashMap<String, Arc<SchemaBinding>>>>,
 
-    /// BGE-M3 embeddings for every `ConceptDescriptor::description`, cached on
-    /// first `build_binding` call.  `None` while fastembed is not loaded.
-    descriptor_vectors: Arc<RwLock<Option<HashMap<EntityConcept, Vec<f32>>>>>,
-
     /// Per-source manual binding overrides, loaded from `schema_metadata_overrides`.
     binding_overrides: Arc<RwLock<HashMap<String, BindingOverrides>>>,
 }
@@ -100,7 +95,6 @@ impl AppState {
             run_progress: crate::progress::RunProgressHub::default(),
             warmup_state,
             bindings: Arc::new(RwLock::new(HashMap::new())),
-            descriptor_vectors: Arc::new(RwLock::new(None)),
             binding_overrides: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -242,22 +236,6 @@ impl AppState {
             for b in all {
                 w.insert(b.source_id.clone(), Arc::new(b));
             }
-        }
-    }
-
-    /// Return cached descriptor vectors (Arc clone).  `None` while not loaded.
-    pub fn descriptor_vectors(&self) -> Option<Arc<HashMap<EntityConcept, Vec<f32>>>> {
-        self.descriptor_vectors
-            .read()
-            .expect("descriptor_vectors lock poisoned")
-            .as_ref()
-            .map(|m| Arc::new(m.clone()))
-    }
-
-    /// Cache descriptor vectors after first computation.
-    pub fn set_descriptor_vectors(&self, vecs: HashMap<EntityConcept, Vec<f32>>) {
-        if let Ok(mut w) = self.descriptor_vectors.write() {
-            *w = Some(vecs);
         }
     }
 
