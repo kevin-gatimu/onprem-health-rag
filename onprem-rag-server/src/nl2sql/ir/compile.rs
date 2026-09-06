@@ -900,7 +900,13 @@ impl CompileCtx {
             TimeRange::ThisMonth => {
                 let start = NaiveDate::from_ymd_opt(now_date.year(), now_date.month(), 1)
                     .unwrap_or(now_date);
-                format!("{} >= '{}'", col_expr, start)
+                let (end_year, end_month) = if now_date.month() == 12 {
+                    (now_date.year() + 1, 1u32)
+                } else {
+                    (now_date.year(), now_date.month() + 1)
+                };
+                let end = NaiveDate::from_ymd_opt(end_year, end_month, 1).unwrap_or(now_date);
+                format!("{} >= '{}' AND {} < '{}'", col_expr, start, col_expr, end)
             }
             TimeRange::LastMonth => {
                 let (prev_year, prev_month) = if now_date.month() == 1 {
@@ -921,7 +927,15 @@ impl CompileCtx {
                 let q_start_month = q * 3 + 1;
                 let start =
                     NaiveDate::from_ymd_opt(now_date.year(), q_start_month, 1).unwrap_or(now_date);
-                format!("{} >= '{}'", col_expr, start)
+                let q_end_month = q_start_month + 3;
+                let (end_year, end_month_val) = if q_end_month > 12 {
+                    (now_date.year() + 1, q_end_month - 12)
+                } else {
+                    (now_date.year(), q_end_month)
+                };
+                let end =
+                    NaiveDate::from_ymd_opt(end_year, end_month_val, 1).unwrap_or(now_date);
+                format!("{} >= '{}' AND {} < '{}'", col_expr, start, col_expr, end)
             }
             TimeRange::LastQuarter => {
                 let q = (now_date.month() - 1) / 3;
@@ -941,7 +955,8 @@ impl CompileCtx {
             }
             TimeRange::ThisYear => {
                 let start = NaiveDate::from_ymd_opt(now_date.year(), 1, 1).unwrap_or(now_date);
-                format!("{} >= '{}'", col_expr, start)
+                let end = NaiveDate::from_ymd_opt(now_date.year() + 1, 1, 1).unwrap_or(now_date);
+                format!("{} >= '{}' AND {} < '{}'", col_expr, start, col_expr, end)
             }
             TimeRange::LastYear => {
                 let start =

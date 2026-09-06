@@ -26,6 +26,11 @@ pub struct DomainPredicate {
     pub name_hint: Option<&'static str>,
     /// How to apply the predicate once the column is resolved.
     pub kind: PredicateKind,
+    /// When `true` the predicate is satisfied by the ABSENCE of matching child
+    /// rows, i.e. the `RelatedScope` it creates must use NOT EXISTS rather than
+    /// EXISTS.  Set this on any predicate that means "no <child> where <cond>":
+    /// e.g. "out of stock" = no stock_batch where quantity_on_hand > 0.
+    pub negated_scope: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +75,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Measure,
         name_hint: Some("weight"),
         kind: PredicateKind::Lt(2500.0),
+        negated_scope: false,
     },
     // ── Stillbirth ────────────────────────────────────────────────────────────
     DomainPredicate {
@@ -78,6 +84,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["stillbirth", "stillborn"]),
+        negated_scope: false,
     },
     // ── Triage category 1 / red ───────────────────────────────────────────────
     DomainPredicate {
@@ -86,6 +93,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Priority,
         name_hint: Some("category"),
         kind: PredicateKind::In(&["1", "red", "category_1"]),
+        negated_scope: false,
     },
     // ── Abnormal result ───────────────────────────────────────────────────────
     // Targets the boolean is_abnormal column (Flag role).  Do NOT add "critical"
@@ -97,6 +105,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Flag,
         name_hint: Some("abnormal"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── Critical result ───────────────────────────────────────────────────────
     // Targets the boolean is_critical column (Criticality role).  Kept separate
@@ -109,6 +118,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Criticality,
         name_hint: Some("critical"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── No-show / DNA / missed appointment ───────────────────────────────────
     DomainPredicate {
@@ -117,6 +127,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["no_show", "dna", "did_not_attend"]),
+        negated_scope: false,
     },
     // ── Outstanding / unpaid bill ─────────────────────────────────────────────
     DomainPredicate {
@@ -125,6 +136,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Amount,
         name_hint: Some("due"),
         kind: PredicateKind::Gt(0.0),
+        negated_scope: false,
     },
     // ── Readmission ───────────────────────────────────────────────────────────
     DomainPredicate {
@@ -133,14 +145,24 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Flag,
         name_hint: Some("readmission"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── Out of stock ──────────────────────────────────────────────────────────
+    // "Which medicines are out of stock?" (ph-01)
+    //
+    // A medicine is out of stock when there are NO stock_batch rows with
+    // quantity_on_hand > 0.  The correct SQL is:
+    //   WHERE NOT EXISTS (SELECT 1 FROM stock_batches WHERE ... AND quantity_on_hand > 0)
+    // This requires:
+    //   • kind = Gt(0.0)  — the child filter is "quantity_on_hand > 0"
+    //   • negated_scope = true — the RelatedScope becomes NOT EXISTS
     DomainPredicate {
         phrases: &["out of stock", "stockout", "stock out", "zero stock"],
         concept: EntityConcept::StockBatch,
         role: ColumnRole::Quantity,
         name_hint: Some("on_hand"),
-        kind: PredicateKind::IsZero,
+        kind: PredicateKind::Gt(0.0),
+        negated_scope: true,
     },
     // ── Lost to follow-up ─────────────────────────────────────────────────────
     DomainPredicate {
@@ -149,6 +171,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["lost_to_followup", "ltfu", "defaulted"]),
+        negated_scope: false,
     },
     // ── Break-glass ───────────────────────────────────────────────────────────
     DomainPredicate {
@@ -157,6 +180,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Flag,
         name_hint: Some("break_glass"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── In charge ─────────────────────────────────────────────────────────────
     DomainPredicate {
@@ -165,6 +189,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Flag,
         name_hint: Some("in_charge"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── Pending certification (mortality) ─────────────────────────────────────
     DomainPredicate {
@@ -173,6 +198,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Identifier,
         name_hint: Some("certificate"),
         kind: PredicateKind::IsNull,
+        negated_scope: false,
     },
     // ── Postpartum haemorrhage ────────────────────────────────────────────────
     DomainPredicate {
@@ -181,6 +207,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Flag,
         name_hint: Some("pph"),
         kind: PredicateKind::IsTrue,
+        negated_scope: false,
     },
     // ── Equipment out of service ──────────────────────────────────────────────
     DomainPredicate {
@@ -189,6 +216,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["out_of_service", "faulty", "broken"]),
+        negated_scope: false,
     },
     // ── Cases without consent ─────────────────────────────────────────────────
     DomainPredicate {
@@ -197,6 +225,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::PrimaryKey, // used to detect absence via NOT EXISTS
         name_hint: None,
         kind: PredicateKind::IsNull, // signals anti-join in compiler
+        negated_scope: false,
     },
     // ── Allergy / allergic to ─────────────────────────────────────────────────
     //
@@ -224,6 +253,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Emergency department attendance ──────────────────────────────────────
     //
@@ -250,6 +280,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::EventTime,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Cohort: record access ─────────────────────────────────────────────────
     //
@@ -279,6 +310,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::EventTime,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Cohort: care-programme enrolment (TB / HIV / chronic care) ────────────
     //
@@ -321,6 +353,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Cohort: HIV program ───────────────────────────────────────────────────
     //
@@ -335,6 +368,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Cohort: chronic care enrollment ──────────────────────────────────────
     //
@@ -350,6 +384,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Cohort: diabetes ──────────────────────────────────────────────────────
     //
@@ -372,6 +407,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Code,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Caesarean delivery ────────────────────────────────────────────────────
     DomainPredicate {
@@ -380,6 +416,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Type,
         name_hint: Some("mode"),
         kind: PredicateKind::In(&["caesarean", "c_section", "lscs", "cs"]),
+        negated_scope: false,
     },
     // ── Refused prescription ─────────────────────────────────────────────────
     //
@@ -394,6 +431,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["refused"]),
+        negated_scope: false,
     },
     // ── Night shift / tonight ─────────────────────────────────────────────────
     //
@@ -406,6 +444,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Type,
         name_hint: None,
         kind: PredicateKind::In(&["night"]),
+        negated_scope: false,
     },
     // ── Rejected insurance claim ──────────────────────────────────────────────
     DomainPredicate {
@@ -414,6 +453,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["rejected", "denied"]),
+        negated_scope: false,
     },
     // ── Unreviewed lab result ─────────────────────────────────────────────────
     //
@@ -434,6 +474,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::ForeignRef,
         name_hint: Some("verified"),
         kind: PredicateKind::IsNull,
+        negated_scope: false,
     },
     // ── Free / available bed ─────────────────────────────────────────────────
     DomainPredicate {
@@ -442,6 +483,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["available", "free", "vacant"]),
+        negated_scope: false,
     },
     // ── Surgery: performed ────────────────────────────────────────────────────
     //
@@ -471,6 +513,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Surgery: cancelled ────────────────────────────────────────────────────
     //
@@ -497,6 +540,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::Status,
         name_hint: None,
         kind: PredicateKind::In(&["cancelled"]),
+        negated_scope: false,
     },
     // ── Equipment overdue for servicing ───────────────────────────────────────
     //
@@ -522,6 +566,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::EventTime,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
     // ── Antenatal visit due ───────────────────────────────────────────────────
     //
@@ -546,6 +591,7 @@ pub static DOMAIN_PREDICATES: &[DomainPredicate] = &[
         role: ColumnRole::EventTime,
         name_hint: None,
         kind: PredicateKind::Unexpressible,
+        negated_scope: false,
     },
 ];
 
