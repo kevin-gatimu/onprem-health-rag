@@ -138,8 +138,8 @@ pub async fn rebuild_binding(
         )));
     }
 
-    // Get descriptor vectors (compute if needed, non-fatal)
-    let dv_arc = state.descriptor_vectors();
+    // Get descriptor vectors from the process-level cache (computed once, non-fatal).
+    let dv_arc = crate::ontology::binder::descriptor_vectors_cached(&state.config).await;
     let dv_ref = dv_arc.as_deref();
 
     let overrides = state.binding_overrides_for(source_id);

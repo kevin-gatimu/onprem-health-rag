@@ -7,8 +7,8 @@
 //!   `Vec<TableBinding>`.  No async, no DB, fully unit-testable.
 //!
 //! - [`build_binding`] — **async wrapper** around `bind_cards`.  Probes enum values
-//!   for categorical columns, resolves descriptor embeddings from AppState (computing
-//!   and caching them on first call), then delegates the pure work to `bind_cards`.
+//!   for categorical columns, receives pre-computed descriptor embeddings from the
+//!   module-level process cache, then delegates the pure work to `bind_cards`.
 //!
 //! # Scoring formula
 //!
@@ -24,6 +24,7 @@
 //! (≈ 0.412 / 0.353 / 0.176 / 0.059).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -1096,8 +1097,40 @@ async fn get_source_kind(
 }
 
 // ---------------------------------------------------------------------------
-// Compute descriptor embeddings (called by build_binding or state init)
+// Compute descriptor embeddings — module-level process cache
 // ---------------------------------------------------------------------------
+
+/// Process-local cache for BGE-M3 concept descriptor embeddings.
+///
+/// Set at most once (on the first successful computation). While fastembed is not
+/// loaded the cell stays empty so the next call can retry — a `OnceLock` that
+/// latches `None` would permanently degrade every subsequent binding.
+static DV_CACHE: std::sync::OnceLock<Arc<HashMap<EntityConcept, Vec<f32>>>> =
+    std::sync::OnceLock::new();
+
+/// Return the process-wide BGE-M3 descriptor-vector map, computing it on first
+/// successful call.
+///
+/// Returns `None` (degraded) when fastembed is not yet loaded. The cache is left
+/// empty so the next call retries; it is never latched to `None`.
+///
+/// A rare duplicate embedding under a concurrent race is acceptable — no elaborate
+/// locking is built to prevent it.
+pub async fn descriptor_vectors_cached(
+    config: &crate::config::Config,
+) -> Option<Arc<HashMap<EntityConcept, Vec<f32>>>> {
+    // Fast path: already computed this process.
+    if let Some(arc) = DV_CACHE.get() {
+        return Some(arc.clone());
+    }
+    // Slow path: attempt to compute. Returns None (degraded) when fastembed not loaded.
+    let map = compute_descriptor_vectors(config).await?;
+    let arc = Arc::new(map);
+    // Store in the cache. If another task raced and already stored a value, that is
+    // fine — both are valid; keep whichever arrived first.
+    let _ = DV_CACHE.set(arc.clone());
+    Some(DV_CACHE.get().cloned().unwrap_or(arc))
+}
 
 /// Compute BGE-M3 embeddings for all non-Unknown entity concept descriptions.
 /// Returns `None` if fastembed is not loaded.
@@ -1472,5 +1505,54 @@ pub mod tests {
             assert_eq!(a.table_name, b.table_name, "table order mismatch after shuffle");
             assert_eq!(a.concept, b.concept, "concept changed after shuffle for {}", a.table_name);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // descriptor_vectors_cached — cache behaviour without a live embedder
+    // -----------------------------------------------------------------------
+
+    /// When fastembed is not loaded the accessor must return `None` and must
+    /// NOT latch the process cache, so a later call (after fastembed warms up)
+    /// can still succeed.
+    ///
+    /// Note: the static `DV_CACHE` is process-wide.  Because fastembed is
+    /// never initialised in the test binary the cache remains empty throughout
+    /// these tests, which is the correct behaviour to verify.
+    #[tokio::test]
+    async fn descriptor_vectors_cached_none_when_embed_not_loaded() {
+        let config = crate::config::Config::from_env();
+
+        // embed is not loaded in the test environment → must return None.
+        let result = descriptor_vectors_cached(&config).await;
+        assert!(
+            result.is_none(),
+            "expected None when fastembed is not loaded"
+        );
+
+        // The cache must remain empty so a future call can succeed after
+        // fastembed warms up — it must not be latched to None.
+        assert!(
+            DV_CACHE.get().is_none(),
+            "DV_CACHE must not be latched when compute returned None"
+        );
+    }
+
+    /// Calling the accessor repeatedly without a live embedder must keep
+    /// returning `None` and must never latch the cache.
+    #[tokio::test]
+    async fn descriptor_vectors_cached_repeated_none_does_not_latch() {
+        let config = crate::config::Config::from_env();
+
+        let r1 = descriptor_vectors_cached(&config).await;
+        let r2 = descriptor_vectors_cached(&config).await;
+        let r3 = descriptor_vectors_cached(&config).await;
+
+        assert!(r1.is_none(), "first call must be None without fastembed");
+        assert!(r2.is_none(), "second call must be None without fastembed");
+        assert!(r3.is_none(), "third call must be None without fastembed");
+        assert!(
+            DV_CACHE.get().is_none(),
+            "repeated calls must not latch DV_CACHE"
+        );
     }
 }
