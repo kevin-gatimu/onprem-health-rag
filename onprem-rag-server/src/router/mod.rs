@@ -803,17 +803,31 @@ pub async fn route_v3(
         };
     }
 
-    // Tier 0 — conversational gate
+    // Tier 0 — capability gate (plan 05 §5)
     //
-    // NOTE (plan 05 §5): a `Capability` gate belongs here, before the
-    // conversational gate. It is deliberately NOT wired in: the `identity` row
-    // of `eval/data/router.jsonl` ("What can you do?") asserts `conversational`
-    // for this surface, and `router_fixture_accuracy` holds that fixture to a
-    // 0.93 gate. Adding the gate here would only pass by editing that fixture.
-    // The capability answer is therefore produced at the agents endpoint
-    // (`agents::routes`), which is where plan 05 §10's "< 100 ms, no model call"
-    // acceptance actually applies; `RouteClass::Capability` and
-    // `conversational::is_capability` exist and are used there.
+    // Must run before the conversational gate: "what can you do?" matches both
+    // `is_capability` and `is_conversational` (via the IDENTITY regex), but the
+    // truthful binding-derived answer belongs to `Capability`, not to the model
+    // improvisation that `Conversational` triggers.  The `identity` fixture row
+    // has been updated to `capability` accordingly.
+    if conversational::is_capability(req.question) {
+        cache.metrics.tier0.fetch_add(1, Ordering::Relaxed);
+        return RouteDecision {
+            class: RouteClass::Capability,
+            tier: 0,
+            cached: false,
+            tier2_attempted: false,
+            entities: RouteEntities::default(),
+            deterministic: false,
+            service_line: None,
+            source_id: None,
+            scope: vec![],
+            query_spec: None,
+            resolved_question: req.question.to_string(),
+        };
+    }
+
+    // Tier 0 — conversational gate
     if conversational::is_conversational(req.question) {
         cache.metrics.tier0.fetch_add(1, Ordering::Relaxed);
         return RouteDecision {
@@ -1747,10 +1761,25 @@ mod tests {
         let dev_acc = dev_route_ok as f64 / dev_judged as f64;
         let alt_acc = alt_route_ok as f64 / alt_judged as f64;
 
-        // Gate: 0.93 (≈ 30/32). After removing the two single-question markers
-        // ("what is on " and " expires"), `theatre-list-tomorrow` and
-        // `pharmacy-expiry` route to semantic; 30/32 = 0.9375 is the honest
-        // floor and is the accepted outcome per plan-02 Item 5 review.
+        // Gate: 0.93 (≈ 30/32).
+        //
+        // One fixture row was corrected: `identity` ("What can you do?") moved
+        // from `conversational` to `capability`, because the `Capability` gate is
+        // now wired in `route_v3` above and a capability question deserves the
+        // binding-derived answer rather than model improvisation. The fixture
+        // follows a *behaviour* change; it was not edited to match broken
+        // behaviour.
+        //
+        // `theatre-list-tomorrow` and `pharmacy-expiry` still FAIL, deliberately.
+        // Both are real router defects, not stale expectations: "What is on
+        // tomorrow's list?" and "What expires within 30 days?" are structured
+        // enumerations over `surgeries.scheduled_start` and
+        // `stock_batches.expiry_date` respectively, and routing them to semantic
+        // retrieval answers the wrong question. `aggregation::intent` records the
+        // marker removal that caused it and calls the two rows an accepted cost.
+        // They stay red so the defect stays visible; 30/32 = 0.9375 is the honest
+        // floor. Flipping either row to `semantic` would convert a known bug into
+        // a silent pass and is not permitted.
         assert!(
             dev_acc >= 0.93,
             "dev binding v3 route accuracy {:.3} below 0.93 gate ({dev_route_ok}/{dev_judged}); \
