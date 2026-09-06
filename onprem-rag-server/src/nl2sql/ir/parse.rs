@@ -575,6 +575,8 @@ fn try_r1_count(
             // Cross-concept, expressible predicate → single-hop reverse-FK semi-join.
             // Grouped by concept so multiple predicates on the same child concept
             // produce one EXISTS subquery (not one per predicate).
+            // `negated` comes from the predicate: "out of stock" uses NOT EXISTS
+            // (stock_batches where quantity > 0), not EXISTS (quantity = 0).
             let child_filter = predicate_to_filter(pred);
             if let Some(rs) = related_scopes.iter_mut().find(|rs| rs.concept == pred.concept) {
                 rs.filters.push(child_filter);
@@ -583,7 +585,7 @@ fn try_r1_count(
                     concept: pred.concept,
                     filters: vec![child_filter],
                     time: None,
-                    negated: false,
+                    negated: pred.negated_scope,
                     physical: None,
                 });
             }
@@ -794,10 +796,18 @@ fn try_r3_average(
     };
 
     let target = ColumnRef { concept, role: target_role, name_hint: name_hint.map(|s| s.to_string()), physical: None };
-    let measures = vec![Measure { op: agg_op, target: Some(ValueExpr::Column(target)), alias: "average".into() }];
+    // Use the metric-slug alias when a recognised duration metric is matched
+    // (plan 03g §1 — alias must name the unit: avg_duration_minutes, etc.).
+    // For non-duration averages fall back to "average".
+    let alias = if let Some((metric_slug, unit)) = derived_duration_metric(tokens) {
+        format!("{}_{}_{}", agg_slug(&agg_op), metric_slug, unit.as_str())
+    } else {
+        "average".to_string()
+    };
+    let measures = vec![Measure { op: agg_op, target: Some(ValueExpr::Column(target)), alias: alias.clone() }];
 
     Some((
-        build_r3_spec(concept, measures, "average", by_concept, time_range),
+        build_r3_spec(concept, measures, &alias, by_concept, time_range),
         vec![],
     ))
 }
@@ -1264,6 +1274,7 @@ fn try_r8_list(
             filters.push(predicate_to_filter(pred));
         } else {
             // Cross-concept, expressible predicate → single-hop reverse-FK semi-join.
+            // `negated` comes from the predicate: "out of stock" uses NOT EXISTS.
             let child_filter = predicate_to_filter(pred);
             if let Some(rs) = related_scopes.iter_mut().find(|rs| rs.concept == pred.concept) {
                 rs.filters.push(child_filter);
@@ -1272,7 +1283,7 @@ fn try_r8_list(
                     concept: pred.concept,
                     filters: vec![child_filter],
                     time: None,
-                    negated: false,
+                    negated: pred.negated_scope,
                     physical: None,
                 });
             }

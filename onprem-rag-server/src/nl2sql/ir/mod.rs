@@ -551,11 +551,11 @@ mod golden_tests {
         //     `wrong <= 0` below, and it must not be re-blessed as correct.
         //   - qs-01 "How many incidents were reported this quarter?" —
         //     `incident_reports` has both `occurred_at` and `reported_at`;
-        //     `select_event_time` picks whichever comes first in column
-        //     order, which is `occurred_at`, not the `reported_at` the
-        //     question's own wording names. Same "can't mark wrong, won't
-        //     bless" situation as pc-02 (compare qs-05 "...happened this
-        //     month?", blessed above: "happened" does match `occurred_at`).
+        //     the binder now picks `reported_at` (correct — "reported" names
+        //     that column), so qs-01 is blessed with a two-sided quarter
+        //     range on `reported_at` (compare qs-05 "...happened this
+        //     month?", which picks `occurred_at` and remains unblessed in
+        //     dev because the pipeline refuses on the EventTime ambiguity).
         //   - fac-01 "Which equipment is out of service?" — real
         //     `equipment.status` values are ('in_service','under_repair',
         //     'standby','decommissioned','awaiting_parts'); none is
