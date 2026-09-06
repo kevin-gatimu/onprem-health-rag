@@ -36,6 +36,15 @@
 //! What focus must *never* carry: free-text clinical content, diagnoses, contact
 //! details, national ids, or a patient name anywhere a log line can reach.
 
+// Plan-06 §2 subsystem: typed conversation focus slots (ConversationFocus,
+// FocusEntity, apply), complete and unit-tested but not yet reachable from
+// the live request path. Consumed by `router::focus_resolve` (plan 06 §3), which
+// is itself unwired; see TODO(plan03-live) in `nl2sql::prepare`. Wiring is gated
+// on the golden suite reaching 55/60 (currently 28/62). Until then every public
+// item here is dead from the binary's point of view, and the resulting warning
+// wall drowns out real signal — so the gate is recorded here instead of in build output.
+#![allow(dead_code)]
+
 use std::fmt;
 
 use serde::{Deserialize, Serialize};

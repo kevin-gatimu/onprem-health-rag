@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::aggregation::intent::QueryIntent;
 
 use super::spec::{
-    BucketUnit, MeasureOp, QuerySpec, Shape, SortDir, TimeRange,
+    MeasureOp, QuerySpec, Shape, SortDir, TimeRange,
 };
 
 // ---------------------------------------------------------------------------

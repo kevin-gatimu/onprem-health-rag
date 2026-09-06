@@ -30,6 +30,14 @@
 //! A caller therefore *cannot* route one of these specs to a database without
 //! passing the existing guard; there is no second copy of it here.
 
+// Plan-06 §3 subsystem: complete and unit-tested, not yet reachable from the live
+// request path. `nl2sql::prepare` runs the IR in shadow mode and always falls
+// through to the template path; see TODO(plan03-live) there. Wiring is gated on the
+// golden suite reaching 55/60 (currently 28/62). Until then every public item here
+// is dead from the binary's point of view, and the resulting warning wall drowns
+// out real signal — so the gate is recorded here instead of in build output.
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use std::sync::LazyLock;

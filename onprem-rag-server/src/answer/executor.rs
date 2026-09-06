@@ -40,6 +40,15 @@
 //! so the distinction lives in the [`ExecOutcome`] variant rather than being
 //! inferred from an empty vector.
 
+// Plan-04 §2 subsystem: complete and unit-tested ladder (run_ladder, ExecOutcome,
+// Rungs, RungReport), not yet reachable from the live request path. The entry
+// point `run` is not called by any route handler because wiring is gated on the
+// golden suite reaching 55/60 (currently 28/62); see TODO(plan03-live) in
+// `nl2sql::prepare`. Until then every public item here is dead from the binary's
+// point of view, and the resulting warning wall drowns out real signal — so the
+// gate is recorded here instead of in build output.
+#![allow(dead_code)]
+
 use std::time::{Duration, Instant};
 
 use mongodb::bson::Document;

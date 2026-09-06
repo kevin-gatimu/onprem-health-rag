@@ -296,7 +296,6 @@ pub const ANCHOR_CONCEPTS: &[EntityConcept] = &[
 
 /// Return the descriptor for a concept. `Unknown` panics — it has no descriptor.
 pub fn descriptor(c: EntityConcept) -> &'static ConceptDescriptor {
-    use EntityConcept::*;
     DESCRIPTORS
         .iter()
         .find(|d| d.concept == c)

@@ -24,8 +24,6 @@ pub mod store;
 #[cfg(test)]
 pub mod tests;
 
-pub use binding::{BindingCoverage, ColumnBinding, JoinHop, SchemaBinding, TableBinding};
-pub use binder::{BindingOverrides, bind_cards, build_binding, compute_descriptor_vectors};
-pub use concepts::{ANCHOR_CONCEPTS, EntityConcept, SHARED_CONCEPTS, descriptor};
-pub use roles::{ColumnRole, ROLE_TOKENS, RoleTokens, TypeClass};
+pub use concepts::EntityConcept;
+pub use roles::ColumnRole;
 pub use service_line::ServiceLine;
