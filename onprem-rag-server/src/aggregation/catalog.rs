@@ -24,6 +24,12 @@ use std::collections::HashMap;
 use crate::ontology::concepts::EntityConcept;
 use crate::ontology::service_line::ServiceLine;
 
+// Plan 04 §3 places `spec_from_query_spec` alongside `Catalog::scoped`. The
+// translation itself is long enough to warrant its own file, so it lives in
+// `from_ir.rs` and is re-exported here — one canonical path, one implementation.
+#[allow(unused_imports)]
+pub use super::from_ir::{DocDbSpec, spec_from_query_spec, spec_from_query_spec_at};
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------

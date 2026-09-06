@@ -6,6 +6,10 @@
 //! The route files own their SSE contracts; this module owns the model and DB
 //! work. Keeping it at the crate root avoids a `rag` -> `agents` import cycle.
 
+pub mod executor;
+pub mod narrate;
+pub mod provenance;
+
 use crate::aggregation::catalog::Catalog;
 use crate::aggregation::execute;
 use crate::aggregation::intent::QueryIntent;

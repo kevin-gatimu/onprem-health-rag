@@ -13,9 +13,13 @@ use rocket::serde::json::Json;
 use rocket::{State, delete, get, patch, post};
 use serde::{Deserialize, Serialize};
 
+use crate::agents::kind::AgentMode;
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::{AppError, AppResult};
+use crate::memory::FOCUS_FIELD;
+use crate::memory::focus::ConversationFocus;
+use crate::ontology::ServiceLine;
 use crate::rag::ChatTurn;
 use crate::state::AppState;
 
@@ -32,6 +36,15 @@ pub struct ConversationOut {
     /// Set for agent conversations; absent for plain chat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// Service line the conversation is pinned to, as a slug (plan 07 §4
+    /// "Open in {Line}"). Absent on conversations created before plan 06 and on
+    /// unpinned ones — the client treats absent as "not pinned", never as a
+    /// default line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_line: Option<String>,
+    /// Agent mode (`ask` | `trends` | `handover`) the conversation was left in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Structured aggregation result stored with agent assistant messages (structured path).
@@ -51,6 +64,44 @@ pub struct SqlResult {
     pub sql: String,
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
+}
+
+/// One follow-up suggestion chip persisted with an assistant message (plan 06 §5).
+///
+/// Defined here rather than in `answer/suggest.rs` because this is the **wire and
+/// storage** shape, and it must match the client mirror
+/// (`src-tauri/src/commands.rs::Suggestion`, `src/lib/bridge.ts::Suggestion`)
+/// field for field. The generator, when it lands, serialises into this.
+///
+/// `kind` is a string rather than an enum on purpose: the client already accepts
+/// `"drill" | "widen" | "compare" | "switch" | "explain" | (string & {})`, and a
+/// Rust enum would serialise a future variant as a hard parse failure on reload
+/// of an older message instead of an unknown-but-displayable chip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestionOut {
+    pub text: String,
+    pub kind: String,
+    /// Pre-bound `QuerySpec` the chip re-runs, passed straight back as
+    /// `suggestion_spec` on click. Opaque JSON here — this module does not need
+    /// to understand the IR to store it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    /// Owning agent slug, when clicking the chip switches tabs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// A clarification the router posed, persisted so a reload shows the question
+/// and its options rather than a blank assistant turn (plan 06 §4).
+///
+/// Matches `ClarifyPayload` in both client mirrors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarifyOut {
+    pub question: String,
+    /// `MissingSlot` as a snake_case slug (`subject`, `time_range`, …).
+    pub slot: String,
+    #[serde(default)]
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,6 +127,31 @@ pub struct MessageOut {
     /// Exact operational SQL result used for a text-to-SQL chat answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql_result: Option<SqlResult>,
+    /// Follow-up suggestion chips generated with this answer (plan 06 §5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<SuggestionOut>>,
+    /// Focus slot **names** the answer borrowed from (`["patient","time_range"]`).
+    ///
+    /// Names only, never values: this crosses to the client, and a patient key or
+    /// a ward name here would put PHI in a payload whose only job is to render a
+    /// "using: …" chip. The values stay server-side in the focus document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_used: Option<Vec<String>>,
+    /// Execution provenance (plan 04 §6): the rung ladder, backend, and timings.
+    ///
+    /// Passed through as opaque JSON exactly as `answer::provenance::Provenance`
+    /// serialised it. Re-typing it here would create a second definition of a
+    /// wire format that has already been pinned by a literal-JSON assertion —
+    /// and a divergence between the two would fail silently, because the field is
+    /// `Option` on both sides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
+    /// The `QuerySpec` IR behind a structured answer (plan 03), opaque here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    /// The clarification this assistant turn posed, when it posed one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clarify: Option<ClarifyOut>,
     pub created_at: String,
 }
 
@@ -92,9 +168,23 @@ pub struct CreateConversationBody {
     pub agent_kind: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+/// `PATCH /conversations/<id>` body.
+///
+/// Every field is optional and applied only when present, so the pre-plan-06
+/// caller that sends `{"title": "..."}` behaves exactly as before. At least one
+/// field must be present — an empty patch is a client bug, and answering `200`
+/// to it would hide the bug rather than surface it.
+#[derive(Debug, Default, Deserialize)]
 pub struct RenameConversationBody {
-    pub title: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Service-line slug to pin the conversation to (plan 07 §4 "Open in {Line}").
+    /// Validated against `ServiceLine::ALL`; `Some("")` clears the pin.
+    #[serde(default)]
+    pub service_line: Option<String>,
+    /// Agent mode: `ask` | `trends` | `handover`. `Some("")` clears it.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -207,12 +297,27 @@ pub async fn create_conversation(
         id: id.to_hex(),
         title,
         agent_kind: agent_kind_out,
+        service_line: None,
+        mode: None,
         created_at: millis_to_iso(now.timestamp_millis()),
         updated_at: millis_to_iso(now.timestamp_millis()),
     }))
 }
 
-/// `PATCH /conversations/<id>` — rename a conversation (ownership-checked).
+/// `PATCH /conversations/<id>` — update a conversation's title, pinned service
+/// line, or agent mode (ownership-checked).
+///
+/// Additive by construction: each field is applied only when the body carries it,
+/// so a pre-plan-06 client sending `{"title": "..."}` produces byte-identical
+/// behaviour to before. The service line and mode were added because plan 07 §4's
+/// "Open in {Line}" has to survive a reload, and the conversation document is the
+/// only per-conversation store that does.
+///
+/// Both slugs are validated against the ontology rather than stored as free text:
+/// an unknown line persisted here would later be read back by
+/// `ServiceLine::from_slug` as `None` and silently degrade to "unpinned", which is
+/// indistinguishable from a client bug. An empty string is the explicit "clear"
+/// signal and unsets the field.
 #[patch("/conversations/<id>", data = "<body>")]
 pub async fn rename_conversation(
     state: &State<AppState>,
@@ -229,23 +334,95 @@ pub async fn rename_conversation(
         .await?
         .ok_or(AppError::NotFound)?;
 
+    let (set, unset) = build_patch_update(&body)?;
+    if set.is_empty() && unset.is_empty() {
+        return Err(AppError::BadRequest(
+            "patch body must set at least one of title, service_line, mode".into(),
+        ));
+    }
+
     let now = BsonDateTime::now();
+    let mut set = set;
+    set.insert("updated_at", now);
+
+    let mut update = doc! { "$set": set };
+    if !unset.is_empty() {
+        update.insert("$unset", unset);
+    }
+
     state
         .db
         .chat_conversations()
-        .update_one(
-            doc! { "_id": oid },
-            doc! { "$set": { "title": &body.title, "updated_at": now } },
-        )
+        .update_one(doc! { "_id": oid }, update)
         .await?;
+
+    // Project the post-update state without a second read: apply exactly the
+    // fields the patch touched over the document we already fetched.
+    let title = body
+        .title
+        .clone()
+        .unwrap_or_else(|| conv.get_str("title").unwrap_or("").to_string());
+    let service_line = patched_field(&body.service_line, &conv, "service_line");
+    let mode = patched_field(&body.mode, &conv, "mode");
 
     Ok(Json(ConversationOut {
         id: id.to_string(),
-        title: body.title.clone(),
+        title,
         agent_kind: conv.get_str("agent_kind").ok().map(str::to_string),
+        service_line,
+        mode,
         created_at: read_dt_field(&conv, "created_at"),
         updated_at: millis_to_iso(now.timestamp_millis()),
     }))
+}
+
+/// Split a `PATCH` body into the `$set` and `$unset` sub-documents it implies.
+///
+/// Pulled out of the handler so the validation and the additive semantics are
+/// unit-testable without a database (the rule "a body with only `title` must
+/// behave exactly as before" is an assertion, not a comment).
+fn build_patch_update(body: &RenameConversationBody) -> AppResult<(Document, Document)> {
+    let mut set = Document::new();
+    let mut unset = Document::new();
+
+    if let Some(title) = &body.title {
+        set.insert("title", title.clone());
+    }
+
+    if let Some(raw) = &body.service_line {
+        let slug = raw.trim();
+        if slug.is_empty() {
+            unset.insert("service_line", "");
+        } else {
+            let line = ServiceLine::from_slug(slug)
+                .ok_or_else(|| AppError::BadRequest(format!("unknown service line: {slug}")))?;
+            set.insert("service_line", line.slug());
+        }
+    }
+
+    if let Some(raw) = &body.mode {
+        let slug = raw.trim();
+        if slug.is_empty() {
+            unset.insert("mode", "");
+        } else {
+            let mode = AgentMode::from_slug(slug)
+                .ok_or_else(|| AppError::BadRequest(format!("unknown mode: {slug}")))?;
+            set.insert("mode", mode.slug());
+        }
+    }
+
+    Ok((set, unset))
+}
+
+/// The value a patched string field holds after the update: the patch value when
+/// present and non-empty, `None` when the patch cleared it, otherwise whatever
+/// the stored document already had.
+fn patched_field(patch: &Option<String>, conv: &Document, field: &str) -> Option<String> {
+    match patch {
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(raw.trim().to_string()),
+        None => conv.get_str(field).ok().map(str::to_string),
+    }
 }
 
 /// `DELETE /conversations/<id>` — delete a conversation and cascade to its
@@ -617,6 +794,200 @@ pub(crate) async fn persist_agent_assistant_message(
     Ok(())
 }
 
+/// Plan-06 extras attached to an assistant message after the answer is built.
+///
+/// A separate struct with a separate write, rather than five more parameters on
+/// each of the three `persist_*_assistant_message` functions: those are called
+/// from `rag/routes.rs` and `agents/routes.rs`, and widening their signatures
+/// would force every existing call site to change for fields most of them never
+/// set. Callers persist the message as they do today, then make one extra call.
+#[derive(Debug, Default)]
+pub(crate) struct AnswerExtras<'a> {
+    /// Follow-up chips (plan 06 section 5). `None` and `Some(&[])` both store nothing.
+    pub suggestions: Option<&'a [SuggestionOut]>,
+    /// Focus slot **names** used, never values (see `MessageOut::focus_used`).
+    pub focus_used: &'a [String],
+    /// `answer::provenance::Provenance` already serialised. Opaque here.
+    pub provenance: Option<serde_json::Value>,
+    /// The `QuerySpec` behind the answer, already serialised. Opaque here.
+    pub spec: Option<serde_json::Value>,
+    /// The clarification this turn posed, if it posed one.
+    pub clarify: Option<&'a ClarifyOut>,
+}
+
+impl AnswerExtras<'_> {
+    /// Whether there is anything at all to write -- lets the caller skip the
+    /// round-trip on the common path where the answer carried no extras.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.suggestions.is_none_or(|s| s.is_empty())
+            && self.focus_used.is_empty()
+            && self.provenance.is_none()
+            && self.spec.is_none()
+            && self.clarify.is_none()
+    }
+}
+
+/// Attach plan-06 extras to the conversation's newest assistant message.
+///
+/// Targets the newest assistant message rather than an id because the existing
+/// `persist_*_assistant_message` helpers do not return one, and the caller writes
+/// the message immediately before calling this.
+pub(crate) async fn attach_answer_extras(
+    db: &DocumentDb,
+    conversation_id: &str,
+    extras: &AnswerExtras<'_>,
+) -> AppResult<()> {
+    if extras.is_empty() {
+        return Ok(());
+    }
+    let Some(newest) = db
+        .chat_messages()
+        .find_one(doc! { "conversation_id": conversation_id, "role": "assistant" })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?
+    else {
+        return Ok(());
+    };
+    let Ok(oid) = newest.get_object_id("_id") else {
+        return Ok(());
+    };
+
+    let set = extras_set_doc(extras);
+    if set.is_empty() {
+        return Ok(());
+    }
+    db.chat_messages()
+        .update_one(doc! { "_id": oid }, doc! { "$set": set })
+        .await?;
+    Ok(())
+}
+
+/// The `$set` document `attach_answer_extras` writes. Split out so the storage
+/// encoding is testable without a database.
+fn extras_set_doc(extras: &AnswerExtras<'_>) -> Document {
+    let mut set = Document::new();
+
+    if let Some(suggestions) = extras.suggestions.filter(|s| !s.is_empty()) {
+        if let Ok(json) = serde_json::to_string(suggestions) {
+            set.insert("suggestions_json", json);
+        }
+    }
+    if !extras.focus_used.is_empty() {
+        set.insert("focus_used", extras.focus_used.to_vec());
+    }
+    if let Some(provenance) = &extras.provenance {
+        set.insert("provenance_json", provenance.to_string());
+    }
+    if let Some(spec) = &extras.spec {
+        set.insert("spec_json", spec.to_string());
+    }
+    if let Some(clarify) = extras.clarify {
+        if let Ok(json) = serde_json::to_string(clarify) {
+            set.insert("clarify_json", json);
+        }
+    }
+    set
+}
+
+/// Persist the updated `ConversationFocus` on the conversation document
+/// (plan 06 section 2).
+///
+/// Stored as a compact JSON **string** under `focus_json`, matching this module's
+/// existing `citations_json` / `structured_json` / `verify_json` convention. Plan
+/// section 2 says "as `focus` (BSON)"; a nested `QuerySpec` round-trips exactly
+/// through serde_json and only approximately through BSON (integer widening,
+/// `f64`/`i64` coercion, map-key constraints), and a focus that silently changes
+/// shape on reload is worse than one extra `to_string`.
+///
+/// An empty focus unsets the field rather than storing `{}`, so a reset really
+/// removes the stored state instead of leaving a husk that reads back as present.
+pub(crate) async fn persist_focus(
+    db: &DocumentDb,
+    conversation_id: &str,
+    focus: &ConversationFocus,
+) -> AppResult<()> {
+    let oid = parse_oid(conversation_id)?;
+    if focus.is_empty() {
+        db.chat_conversations()
+            .update_one(doc! { "_id": oid }, doc! { "$unset": { FOCUS_FIELD: "" } })
+            .await?;
+        return Ok(());
+    }
+    // A focus that will not serialise is a bug, not a runtime condition worth an
+    // error page: the turn already succeeded. Skip the write and keep the previous
+    // focus rather than failing the request over a memory update.
+    let Some(json) = focus.to_json_string() else {
+        return Ok(());
+    };
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, doc! { "$set": { FOCUS_FIELD: json } })
+        .await?;
+    Ok(())
+}
+
+/// Insert the assistant turn for a clarification and store the partial spec with
+/// it (plan 06 section 4).
+///
+/// The partial spec is persisted on the *message*, not only in the focus, because
+/// section 4 allows the fill to come from "the stored partial spec on the clarify
+/// message": the focus can be superseded by a concurrent turn, whereas the
+/// message that asked the question cannot.
+pub(crate) async fn persist_clarify_message(
+    db: &DocumentDb,
+    conversation_id: &str,
+    user_id: &str,
+    clarify: &ClarifyOut,
+    partial_spec: Option<&serde_json::Value>,
+) -> AppResult<()> {
+    let oid = parse_oid(conversation_id)?;
+    let now = BsonDateTime::now();
+    let clarify_json =
+        serde_json::to_string(clarify).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let mut message = doc! {
+        "_id": ObjectId::new(),
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "role": "assistant",
+        "content": clarify.question.clone(),
+        "citations_json": "[]",
+        "clarify_json": clarify_json,
+        "created_at": now,
+    };
+    if let Some(spec) = partial_spec {
+        message.insert("spec_json", spec.to_string());
+    }
+    db.chat_messages().insert_one(message).await?;
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, doc! { "$set": { "updated_at": now } })
+        .await?;
+    Ok(())
+}
+
+/// Read back the partial spec stored on the conversation's most recent clarify
+/// message (plan 06 section 4's fallback source for the slot fill).
+///
+/// Returns raw JSON: this module deliberately does not depend on the IR types, so
+/// the caller in `router/focus_resolve.rs` deserialises into `QuerySpec`.
+pub(crate) async fn load_pending_clarify_spec(
+    db: &DocumentDb,
+    conversation_id: &str,
+) -> Option<serde_json::Value> {
+    let newest = db
+        .chat_messages()
+        .find_one(doc! { "conversation_id": conversation_id, "role": "assistant" })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await
+        .ok()
+        .flatten()?;
+    // Only the *newest* assistant message counts: an older clarify has already
+    // been answered or abandoned, and reviving its spec would answer a question
+    // the user has moved on from.
+    newest.get_str("clarify_json").ok()?;
+    let spec = newest.get_str("spec_json").ok()?;
+    serde_json::from_str(spec).ok()
+}
+
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
@@ -670,6 +1041,8 @@ fn conv_doc_to_out(d: &Document) -> ConversationOut {
             .unwrap_or_default(),
         title: d.get_str("title").unwrap_or("").to_string(),
         agent_kind: d.get_str("agent_kind").ok().map(str::to_string),
+        service_line: d.get_str("service_line").ok().map(str::to_string),
+        mode: d.get_str("mode").ok().map(str::to_string),
         created_at: read_dt_field(d, "created_at"),
         updated_at: read_dt_field(d, "updated_at"),
     }
@@ -702,6 +1075,45 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
     let agent_kind = d.get_str("agent_kind").ok().map(str::to_string);
     let mode = d.get_str("mode").ok().map(str::to_string);
 
+    let suggestions = d
+        .get_str("suggestions_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<SuggestionOut>>(s).ok())
+        .filter(|s| !s.is_empty());
+
+    // Focus slot names are stored as a plain BSON array -- no JSON string, because
+    // the value is a flat list of short ASCII identifiers with no nesting to lose.
+    let focus_used = d
+        .get_array("focus_used")
+        .ok()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect::<Vec<String>>()
+        })
+        .filter(|names| !names.is_empty());
+
+    // Provenance and spec are re-emitted exactly as the producer serialised them.
+    // Parsing into a local type and re-serialising would risk changing the
+    // encoding of a wire shape that is pinned elsewhere by a literal-JSON
+    // assertion -- and `Provenance` is Serialize-only, so it could not round-trip
+    // even if that were wanted.
+    let provenance = d
+        .get_str("provenance_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+    let spec = d
+        .get_str("spec_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+
+    let clarify = d
+        .get_str("clarify_json")
+        .ok()
+        .and_then(|s| serde_json::from_str::<ClarifyOut>(s).ok());
+
     MessageOut {
         id: d
             .get_object_id("_id")
@@ -715,6 +1127,11 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
         mode,
         structured,
         sql_result,
+        suggestions,
+        focus_used,
+        provenance,
+        spec,
+        clarify,
         created_at: read_dt_field(d, "created_at"),
     }
 }
