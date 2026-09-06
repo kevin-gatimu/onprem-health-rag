@@ -2,7 +2,7 @@
 //   md .. xl : a fixed 60px icon rail (labels hidden, tooltips via title)
 //   xl+      : a 240px labelled sidebar with section headers, collapsible to 60px
 // Hidden entirely below md — phones use TopBar + BottomBar + NavSheet instead.
-import { Activity, ChevronLeft, ChevronRight, LogOut } from "lucide-react";
+import { ChevronLeft, ChevronRight, LogOut } from "lucide-react";
 import { useUi, currentRoute } from "../../stores/ui";
 import { useSession } from "../../stores/session";
 import { useEffectiveRole } from "../../hooks/useEffectiveRole";
@@ -12,6 +12,7 @@ import { logout } from "../../lib/bridge";
 import { resetConversationRuntime } from "../../lib/conversationRuntime";
 import { queryClient } from "../../lib/queryClient";
 import { cn } from "../ui/cn";
+import logo from "../../assets/logo.png";
 
 export function Sidebar() {
   const collapsed = useUi((s) => s.sidebarCollapsed);
@@ -50,7 +51,11 @@ export function Sidebar() {
     >
       {/* Brand */}
       <div className="flex h-14 items-center gap-2 px-3 border-b border-border">
-        <Activity size={22} className="text-accent shrink-0" />
+        <img
+          src={logo}
+          alt="Health RAG"
+          className="h-[22px] w-[22px] shrink-0 rounded object-contain"
+        />
         <span className={cn("font-semibold text-fg truncate", labelCls)}>Health RAG</span>
       </div>
 
