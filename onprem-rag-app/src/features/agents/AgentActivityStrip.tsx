@@ -15,6 +15,7 @@ interface AgentActivityStripProps {
 const PHASE_LABELS: Partial<Record<AgentPhase, string>> = {
   routing:    'Choosing the right agent…',
   planning:   'Planning query…',
+  querying:   'Querying database…',
   running:    'Running aggregation…',
   retrieving: 'Retrieving records…',
   generating: 'Writing answer…',

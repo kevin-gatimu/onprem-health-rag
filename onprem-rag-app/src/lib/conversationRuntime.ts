@@ -1,7 +1,7 @@
 import { agent, cancelRun, chat, createConversation } from './bridge';
 import type { AgentKind, RetrievalOpts } from './bridge';
 import { queryClient } from './queryClient';
-import { useAgents, type QueuedAgentPrompt } from '../stores/agents';
+import { useAgents, type AgentTurnOpts, type QueuedAgentPrompt } from '../stores/agents';
 import { useChat, type QueuedChatPrompt } from '../stores/chat';
 
 const activeChatRuns = new Map<string, Set<string>>();
@@ -172,11 +172,15 @@ export function retryChatRun(runId: string) {
 async function launchAgent(prompt: QueuedAgentPrompt): Promise<void> {
   const runId = crypto.randomUUID();
   addActive(activeAgentRuns, prompt.conversationId, runId);
-  useAgents.getState().startRun(runId, prompt.conversationId, prompt.selectedKind, prompt.user);
+  useAgents
+    .getState()
+    .startRun(runId, prompt.conversationId, prompt.selectedKind, prompt.user, prompt.opts);
 
   let succeeded = false;
   try {
-    await agent(prompt.selectedKind, prompt.user, prompt.conversationId, runId);
+    // Per-turn options (mode / pinned source / a suggestion's query spec) travel with
+    // the prompt so a queued or retried turn is sent exactly as it was composed.
+    await agent(prompt.selectedKind, prompt.user, prompt.conversationId, runId, prompt.opts);
     succeeded = true;
     await queryClient.invalidateQueries({ queryKey: ['messages', prompt.conversationId] });
     void queryClient.invalidateQueries({
@@ -206,6 +210,7 @@ export async function submitAgentPrompt(
   selectedKind: AgentKind,
   user: string,
   sendImmediately: boolean,
+  opts?: AgentTurnOpts,
 ): Promise<string> {
   const epoch = runtimeEpoch;
   const resolvedId = await ensureAgentConversation(conversationId, selectedKind);
@@ -215,6 +220,7 @@ export async function submitAgentPrompt(
     conversationId: resolvedId,
     selectedKind,
     user,
+    opts,
     queuedAt: Date.now(),
   };
 
@@ -249,6 +255,7 @@ export function retryAgentRun(runId: string) {
     conversationId: run.conversationId,
     selectedKind: run.selectedKind,
     user: run.user,
+    opts: run.opts,
     queuedAt: Date.now(),
   };
   if (agentIsBusy(run.conversationId)) {

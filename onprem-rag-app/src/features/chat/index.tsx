@@ -67,6 +67,16 @@ export default function Chat() {
     });
   }, [activeConvId]);
 
+  // A suggestion chip or clarify option is a normal turn (plan 07 §5.4) — the
+  // chip text becomes the user message. `/chat` has no agent tabs, so a "switch"
+  // suggestion's target agent is not actionable here; the text is still sent and
+  // the router resolves the line itself.
+  const handleSuggestionSubmit = useCallback((text: string) => {
+    void submitChatPrompt(activeConvId, text, {}, true).catch((error) => {
+      toast.error(`Failed to send: ${String(error)}`);
+    });
+  }, [activeConvId]);
+
   function handleNewChat() {
     useChat.getState().setActiveConversation(null);
     setDrawerOpen(false);
@@ -143,6 +153,7 @@ export default function Chat() {
             }}
             onRetry={retryChatRun}
             onStop={stopChatRun}
+            onSuggestionSubmit={handleSuggestionSubmit}
           />
           <Composer
             text={draft}

@@ -14,6 +14,20 @@ interface MessageListProps {
   onRemoveQueued: (promptId: string) => void;
   onRetry: (runId: string) => void;
   onStop: (runId: string) => void;
+  /**
+   * Submit a suggestion chip or a clarify option as the next turn (plan 07 §5.4:
+   * "clicking a suggestion is a normal turn ... never a hidden action").
+   */
+  onSuggestionSubmit: (
+    text: string,
+    opts?: { suggestionSpec?: unknown; switchKind?: string },
+  ) => void;
+  /** Switch the active agent tab, carrying the conversation. */
+  onSwitchAgent: (kind: string) => void;
+  /** Example questions for the empty state — registry data, never hardcoded. */
+  exampleQuestions: string[];
+  /** Fill the composer with an example question. */
+  onPickExample: (question: string) => void;
 }
 
 export default function MessageList({
@@ -25,6 +39,10 @@ export default function MessageList({
   onRemoveQueued,
   onRetry,
   onStop,
+  onSuggestionSubmit,
+  onSwitchAgent,
+  exampleQuestions,
+  onPickExample,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -60,6 +78,22 @@ export default function MessageList({
             Use AI agents to query health records, analyse trends, and summarise patient data.
           </p>
         </div>
+        {/* Plan 07 §4: the selected agent's example questions, centred in the
+            message pane. Text comes from the registry (`AgentInfo.example_questions`),
+            so an agent with no examples simply shows nothing here. */}
+        {exampleQuestions.length > 0 && (
+          <div className="flex flex-col items-center gap-1.5 mt-2 w-full max-w-md">
+            {exampleQuestions.slice(0, 4).map((question) => (
+              <button
+                key={question}
+                onClick={() => onPickExample(question)}
+                className="w-full px-3 py-2 rounded-lg border border-border bg-surface text-sm text-fg-muted hover:text-fg hover:border-accent hover:bg-elevated transition-colors min-h-[44px]"
+              >
+                {question}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
     );
   }
@@ -76,14 +110,30 @@ export default function MessageList({
       {/* Centered cap: keeps message bubbles in a comfortable reading column on wide
           monitors while the scrollbar stays at the pane edge. */}
       <div className="flex flex-col gap-4 max-w-4xl 3xl:max-w-5xl mx-auto w-full">
-        {persisted.map((msg) => (
-          <MessageBubble key={msg.id} kind="persisted" message={msg} />
+        {/* `isLast` is true only for the final persisted message AND only when no
+            live run follows it — otherwise a reloaded conversation would show its
+            old suggestion chips underneath a fresh answer. */}
+        {persisted.map((msg, index) => (
+          <MessageBubble
+            key={msg.id}
+            kind="persisted"
+            message={msg}
+            isLast={index === persisted.length - 1 && runs.length === 0}
+            onSuggestionSubmit={onSuggestionSubmit}
+            onSwitchAgent={onSwitchAgent}
+          />
         ))}
 
-        {runs.map((run) => (
+        {runs.map((run, index) => (
           <div key={run.runId} className="contents">
             <MessageBubble kind="optimistic-user" text={run.user} />
-            <MessageBubble kind="optimistic-assistant" pending={run} />
+            <MessageBubble
+              kind="optimistic-assistant"
+              pending={run}
+              isLast={index === runs.length - 1}
+              onSuggestionSubmit={onSuggestionSubmit}
+              onSwitchAgent={onSwitchAgent}
+            />
             {run.phase !== 'done' && run.phase !== 'stopped' && (
               <button
                 onClick={() => onStop(run.runId)}

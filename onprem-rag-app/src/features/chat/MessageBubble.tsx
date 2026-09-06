@@ -2,23 +2,43 @@
 //   'persisted'           — a stored StoredMessage (user or assistant)
 //   'optimistic-user'     — the in-flight user question (before server persists)
 //   'optimistic-assistant'— the in-flight assistant answer (live-streaming)
+//
+// Plan 07 §4 ("features/chat/*"): Ask on /chat gets the SAME provenance strip,
+// suggestion chips, clarify block and department badge as the agents screen. The
+// three components are imported from `src/components/answer/` and the registry —
+// nothing here is a second copy of the agents implementation.
 import { useState } from 'react';
-import { Copy, Check } from 'lucide-react';
+import { Copy, Check, Zap } from 'lucide-react';
 import type { StoredMessage } from '../../lib/bridge';
 import type { PendingRun } from '../../stores/chat';
+import { useAgentRegistry } from '../../stores/agentRegistry';
 import Markdown from '../../components/Markdown';
 import Citations from './Citations';
 import ActivityStrip from './ActivityStrip';
 import VerifyBadge from './VerifyBadge';
 import SqlResultTable from './SqlResultTable';
+import { Badge } from '../../components/ui';
+import ProvenanceStrip from '../../components/answer/ProvenanceStrip';
+import SuggestionChips from '../../components/answer/SuggestionChips';
 
 type MessageBubbleProps =
-  | { kind: 'persisted'; message: StoredMessage }
+  | {
+      kind: 'persisted';
+      message: StoredMessage;
+      isLast?: boolean;
+      onSuggestionSubmit?: (text: string, opts?: { suggestionSpec?: unknown }) => void;
+    }
   | { kind: 'optimistic-user'; text: string }
-  | { kind: 'optimistic-assistant'; pending: PendingRun };
+  | {
+      kind: 'optimistic-assistant';
+      pending: PendingRun;
+      isLast?: boolean;
+      onSuggestionSubmit?: (text: string, opts?: { suggestionSpec?: unknown }) => void;
+    };
 
 export default function MessageBubble(props: MessageBubbleProps) {
   const [copied, setCopied] = useState(false);
+  const registry = useAgentRegistry();
 
   function handleCopy(text: string) {
     navigator.clipboard.writeText(text).then(() => {
@@ -68,8 +88,52 @@ export default function MessageBubble(props: MessageBubbleProps) {
     || props.pending.phase === 'done'
     || props.pending.phase === 'stopped';
 
+  // ── Department badge ────────────────────────────────────────────────────────
+  // `/chat` is the one route that emits the FULL routed decision, so
+  // `routed.service_line` is the verified source of the department here
+  // (`RouteDecision::to_sse_json`, onprem-rag-server/src/router/mod.rs L196-203).
+  // The label is looked up in the registry — never spelled out in this file.
+  const serviceLine =
+    props.kind === 'persisted'
+      ? (props.message.provenance?.service_line ?? props.message.agent_kind ?? null)
+      : (pendingRun?.routed?.service_line ?? null);
+  const departmentLabel = serviceLine ? registry.labelFor(serviceLine) : undefined;
+  const deterministic = pendingRun?.routed?.deterministic ?? false;
+
+  const provenance =
+    props.kind === 'persisted' ? props.message.provenance : (pendingRun?.provenance ?? undefined);
+  const suggestions =
+    props.kind === 'persisted'
+      ? (props.message.suggestions ?? [])
+      : (pendingRun?.suggestions ?? []);
+  const focusUsed =
+    props.kind === 'persisted'
+      ? (props.message.focus_used ?? [])
+      : (pendingRun?.focusUsed ?? []);
+  const clarify =
+    props.kind === 'persisted' ? (props.message.clarify ?? null) : (pendingRun?.clarify ?? null);
+  const isLast = props.isLast ?? false;
+  const onSuggestionSubmit = props.onSuggestionSubmit;
+
   return (
     <div className="flex flex-col gap-1 max-w-[90%] px-1">
+      {/* Department badge + deterministic marker + focus chip */}
+      {(departmentLabel || deterministic || focusUsed.length > 0) && (
+        <div className="flex flex-wrap items-center gap-1.5 mb-0.5">
+          {departmentLabel && <Badge variant="info">{departmentLabel}</Badge>}
+          {deterministic && (
+            <span title="Deterministic SQL" className="text-fg-muted" aria-label="Deterministic">
+              <Zap size={12} aria-hidden="true" />
+            </span>
+          )}
+          {focusUsed.length > 0 && (
+            <span className="text-xs text-fg-subtle px-1.5 py-0.5 rounded bg-elevated">
+              using: {focusUsed.join(' · ')}
+            </span>
+          )}
+        </div>
+      )}
+
       {/* Activity strip: visible while no tokens have arrived yet */}
       {pendingRun !== null && !isDone && content === '' && (
         <ActivityStrip pending={pendingRun} />
@@ -95,6 +159,24 @@ export default function MessageBubble(props: MessageBubbleProps) {
         </div>
       )}
 
+      {/* Clarify block — options submit as a normal turn (plan 07 §5.5). */}
+      {clarify && (
+        <div className="mt-1 p-3 rounded-lg border border-border bg-surface">
+          <p className="text-sm font-medium text-fg mb-2">{clarify.question}</p>
+          <div className="flex flex-wrap gap-1.5">
+            {clarify.options.map((option) => (
+              <button
+                key={option}
+                onClick={() => onSuggestionSubmit?.(option)}
+                className="px-2.5 py-1.5 rounded-full border border-border text-xs text-fg-muted hover:border-accent hover:text-fg bg-elevated transition-colors min-h-[36px]"
+              >
+                {option}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {sqlResult && <SqlResultTable result={sqlResult} />}
 
       {/* Copy button (appears once there is content) */}
@@ -116,6 +198,14 @@ export default function MessageBubble(props: MessageBubbleProps) {
 
       {/* Citations */}
       {citations.length > 0 && <Citations citations={citations} />}
+
+      {/* Provenance disclosure — shared with the agents screen. */}
+      {isDone && provenance && <ProvenanceStrip provenance={provenance} />}
+
+      {/* Follow-up suggestions — last assistant message only. */}
+      {isDone && isLast && suggestions.length > 0 && onSuggestionSubmit && (
+        <SuggestionChips suggestions={suggestions} onSubmit={onSuggestionSubmit} />
+      )}
     </div>
   );
 }

@@ -35,7 +35,7 @@ export const NAV_ITEMS: NavItem[] = [
   { route: "/connections", label: "Connections", icon: Database, section: "Main" },
   { route: "/ingest", label: "Ingest", icon: Download, section: "Main" },
   { route: "/data", label: "Data Explorer", icon: FolderOpen, section: "Main" },
-  { route: "/agents", label: "AI Agents", icon: Cpu, section: "Main" },
+  { route: "/agents", label: "Hospital Agents", icon: Cpu, section: "Main" },
   { route: "/models", label: "Models", icon: Boxes, section: "Main" },
   // Analytics
   { route: "/analytics", label: "Analytics", icon: BarChart3, section: "Analytics" },

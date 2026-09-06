@@ -14,6 +14,8 @@ interface MessageListProps {
   onRemoveQueued: (promptId: string) => void;
   onRetry: (runId: string) => void;
   onStop: (runId: string) => void;
+  /** Submit a suggestion chip or clarify option as a normal next turn. */
+  onSuggestionSubmit: (text: string, opts?: { suggestionSpec?: unknown }) => void;
 }
 
 export default function MessageList({
@@ -25,6 +27,7 @@ export default function MessageList({
   onRemoveQueued,
   onRetry,
   onStop,
+  onSuggestionSubmit,
 }: MessageListProps) {
   const listRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -83,14 +86,25 @@ export default function MessageList({
       {/* Centered cap: keeps message bubbles in a comfortable reading column on wide
           monitors while the scrollbar stays at the pane edge. */}
       <div className="flex flex-col gap-4 max-w-4xl 3xl:max-w-5xl mx-auto w-full">
-        {visible.map((msg) => (
-          <MessageBubble key={msg.id} kind="persisted" message={msg} />
+        {visible.map((msg, index) => (
+          <MessageBubble
+            key={msg.id}
+            kind="persisted"
+            message={msg}
+            isLast={index === visible.length - 1 && runs.length === 0}
+            onSuggestionSubmit={onSuggestionSubmit}
+          />
         ))}
 
-        {runs.map((run) => (
+        {runs.map((run, index) => (
           <div key={run.runId} className="contents">
             <MessageBubble kind="optimistic-user" text={run.user} />
-            <MessageBubble kind="optimistic-assistant" pending={run} />
+            <MessageBubble
+              kind="optimistic-assistant"
+              pending={run}
+              isLast={index === runs.length - 1}
+              onSuggestionSubmit={onSuggestionSubmit}
+            />
             {run.phase !== 'done' && run.phase !== 'stopped' && (
               <button
                 onClick={() => onStop(run.runId)}

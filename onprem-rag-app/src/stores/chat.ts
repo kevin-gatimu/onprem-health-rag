@@ -1,6 +1,6 @@
 // Chat store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { Passage, RetrievalOpts, SqlResult, StageEvent, VerifyReport } from '../lib/bridge';
+import type { ClarifyPayload, Passage, Provenance, RetrievalOpts, RoutedEvent, SqlResult, StageEvent, Suggestion, VerifyReport } from '../lib/bridge';
 import { applyStageEvent, type StageStep } from './stages';
 
 export type ChatPhase = 'searching' | 'generating' | 'done' | 'stopped';
@@ -16,6 +16,20 @@ export interface PendingRun {
   /** Faithfulness verdict, or null until the post-stream `verify` event arrives
    *  (which it may never do — the check is opt-in server-side). */
   verify: VerifyReport | null;
+  /**
+   * The `routed` decision for this run. VERIFIED: `/chat` emits the full
+   * `RouteDecision::to_sse_json()` object (`onprem-rag-server/src/rag/routes.rs`
+   * ≈L327/L558), which is what carries `service_line` and `deterministic`.
+   */
+  routed: RoutedEvent | null;
+  /** Execution provenance (plan 06). */
+  provenance: Provenance | null;
+  /** Follow-up suggestion chips (plan 06). */
+  suggestions: Suggestion[];
+  /** Active focus entities (plan 06). */
+  focusUsed: string[];
+  /** Clarification request (plan 06). */
+  clarify: ClarifyPayload | null;
   error: string | null;
   phase: ChatPhase;
   /** Pipeline steps the server reported for this run, oldest first. */
@@ -45,6 +59,11 @@ interface ChatState {
   setSqlColumns(runId: string, columns: string[]): void;
   setSqlRows(runId: string, rows: unknown[][]): void;
   setVerify(runId: string, report: VerifyReport): void;
+  setRouted(runId: string, payload: RoutedEvent): void;
+  setProvenance(runId: string, provenance: Provenance): void;
+  setSuggestions(runId: string, suggestions: Suggestion[]): void;
+  setFocusUsed(runId: string, focusUsed: string[]): void;
+  setClarify(runId: string, clarify: ClarifyPayload): void;
   pushStage(runId: string, event: StageEvent): void;
   setError(runId: string, message: string): void;
   markStopped(runId: string): void;
@@ -82,6 +101,11 @@ export const useChat = create<ChatState>((set, get) => ({
           citations: [],
           sqlResult: null,
           verify: null,
+          routed: null,
+          provenance: null,
+          suggestions: [],
+          focusUsed: [],
+          clarify: null,
           error: null,
           phase: 'searching',
           stages: [],
@@ -145,6 +169,31 @@ export const useChat = create<ChatState>((set, get) => ({
     set((state) => ({
       runs: { ...state.runs, [runId]: { ...state.runs[runId], verify } },
     }));
+  },
+
+  setRouted(runId, routed) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], routed } } }));
+  },
+
+  setProvenance(runId, provenance) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], provenance } } }));
+  },
+
+  setSuggestions(runId, suggestions) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], suggestions } } }));
+  },
+
+  setFocusUsed(runId, focusUsed) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], focusUsed } } }));
+  },
+
+  setClarify(runId, clarify) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], clarify } } }));
   },
 
   pushStage(runId, event) {

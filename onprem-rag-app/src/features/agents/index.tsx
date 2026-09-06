@@ -1,26 +1,29 @@
-// AI Agents screen — Stage 7. Mobile-first, ships as desktop (Tauri) + Android.
+// Hospital Agents screen — Plan 07. Mobile-first, ships as desktop (Tauri) + Android.
 //
 // Layout:
 //   mobile  (< md):  Kind-selector tabs + TopBar (drawer button / title / info) +
-//                    message list + composer. Conversation drawer and data panel
+//                    message list + composer. Conversation drawer and scope panel
 //                    open as Modals.
 //   md+:             Kind-selector tabs + left conversation rail (260 px) + message pane.
-//   xl+:             Same as md but with a third context column (220 px) on the right.
+//   xl+:             Same as md but with a third Scope panel column (220 px) on the right.
 //
-// Agent kinds: auto / health_query / trends / patient_lookup / summarize.
-// Each kind maintains its own conversation partition and per-kind new-chat draft.
+// Agent tabs come from the server roster (GET /agents via useAgentRegistry).
+// Falls back to legacy kinds when the server hasn't implemented plan 05 yet.
+// No service-line slug or label is hardcoded in this file — everything is registry-driven.
 //
-// Send flow mirrors chat/index.tsx exactly, using the agent() bridge call.
-import { useState, useCallback } from 'react';
+// Tier 1 agents are shown directly; Tier 2/3 collapse into a "More ▾" menu.
+// Unusable agents appear greyed in "More" with a tooltip.
+//
+// Mode toggle (Ask / Trends / Handover) appears on the right of the tab bar for
+// agents that support more than one mode.
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { PanelLeftOpen, Layers, Bot, Info } from 'lucide-react';
+import { PanelLeftOpen, Layers, ChevronDown, Bot, AlertTriangle, Info } from 'lucide-react';
 import {
   listAgentConversations,
   getMessages,
-  getStats,
-  getIngestHistory,
 } from '../../lib/bridge';
-import type { AgentKind } from '../../lib/bridge';
+import type { AgentKind, AgentMode } from '../../lib/bridge';
 import {
   retryAgentRun,
   sendQueuedAgentNow,
@@ -28,49 +31,31 @@ import {
   submitAgentPrompt,
 } from '../../lib/conversationRuntime';
 import { useAgents } from '../../stores/agents';
+import { useAgentRegistry } from '../../stores/agentRegistry';
 import { toast } from '../../stores/ui';
-import { Button, Modal } from '../../components/ui';
+import { Button, Modal, EmptyState } from '../../components/ui';
 import ConversationList from './ConversationList';
 import MessageList from './MessageList';
 import Composer from './Composer';
-import Chat from '../chat';
-
-// ── Kind selector config ─────────────────────────────────────────────────────
-
-interface KindTab {
-  kind: AgentKind;
-  label: string;
-}
-
-// No 'chat' tab — 'chat' is only a routed *result* the server emits, never a
-// user-selectable input.
-const KIND_TABS: KindTab[] = [
-  { kind: 'auto',           label: 'Auto' },
-  { kind: 'health_query',   label: 'Health Query' },
-  { kind: 'trends',         label: 'Trends' },
-  { kind: 'patient_lookup', label: 'Patient Lookup' },
-  { kind: 'summarize',      label: 'Summarize' },
-];
-
-const KIND_BLURBS: Record<string, string> = {
-  auto:           'Automatically selects the best agent for your question.',
-  health_query:   'Runs structured queries against health record data and visualises the results.',
-  trends:         'Detects patterns and trends across patient records over time.',
-  patient_lookup: 'Finds and summarises records for a specific patient.',
-  summarize:      'Produces a concise narrative summary of selected records.',
-};
+import ScopePanel from './ScopePanel';
 
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function Agents() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  const [moreOpen, setMoreOpen] = useState(false);
+
   const activeConvId = useAgents((state) => state.activeConversationId);
   const selectedKind = useAgents((state) => state.selectedKind);
   const allRuns = useAgents((state) => state.runs);
   const queues = useAgents((state) => state.queues);
+  const modes = useAgents((state) => state.modes);
+
+  // Draft key encodes both kind and conv so switching tabs preserves composer text.
   const draftKey = `${selectedKind}:${activeConvId ?? '__new__'}`;
   const draft = useAgents((state) => state.drafts[draftKey] ?? '');
+
   const runs = Object.values(allRuns)
     .filter((run) => run.conversationId === activeConvId)
     .sort((a, b) => a.startedAt - b.startedAt);
@@ -81,6 +66,30 @@ export default function Agents() {
       .map((run) => run.conversationId),
   );
   const busy = activeConvId !== null && busyConversationIds.has(activeConvId);
+
+  // Active mode. Keyed like the draft, so a mode can be chosen BEFORE the first
+  // message exists — `activeConversationId` is null until the server mints the
+  // conversation, and a toggle that silently does nothing until you have already
+  // sent a turn is the wrong affordance.
+  const modeKey = draftKey;
+  const activeMode: AgentMode = modes[modeKey] ?? 'ask';
+
+  // ── Registry ─────────────────────────────────────────────────────────────────
+  const registry = useAgentRegistry();
+  useEffect(() => {
+    // Load once after mount; the store is idempotent so this is safe on re-mount.
+    void registry.load();
+  }, []);
+
+  const usableAgents = registry.usable();
+  const tier1 = usableAgents.filter((a) => a.tier === 1);
+  const tierMore = usableAgents.filter((a) => a.tier !== 1);
+  // Unusable agents for the "More" menu (greyed, no route).
+  const unusableAgents = registry.agents.filter((a) => !a.usable);
+
+  const currentAgent = registry.byKind(selectedKind);
+  const registrySource = registry.source;
+  const registryError = registry.error;
 
   // ── Queries ─────────────────────────────────────────────────────────────────
   const { data: conversations = [] } = useQuery({
@@ -96,26 +105,86 @@ export default function Agents() {
     staleTime: 30_000,
   });
 
-  // Context panel: stats + ingest history (secondary data, soft failure OK).
-  const { data: stats } = useQuery({
-    queryKey: ['stats'],
-    queryFn: getStats,
-    staleTime: 30_000,
-  });
-
-  const { data: ingestHistory = [] } = useQuery({
-    queryKey: ['ingest-history'],
-    queryFn: getIngestHistory,
-    staleTime: 30_000,
-  });
-
-  const indexedTableCount = ingestHistory.reduce((acc, c) => acc + c.tables.length, 0);
-
+  // ── Handlers ─────────────────────────────────────────────────────────────────
+  // Every turn carries the conversation's current mode (plan 07 §4: "Mode is sent
+  // with each prompt and shown as a badge on the assistant bubble"). The bridge
+  // forwards it as the `mode` body field; see the finding on `mode` in the report —
+  // the current server ignores it, which is why the toggle only appears for agents
+  // whose roster entry advertises more than one mode.
   const handleSend = useCallback((text: string, sendImmediately: boolean) => {
-    void submitAgentPrompt(activeConvId, selectedKind, text, sendImmediately).catch((error) => {
-      toast.error(`Failed to start conversation: ${String(error)}`);
-    });
-  }, [activeConvId, selectedKind]);
+    void submitAgentPrompt(activeConvId, selectedKind, text, sendImmediately, {
+      mode: activeMode,
+    })
+      .then((resolvedId) => {
+        // Carry the pre-send mode onto the conversation the server just minted,
+        // so the toggle does not snap back to Ask after the first turn. The key
+        // must match the reader's `${kind}:${convId}` form, not the bare id.
+        if (!activeConvId) {
+          useAgents.getState().setMode(`${selectedKind}:${resolvedId}`, activeMode);
+        }
+      })
+      .catch((error) => {
+        toast.error(`Failed to start conversation: ${String(error)}`);
+      });
+  }, [activeConvId, selectedKind, activeMode]);
+
+  /**
+   * A suggestion chip or clarify option click. Plan 07 §5.4: this is a NORMAL
+   * turn — the chip's text becomes the user message, never a hidden action.
+   * A `switch` suggestion also moves the tab before sending, so the answer lands
+   * in the line that can serve it.
+   */
+  const handleSuggestionSubmit = useCallback(
+    (text: string, opts?: { suggestionSpec?: unknown; switchKind?: string }) => {
+      const targetKind = opts?.switchKind ?? selectedKind;
+      if (opts?.switchKind && opts.switchKind !== selectedKind) {
+        useAgents.getState().setSelectedKind(opts.switchKind);
+      }
+      void submitAgentPrompt(activeConvId, targetKind, text, true, {
+        mode: activeMode,
+        suggestionSpec: opts?.suggestionSpec,
+      })
+        .then((resolvedId) => {
+          if (!activeConvId) {
+            useAgents.getState().setMode(`${targetKind}:${resolvedId}`, activeMode);
+          }
+        })
+        .catch((error) => {
+          toast.error(`Failed to send: ${String(error)}`);
+        });
+    },
+    [activeConvId, selectedKind, activeMode],
+  );
+
+  /**
+   * "Open in {Line}" — switch tab and carry the conversation across.
+   *
+   * CLIENT-SIDE ONLY. Plan 07 §4 asks for the conversation's `agent_kind` to be
+   * changed server-side via `PATCH /conversations/<id>`, but that route accepts
+   * only `{ title }` (`onprem-rag-server/src/routes/conversations.rs`), and this
+   * workstream must not edit the server crate. So the tab moves and the same
+   * conversation stays open, but the stored `agent_kind` is unchanged: after a
+   * reload the conversation reappears under its original tab. Reported as a
+   * blocked deliverable rather than worked around with a delete-and-recreate,
+   * which would lose the message history.
+   */
+  const handleSwitchAgent = useCallback(
+    (kind: string) => {
+      if (kind === selectedKind) return;
+      const conv = activeConvId;
+      useAgents.getState().setSelectedKind(kind);
+      if (conv) useAgents.getState().setActiveConversation(conv);
+    },
+    [selectedKind, activeConvId],
+  );
+
+  const handlePickExample = useCallback(
+    (question: string) => {
+      useAgents.getState().setDraft(draftKey, question);
+      setPanelOpen(false);
+    },
+    [draftKey],
+  );
 
   function handleNewChat() {
     useAgents.getState().setActiveConversation(null);
@@ -133,15 +202,46 @@ export default function Agents() {
 
   function handleKindChange(kind: AgentKind) {
     if (kind !== selectedKind) useAgents.getState().setSelectedKind(kind);
+    setMoreOpen(false);
   }
 
+  function handleModeChange(mode: AgentMode) {
+    useAgents.getState().setMode(modeKey, mode);
+  }
+
+  // ── Mode toggle — only shown when the current agent supports multiple modes ──
+  const agentModes = currentAgent?.modes ?? ['ask'];
+  const modeToggle = agentModes.length > 1 ? (
+    <div className="flex items-center gap-0.5 ml-auto shrink-0" role="group" aria-label="Mode">
+      {(['ask', 'trends', 'handover'] as AgentMode[])
+        .filter((m) => agentModes.includes(m))
+        .map((m) => (
+          <button
+            key={m}
+            onClick={() => handleModeChange(m)}
+            aria-pressed={activeMode === m}
+            className={[
+              'px-2.5 py-1 rounded text-xs font-medium transition-colors capitalize min-h-[32px]',
+              activeMode === m
+                ? 'bg-accent-subtle text-fg'
+                : 'text-fg-muted hover:bg-elevated hover:text-fg',
+            ].join(' ')}
+          >
+            {m}
+          </button>
+        ))}
+    </div>
+  ) : null;
+
+  // ── Kind selector ─────────────────────────────────────────────────────────────
   const kindSelector = (
     <div
       className="flex-shrink-0 flex items-center gap-1 pb-3 overflow-x-auto"
       role="tablist"
-      aria-label="Agent type"
+      aria-label="Agent"
     >
-      {KIND_TABS.map((tab) => (
+      {/* Tier 1 tabs always visible */}
+      {tier1.map((tab) => (
         <button
           key={tab.kind}
           role="tab"
@@ -157,45 +257,104 @@ export default function Agents() {
           {tab.label}
         </button>
       ))}
-      {selectedKind !== 'auto' && (
-        <button
-          type="button"
-          onClick={() => setPanelOpen((open) => !open)}
-          className="hidden md:flex ml-auto shrink-0 items-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-fg-muted hover:bg-elevated hover:text-fg min-h-[44px]"
-          aria-expanded={panelOpen}
-          aria-controls="agent-data-overview"
-        >
-          <Info size={16} aria-hidden="true" />
-          Data Overview
-        </button>
+
+      {/* Tier 2/3 and unusable collapse into "More" */}
+      {(tierMore.length > 0 || unusableAgents.length > 0) && (
+        <div className="relative shrink-0">
+          <button
+            onClick={() => setMoreOpen((v) => !v)}
+            aria-expanded={moreOpen}
+            className={[
+              'flex items-center gap-1 px-3 py-2 rounded-md text-sm font-medium transition-colors whitespace-nowrap min-h-[44px]',
+              tierMore.some((a) => a.kind === selectedKind)
+                ? 'bg-accent-subtle text-fg'
+                : 'text-fg-muted hover:bg-elevated hover:text-fg',
+            ].join(' ')}
+          >
+            More
+            <ChevronDown size={13} aria-hidden="true" />
+          </button>
+          {moreOpen && (
+            <div className="absolute top-full left-0 mt-1 w-44 bg-surface border border-border rounded-lg shadow-md z-50 py-1">
+              {tierMore.map((tab) => (
+                <button
+                  key={tab.kind}
+                  onClick={() => handleKindChange(tab.kind)}
+                  className={[
+                    'w-full text-left px-3 py-2 text-sm transition-colors',
+                    selectedKind === tab.kind ? 'bg-elevated text-fg' : 'text-fg-muted hover:bg-elevated hover:text-fg',
+                  ].join(' ')}
+                >
+                  {tab.label}
+                </button>
+              ))}
+              {unusableAgents.map((tab) => (
+                <button
+                  key={tab.kind}
+                  disabled
+                  title="No bound tables in connected sources"
+                  className="w-full text-left px-3 py-2 text-sm text-fg-subtle opacity-50 cursor-not-allowed"
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       )}
+
+      {/* Mode toggle on the right end */}
+      {modeToggle}
     </div>
   );
-
-  if (selectedKind === 'auto') {
-    return (
-      <div className="flex flex-col h-full">
-        {kindSelector}
-        <div className="flex-1 min-h-0">
-          <Chat />
-        </div>
-      </div>
-    );
-  }
 
   // ── Active conversation title for the mobile header ──────────────────────────
   const activeTitle = activeConvId
     ? (conversations.find((c) => c.id === activeConvId)?.title ?? 'Agent Chat')
     : 'New Chat';
 
+  // ── Scope panel content (plan 07 §4 — extracted to ScopePanel.tsx) ──────────
+  const scopePanel = currentAgent ? (
+    <ScopePanel agent={currentAgent} onPickExample={handlePickExample} />
+  ) : null;
+
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full" onClick={() => moreOpen && setMoreOpen(false)}>
 
       {/* Agent kind selector — horizontal-scroll strip (mobile) / pill tabs (md+) */}
       {kindSelector}
 
-      {/* Mobile top row: drawer button + active title + data overview toggle */}
+      {/* Legacy notice — shown when the server has no agent registry endpoint.
+          Non-blocking: the app is fully usable with the built-in default list. */}
+      {registrySource === 'legacy' && (
+        <div
+          className="flex items-center gap-2 px-3 py-2 mb-2 rounded-md border border-border bg-elevated text-xs text-fg-muted flex-shrink-0"
+          role="status"
+        >
+          <Info size={13} aria-hidden="true" />
+          <span>Agent list is a built-in default — this server does not provide an agent registry.</span>
+        </div>
+      )}
+
+      {/* Error state — registry fetch failed; feature is not usable until resolved */}
+      {registryError !== null && registrySource === 'none' ? (
+        <div className="flex-1 min-h-0 flex items-center justify-center">
+          <EmptyState
+            icon={<AlertTriangle size={32} />}
+            title="Agent roster could not be loaded"
+            description={registryError}
+            action={
+              <Button variant="secondary" onClick={() => void registry.load(true)}>
+                Retry
+              </Button>
+            }
+          />
+        </div>
+      ) : (
+      <>
+
+      {/* Mobile top row: drawer button + active title + scope panel toggle */}
       <div className="md:hidden flex items-center gap-2 pb-3 flex-shrink-0">
         <Button
           variant="secondary"
@@ -209,13 +368,15 @@ export default function Agents() {
         <h2 className="text-sm font-semibold text-fg flex-1 truncate text-center">
           {activeTitle}
         </h2>
-        <button
-          onClick={() => setPanelOpen(true)}
-          className="flex items-center justify-center w-9 h-9 text-fg-muted hover:text-fg hover:bg-elevated rounded-md min-h-[44px]"
-          aria-label="Data overview"
-        >
-          <Info size={16} aria-hidden="true" />
-        </button>
+        {currentAgent && (
+          <button
+            onClick={() => setPanelOpen(true)}
+            className="flex items-center justify-center w-9 h-9 text-fg-muted hover:text-fg hover:bg-elevated rounded-md min-h-[44px]"
+            aria-label="Agent scope"
+          >
+            <Bot size={16} aria-hidden="true" />
+          </button>
+        )}
       </div>
 
       {/* Main layout: single column (mobile) → two column (md+) → three column (xl+) */}
@@ -232,7 +393,7 @@ export default function Agents() {
               conversations={conversations}
               activeConvId={activeConvId}
               selectedKind={selectedKind}
-           busyConversationIds={busyConversationIds}
+              busyConversationIds={busyConversationIds}
               onSelect={handleSelectConv}
               onNewChat={handleNewChat}
               onActiveDeleted={handleActiveDeleted}
@@ -255,6 +416,10 @@ export default function Agents() {
             }}
             onRetry={retryAgentRun}
             onStop={stopAgentRun}
+            onSuggestionSubmit={handleSuggestionSubmit}
+            onSwitchAgent={handleSwitchAgent}
+            exampleQuestions={currentAgent?.example_questions ?? []}
+            onPickExample={handlePickExample}
           />
           <Composer
             text={draft}
@@ -264,47 +429,15 @@ export default function Agents() {
           />
         </div>
 
-        {/* Context panel — xl+ third column; hidden on smaller screens */}
-        {panelOpen && <aside id="agent-data-overview" className="hidden xl:flex xl:flex-col min-h-0 border-l border-border bg-surface overflow-y-auto p-3 gap-3">
-          <h3 className="text-xs font-semibold text-fg-muted uppercase tracking-wide flex items-center gap-1.5 flex-shrink-0">
-            <Bot size={12} aria-hidden="true" />
-            Data Overview
-          </h3>
-
-          {/* Stat counts from GET /stats */}
-          {stats && (
-            <div className="flex flex-col gap-1.5 text-xs flex-shrink-0">
-              <div className="flex justify-between items-center">
-                <span className="text-fg-muted">Connections</span>
-                <span className="font-medium text-fg">{stats.active_connections}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-fg-muted">Tables</span>
-                <span className="font-medium text-fg">{stats.total_tables}</span>
-              </div>
-              <div className="flex justify-between items-center">
-                <span className="text-fg-muted">Records</span>
-                <span className="font-medium text-fg">{stats.total_records.toLocaleString()}</span>
-              </div>
-              {indexedTableCount > 0 && (
-                <div className="flex justify-between items-center">
-                  <span className="text-fg-muted">Indexed tables</span>
-                  <span className="font-medium text-fg">{indexedTableCount}</span>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Per-agent blurb */}
-          <div className="border-t border-border pt-2 flex-shrink-0">
-            <p className="text-xs font-medium text-fg mb-1">
-              {KIND_TABS.find((t) => t.kind === selectedKind)?.label ?? 'Agent'}
-            </p>
-            <p className="text-xs text-fg-muted leading-relaxed">
-              {KIND_BLURBS[selectedKind] ?? ''}
-            </p>
-          </div>
-        </aside>}
+        {/* Scope panel — xl+ third column */}
+        {panelOpen && currentAgent && (
+          <aside
+            id="agent-scope-panel"
+            className="hidden xl:flex xl:flex-col min-h-0 border-l border-border bg-surface overflow-y-auto p-3 gap-3"
+          >
+            {scopePanel}
+          </aside>
+        )}
       </div>
 
       {/* Mobile conversation drawer */}
@@ -326,46 +459,20 @@ export default function Agents() {
         />
       </Modal>
 
-      {/* Mobile data overview panel */}
+      {/* Mobile scope panel */}
       <Modal
         open={panelOpen}
         onClose={() => setPanelOpen(false)}
-        title="Data Overview"
+        title={currentAgent?.label ?? 'Agent'}
         size="sm"
       >
         <div className="flex flex-col gap-3 py-2">
-          {stats && (
-            <div className="flex flex-col gap-2 text-sm">
-              <div className="flex justify-between">
-                <span className="text-fg-muted">Active connections</span>
-                <span className="font-medium text-fg">{stats.active_connections}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-fg-muted">Tables</span>
-                <span className="font-medium text-fg">{stats.total_tables}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-fg-muted">Records</span>
-                <span className="font-medium text-fg">{stats.total_records.toLocaleString()}</span>
-              </div>
-              {indexedTableCount > 0 && (
-                <div className="flex justify-between">
-                  <span className="text-fg-muted">Indexed tables</span>
-                  <span className="font-medium text-fg">{indexedTableCount}</span>
-                </div>
-              )}
-            </div>
-          )}
-          <div className="border-t border-border pt-3">
-            <p className="text-sm font-medium text-fg mb-1">
-              {KIND_TABS.find((t) => t.kind === selectedKind)?.label ?? 'Agent'}
-            </p>
-            <p className="text-sm text-fg-muted leading-relaxed">
-              {KIND_BLURBS[selectedKind] ?? ''}
-            </p>
-          </div>
+          {scopePanel}
         </div>
       </Modal>
+
+      </>
+      )}
     </div>
   );
 }
