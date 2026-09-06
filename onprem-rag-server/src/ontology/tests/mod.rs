@@ -23,6 +23,8 @@ use crate::ontology::binding::SchemaBinding;
 use crate::ontology::concepts::EntityConcept;
 use crate::ontology::service_line::ServiceLine;
 
+mod ddl;
+
 /// Production default for `binding_min_confidence`.
 /// Must stay in sync with the `env_parse` default in `config.rs`.
 /// All `bind_cards` calls in this module use this constant so the floor
@@ -48,647 +50,24 @@ fn load_fixture(json: &str) -> Fixture {
     serde_json::from_str(json).expect("valid fixture JSON")
 }
 
-/// Build a minimal TableCard from the dev-postgres schema structure.
-/// We only supply enough metadata for the binder to score correctly — the full
-/// schema is too large to inline; the key signals are the column names and FKs.
+/// Dev-seed `TableCard`s, parsed from the real DDL at test time (plan 03e).
+///
+/// Previously ~800 lines of hand-written cards with no process reconciling
+/// them against `docker/dev-postgres/init/01_schema.sql` -- 03d measured 64%
+/// of blessed golden rows drifting from the real schema as a result. This now
+/// delegates to `ddl::dev_cards_from_ddl`, which `include_str!`s that same
+/// file and parses it, so there is exactly one copy of the schema truth and
+/// nothing left to keep in sync. See `ddl.rs` for the parser, its guard
+/// assertions, and its canary tests.
 pub(crate) fn dev_seed_cards() -> Vec<TableCard> {
-    // Helper closure
-    let col = |name: &str, type_: &str, pk: bool, fk: bool| CardColumn {
-        name: name.to_string(),
-        type_: type_.to_string(),
-        nullable: !pk,
-        is_primary_key: pk,
-        is_foreign_key: fk,
-        sample_values: vec![],
-        profile: ColumnProfile::default(),
-    };
-    let fk_edge = |column: &str, ref_table: &str, ref_column: &str| CardFkEdge {
-        column: column.to_string(),
-        ref_table: ref_table.to_string(),
-        ref_column: ref_column.to_string(),
-    };
-    let card = |table: &str, row_count: i64, cols: Vec<CardColumn>, fks: Vec<CardFkEdge>| TableCard {
-        source_id: "dev".to_string(),
-        table_name: table.to_string(),
-        row_count,
-        columns: cols,
-        fk_edges: fks,
-        card_vector: None,
-        card_text: table.to_string(),
-    };
+    ddl::dev_cards_from_ddl()
+}
 
-    vec![
-        card("patients", 50000, vec![
-            col("id", "serial", true, false),
-            col("patient_no", "varchar", false, false),
-            col("first_name", "varchar", false, false),
-            col("last_name", "varchar", false, false),
-            col("date_of_birth", "date", false, false),
-            col("gender", "varchar", false, false),
-            col("county_id", "integer", false, true),
-            col("phone", "varchar", false, false),
-            col("national_id", "varchar", false, false),
-            col("registered_at", "timestamp", false, false),
-            col("patient_status", "varchar", false, false),
-        ], vec![fk_edge("county_id", "counties", "id")]),
-        card("counties", 47, vec![
-            col("id", "serial", true, false),
-            col("name", "varchar", false, false),
-            col("region", "varchar", false, false),
-            col("code", "varchar", false, false),
-        ], vec![]),
-        card("departments", 20, vec![
-            col("id", "serial", true, false),
-            col("code", "varchar", false, false),
-            col("name", "varchar", false, false),
-            col("dept_type", "varchar", false, false),
-            col("floor", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![]),
-        card("wards", 15, vec![
-            col("id", "serial", true, false),
-            col("code", "varchar", false, false),
-            col("name", "varchar", false, false),
-            col("ward_type", "varchar", false, false),
-            col("bed_capacity", "integer", false, false),
-            col("department_id", "integer", false, true),
-            col("floor", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![fk_edge("department_id", "departments", "id")]),
-        card("beds", 300, vec![
-            col("id", "serial", true, false),
-            col("ward_id", "integer", false, true),
-            col("bed_no", "varchar", false, false),
-            col("bed_type", "varchar", false, false),
-            col("status", "varchar", false, false),
-        ], vec![fk_edge("ward_id", "wards", "id")]),
-        card("providers", 200, vec![
-            col("id", "serial", true, false),
-            col("employee_no", "varchar", false, false),
-            col("first_name", "varchar", false, false),
-            col("last_name", "varchar", false, false),
-            col("specialty", "varchar", false, false),
-            col("role", "varchar", false, false),
-            col("department_id", "integer", false, true),
-            col("hire_date", "date", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![fk_edge("department_id", "departments", "id")]),
-        card("provider_schedules", 500, vec![
-            col("id", "serial", true, false),
-            col("provider_id", "integer", false, true),
-            col("department_id", "integer", false, true),
-            col("weekday", "integer", false, false),
-            col("start_time", "time", false, false),
-            col("end_time", "time", false, false),
-            col("slot_minutes", "integer", false, false),
-            col("clinic_name", "varchar", false, false),
-        ], vec![fk_edge("provider_id", "providers", "id"), fk_edge("department_id", "departments", "id")]),
-        card("provider_time_off", 800, vec![
-            col("id", "serial", true, false),
-            col("provider_id", "integer", false, true),
-            col("start_date", "date", false, false),
-            col("end_date", "date", false, false),
-            col("reason", "varchar", false, false),
-            col("is_approved", "boolean", false, false),
-        ], vec![fk_edge("provider_id", "providers", "id")]),
-        card("icd10_codes", 15000, vec![
-            col("id", "serial", true, false),
-            col("code", "varchar", false, false),
-            col("description", "varchar", false, false),
-            col("category", "varchar", false, false),
-            col("chapter", "varchar", false, false),
-            col("is_notifiable", "boolean", false, false),
-        ], vec![]),
-        card("encounters", 200000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("provider_id", "integer", false, true),
-            col("department_id", "integer", false, true),
-            col("encounter_type", "varchar", false, false),
-            col("encounter_date", "date", false, false),
-            col("chief_complaint", "text", false, false),
-            col("status", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("provider_id", "providers", "id"), fk_edge("department_id", "departments", "id")]),
-        card("appointments", 100000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("provider_id", "integer", false, true),
-            col("scheduled_time", "timestamp", false, false),
-            col("scheduled_at", "timestamp", false, false),
-            col("appointment_status", "varchar", false, false),
-            col("appointment_type", "varchar", false, false),
-            col("department_id", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("provider_id", "providers", "id")]),
-        card("referrals", 5000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("referred_by", "integer", false, true),
-            col("referred_to", "varchar", false, false),
-            col("referral_date", "date", false, false),
-            col("status", "varchar", false, false),
-            col("specialty", "varchar", false, false),
-            col("referral_closed_at", "timestamp", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("insurers", 30, vec![
-            col("id", "serial", true, false),
-            col("name", "varchar", false, false),
-            col("code", "varchar", false, false),
-            col("scheme_type", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-            col("claims_email", "varchar", false, false),
-        ], vec![]),
-        card("patient_insurance", 80000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("insurance_provider", "integer", false, true),
-            col("policy_no", "varchar", false, false),
-            col("member_no", "varchar", false, false),
-            col("valid_from", "date", false, false),
-            col("valid_to", "date", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("insurance_provider", "insurers", "id")]),
-        card("diagnoses", 400000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("icd_code", "varchar", false, false),
-            col("diagnosis_date", "date", false, false),
-            col("provider_id", "integer", false, true),
-            col("is_primary", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("encounter_id", "encounters", "id")]),
-        card("clinical_notes", 500000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("provider_id", "integer", false, true),
-            col("note_type", "varchar", false, false),
-            col("content", "text", false, false),
-            col("recorded_at", "timestamp", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("encounter_id", "encounters", "id")]),
-        card("vital_signs", 1000000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("temperature", "numeric", false, false),
-            col("pulse", "integer", false, false),
-            col("bp_systolic", "integer", false, false),
-            col("bp_diastolic", "integer", false, false),
-            col("resp_rate", "integer", false, false),
-            col("spo2", "numeric", false, false),
-            col("weight", "numeric", false, false),
-            col("height", "numeric", false, false),
-            col("recorded_at", "timestamp", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("encounter_id", "encounters", "id")]),
-        card("allergies", 60000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("allergen", "varchar", false, false),
-            col("reaction_type", "varchar", false, false),
-            col("severity", "varchar", false, false),
-            col("onset_date", "date", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("medical_history", 100000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("condition", "varchar", false, false),
-            col("onset_year", "integer", false, false),
-            col("is_resolved", "boolean", false, false),
-            col("notes", "text", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("family_history", 40000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("relation", "varchar", false, false),
-            col("condition", "varchar", false, false),
-            col("is_deceased", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("immunizations", 80000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("vaccine", "varchar", false, false),
-            col("dose_number", "integer", false, false),
-            col("given_at", "date", false, false),
-            col("administered_by", "integer", false, true),
-            col("lot_no", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("patient_documents", 50000, vec![
-            col("id", "serial", true, false),
-            col("doc_no", "varchar", false, false),
-            col("patient_id", "integer", false, true),
-            col("document_type", "varchar", false, false),
-            col("file_name", "varchar", false, false),
-            col("uploaded_at", "timestamp", false, false),
-            col("uploaded_by", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("admissions", 30000, vec![
-            col("id", "serial", true, false),
-            col("admission_no", "varchar", false, false),
-            col("patient_id", "integer", false, true),
-            col("ward_id", "integer", false, true),
-            col("bed_id", "integer", false, true),
-            col("admitted_at", "timestamp", false, false),
-            col("discharge_date", "date", false, false),
-            col("admission_type", "varchar", false, false),
-            col("discharge_reason", "varchar", false, false),
-            col("length_of_stay_days", "integer", false, false),
-            col("total_charges", "numeric", false, false),
-            col("admission_status", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("ward_id", "wards", "id"), fk_edge("bed_id", "beds", "id")]),
-        card("bed_assignments", 80000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("bed_id", "integer", false, true),
-            col("ward_id", "integer", false, true),
-            col("admission_id", "integer", false, true),
-            col("assigned_at", "timestamp", false, false),
-            col("vacated_at", "timestamp", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("bed_id", "beds", "id")]),
-        card("patient_transfers", 5000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("from_ward", "integer", false, true),
-            col("to_ward", "integer", false, true),
-            col("from_bed", "integer", false, true),
-            col("to_bed", "integer", false, true),
-            col("transfer_date", "timestamp", false, false),
-            col("reason", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("staff_shifts", 50000, vec![
-            col("id", "serial", true, false),
-            col("provider_id", "integer", false, true),
-            col("ward_id", "integer", false, true),
-            col("shift_date", "date", false, false),
-            col("start_time", "time", false, false),
-            col("end_time", "time", false, false),
-            col("shift_type", "varchar", false, false),
-        ], vec![fk_edge("provider_id", "providers", "id"), fk_edge("ward_id", "wards", "id")]),
-        card("medication_administrations", 200000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("medication_id", "integer", false, true),
-            col("dose", "varchar", false, false),
-            col("route", "varchar", false, false),
-            col("administered_at", "timestamp", false, false),
-            col("administered_by", "integer", false, true),
-            col("admin_status", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("medication_id", "medications", "id")]),
-        card("triage_assessments", 20000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("triage_time", "timestamp", false, false),
-            col("acuity", "varchar", false, false),
-            col("chief_complaint", "text", false, false),
-            col("triage_category", "varchar", false, false),
-            col("arrival_mode", "varchar", false, false),
-            col("provider_id", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("antenatal_visits", 10000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("visit_date", "date", false, false),
-            col("gestation_weeks", "integer", false, false),
-            col("visit_number", "integer", false, false),
-            col("fundal_height", "numeric", false, false),
-            col("fetal_heart_rate", "integer", false, false),
-            col("provider_id", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("deliveries", 8000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("delivered_at", "timestamp", false, false),
-            col("delivery_mode", "varchar", false, false),
-            col("delivery_status", "varchar", false, false),
-            col("gestation_weeks", "integer", false, false),
-            col("blood_loss", "numeric", false, false),
-            col("delivered_by", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("newborns", 8000, vec![
-            col("id", "serial", true, false),
-            col("delivery_id", "integer", false, true),
-            col("birth_weight", "numeric", false, false),
-            col("apgar", "integer", false, false),
-            col("outcome", "varchar", false, false),
-            col("sex", "varchar", false, false),
-            col("length_cm", "numeric", false, false),
-        ], vec![fk_edge("delivery_id", "deliveries", "id")]),
-        card("surgeries", 5000, vec![
-            col("id", "serial", true, false),
-            col("surgery_no", "varchar", false, false),
-            col("patient_id", "integer", false, true),
-            col("scheduled_start", "timestamp", false, false),
-            col("theatre_no", "varchar", false, false),
-            col("primary_surgeon", "integer", false, true),
-            col("anaesthetist", "integer", false, true),
-            col("urgency", "varchar", false, false),
-            col("asa_grade", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("procedures", 15000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("procedure_code", "varchar", false, false),
-            col("performed_at", "timestamp", false, false),
-            col("performed_by", "integer", false, true),
-            col("outcome", "varchar", false, false),
-            col("duration_minutes", "integer", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("procedure_codes", 2000, vec![
-            col("id", "serial", true, false),
-            col("code", "varchar", false, false),
-            col("description", "varchar", false, false),
-            col("category", "varchar", false, false),
-            col("is_surgical", "boolean", false, false),
-            col("typical_minutes", "integer", false, false),
-        ], vec![]),
-        card("consents", 5000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("procedure_id", "integer", false, true),
-            col("consented_at", "timestamp", false, false),
-            col("consented_by", "integer", false, true),
-            col("consent_type", "varchar", false, false),
-            col("is_signed", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("medications", 3000, vec![
-            col("id", "serial", true, false),
-            col("medication_no", "varchar", false, false),
-            col("generic_name", "varchar", false, false),
-            col("brand_name", "varchar", false, false),
-            col("drug_class", "varchar", false, false),
-            col("atc_code", "varchar", false, false),
-            col("form", "varchar", false, false),
-            col("strength", "varchar", false, false),
-            col("is_formulary", "boolean", false, false),
-            col("stock_status", "varchar", false, false),
-            col("expires_on", "date", false, false),
-            col("quantity_on_hand", "integer", false, false),
-        ], vec![]),
-        card("prescriptions", 200000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("prescribed_by", "integer", false, true),
-            col("prescribed_at", "timestamp", false, false),
-            col("status", "varchar", false, false),
-            col("rx_number", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("encounter_id", "encounters", "id")]),
-        card("prescription_items", 500000, vec![
-            col("id", "serial", true, false),
-            col("prescription_id", "integer", false, true),
-            col("medication_id", "integer", false, true),
-            col("dose", "varchar", false, false),
-            col("frequency", "varchar", false, false),
-            col("quantity", "integer", false, false),
-            col("duration_days", "integer", false, false),
-        ], vec![fk_edge("prescription_id", "prescriptions", "id"), fk_edge("medication_id", "medications", "id")]),
-        card("stock_batches", 5000, vec![
-            col("id", "serial", true, false),
-            col("medication_id", "integer", false, true),
-            col("batch_no", "varchar", false, false),
-            col("expiry_date", "date", false, false),
-            col("quantity", "integer", false, false),
-            col("unit_cost", "numeric", false, false),
-        ], vec![fk_edge("medication_id", "medications", "id")]),
-        card("stock_movements", 50000, vec![
-            col("id", "serial", true, false),
-            col("batch_id", "integer", false, true),
-            col("medication_id", "integer", false, true),
-            col("quantity_change", "integer", false, false),
-            col("movement_type", "varchar", false, false),
-            col("moved_at", "timestamp", false, false),
-            col("reference_id", "integer", false, true),
-        ], vec![fk_edge("batch_id", "stock_batches", "id")]),
-        card("drug_interactions", 10000, vec![
-            col("id", "serial", true, false),
-            col("drug1_id", "integer", false, true),
-            col("drug2_id", "integer", false, true),
-            col("severity", "varchar", false, false),
-            col("mechanism", "text", false, false),
-            col("clinical_effect", "text", false, false),
-            col("management", "text", false, false),
-        ], vec![fk_edge("drug1_id", "medications", "id"), fk_edge("drug2_id", "medications", "id")]),
-        card("allergens", 500, vec![
-            col("id", "serial", true, false),
-            col("name", "varchar", false, false),
-            col("category", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![]),
-        card("cds_alerts", 20000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("alert_type", "varchar", false, false),
-            col("triggered_at", "timestamp", false, false),
-            col("rule_id", "varchar", false, false),
-            col("acknowledged_by", "integer", false, true),
-            col("is_overridden", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("lab_tests", 500, vec![
-            col("id", "serial", true, false),
-            col("code", "varchar", false, false),
-            col("name", "varchar", false, false),
-            col("category", "varchar", false, false),
-            col("unit", "varchar", false, false),
-            col("sample_type", "varchar", false, false),
-            col("turnaround_hours", "integer", false, false),
-            col("ordered_at", "timestamp", false, false),
-        ], vec![]),
-        card("lab_orders", 300000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("test_id", "integer", false, true),
-            col("ordered_by", "integer", false, true),
-            col("ordered_at", "timestamp", false, false),
-            col("status", "varchar", false, false),
-            col("priority", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("test_id", "lab_tests", "id")]),
-        card("lab_results", 280000, vec![
-            col("id", "serial", true, false),
-            col("result_no", "varchar", false, false),
-            col("order_id", "integer", false, true),
-            col("patient_id", "integer", false, true),
-            col("result_value", "varchar", false, false),
-            col("result_date", "timestamp", false, false),
-            col("unit", "varchar", false, false),
-            col("reference_range", "varchar", false, false),
-            col("is_abnormal", "boolean", false, false),
-            col("verified_by", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("order_id", "lab_orders", "id")]),
-        card("imaging_orders", 100000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("modality", "varchar", false, false),
-            col("body_part", "varchar", false, false),
-            col("ordered_by", "integer", false, true),
-            col("ordered_at", "timestamp", false, false),
-            col("status", "varchar", false, false),
-            col("priority", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("blood_units", 5000, vec![
-            col("id", "serial", true, false),
-            col("blood_group", "varchar", false, false),
-            col("component", "varchar", false, false),
-            col("volume_ml", "integer", false, false),
-            col("collected_on", "date", false, false),
-            col("expires_on", "date", false, false),
-            col("status", "varchar", false, false),
-            col("unit_no", "varchar", false, false),
-        ], vec![]),
-        card("transfusions", 3000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("blood_unit_id", "integer", false, true),
-            col("issued_at", "timestamp", false, false),
-            col("started_at", "timestamp", false, false),
-            col("reaction", "varchar", false, false),
-            col("administered_by", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("blood_unit_id", "blood_units", "id")]),
-        card("billing_encounters", 200000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("encounter_id", "integer", false, true),
-            col("bill_no", "varchar", false, false),
-            col("billing_date", "date", false, false),
-            col("subtotal", "numeric", false, false),
-            col("discount", "numeric", false, false),
-            col("patient_due", "numeric", false, false),
-            col("amount_paid", "numeric", false, false),
-            col("status", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("encounter_id", "encounters", "id")]),
-        card("billing_items", 800000, vec![
-            col("id", "serial", true, false),
-            col("billing_id", "integer", false, true),
-            col("item_type", "varchar", false, false),
-            col("description", "varchar", false, false),
-            col("quantity", "integer", false, false),
-            col("unit_price", "numeric", false, false),
-            col("total", "numeric", false, false),
-        ], vec![fk_edge("billing_id", "billing_encounters", "id")]),
-        card("insurance_claims", 50000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("billing_id", "integer", false, true),
-            col("insurer_id", "integer", false, true),
-            col("claim_no", "varchar", false, false),
-            col("submitted_at", "date", false, false),
-            col("status", "varchar", false, false),
-            col("amount_claimed", "numeric", false, false),
-            col("amount_approved", "numeric", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("insurer_id", "insurers", "id")]),
-        card("payments", 200000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("billing_id", "integer", false, true),
-            col("payment_date", "date", false, false),
-            col("payment_method", "varchar", false, false),
-            col("amount", "numeric", false, false),
-            col("reference_no", "varchar", false, false),
-            col("received_by", "integer", false, true),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("incidents", 2000, vec![
-            col("id", "serial", true, false),
-            col("incident_type", "varchar", false, false),
-            col("incident_date", "timestamp", false, false),
-            col("severity", "varchar", false, false),
-            col("reported_by", "integer", false, true),
-            col("location", "varchar", false, false),
-            col("outcome", "varchar", false, false),
-        ], vec![]),
-        card("mortality_records", 1000, vec![
-            col("id", "serial", true, false),
-            col("death_no", "varchar", false, false),
-            col("patient_id", "integer", false, true),
-            col("national_id", "varchar", false, false),
-            col("date_of_death", "date", false, false),
-            col("cause_of_death", "varchar", false, false),
-            col("icd_cause", "varchar", false, false),
-            col("certified_by", "integer", false, true),
-            col("manner", "varchar", false, false),
-            col("completed_at", "date", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("patient_feedback", 5000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("feedback_date", "date", false, false),
-            col("category", "varchar", false, false),
-            col("rating", "integer", false, false),
-            col("comment", "text", false, false),
-            col("resolved", "boolean", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("notifiable_disease_reports", 500, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("disease_code", "varchar", false, false),
-            col("reported_at", "timestamp", false, false),
-            col("reported_by", "integer", false, true),
-            col("status", "varchar", false, false),
-            col("authority", "varchar", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("record_access_logs", 50000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("accessed_at", "timestamp", false, false),
-            col("accessed_by", "integer", false, true),
-            col("action", "varchar", false, false),
-            col("ip_address", "varchar", false, false),
-            col("justification", "text", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id")]),
-        card("provider_licenses", 400, vec![
-            col("id", "serial", true, false),
-            col("provider_id", "integer", false, true),
-            col("regulator", "varchar", false, false),
-            col("license_no", "varchar", false, false),
-            col("license_type", "varchar", false, false),
-            col("issued_on", "date", false, false),
-            col("expires_on", "date", false, false),
-            col("is_current", "boolean", false, false),
-        ], vec![fk_edge("provider_id", "providers", "id")]),
-        card("care_programs", 20, vec![
-            col("id", "serial", true, false),
-            col("name", "varchar", false, false),
-            col("disease", "varchar", false, false),
-            col("description", "text", false, false),
-            col("target_population", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![]),
-        card("program_enrollments", 30000, vec![
-            col("id", "serial", true, false),
-            col("patient_id", "integer", false, true),
-            col("program_id", "integer", false, true),
-            col("enrolled_at", "date", false, false),
-            col("status", "varchar", false, false),
-            col("next_visit_date", "date", false, false),
-        ], vec![fk_edge("patient_id", "patients", "id"), fk_edge("program_id", "care_programs", "id")]),
-        card("vaccines", 50, vec![
-            col("id", "serial", true, false),
-            col("name", "varchar", false, false),
-            col("antigen", "varchar", false, false),
-            col("doses_required", "integer", false, false),
-            col("route", "varchar", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![]),
-        card("equipment", 500, vec![
-            col("id", "serial", true, false),
-            col("equipment_no", "varchar", false, false),
-            col("name", "varchar", false, false),
-            col("category", "varchar", false, false),
-            col("serial_no", "varchar", false, false),
-            col("department_id", "integer", false, true),
-            col("status", "varchar", false, false),
-            col("purchase_date", "date", false, false),
-            col("is_active", "boolean", false, false),
-        ], vec![fk_edge("department_id", "departments", "id")]),
-        card("equipment_maintenance", 2000, vec![
-            col("id", "serial", true, false),
-            col("equipment_id", "integer", false, true),
-            col("service_date", "date", false, false),
-            col("performed_by", "varchar", false, false),
-            col("type", "varchar", false, false),
-            col("next_service_date", "date", false, false),
-            col("cost", "numeric", false, false),
-        ], vec![fk_edge("equipment_id", "equipment", "id")]),
-    ]
+/// Ground-truth enum labels for the dev-seed schema, parsed from the same DDL
+/// as `dev_seed_cards` (plan 03e). Consumed by `nl2sql::ir`'s golden suite via
+/// `bind_cards`'s `enum_values` parameter -- see `ddl::dev_enum_values_from_ddl`.
+pub(crate) fn dev_seed_enum_values() -> HashMap<String, HashMap<String, Vec<String>>> {
+    ddl::dev_enum_values_from_ddl()
 }
 
 /// Alternative schema (25 tables) using plan 08 §1 naming conventions.
@@ -959,6 +338,8 @@ pub(crate) fn alt_schema_cards() -> Vec<TableCard> {
             col("reference_range", "varchar", false, false),
             col("is_abnormal", "boolean", false, false),
             col("AbnormalFlag", "char", false, false),
+            // Mirror of dev lab_results.is_critical — same ground-truth column.
+            col("is_critical", "boolean", false, false),
         ], vec![
             fk_edge("patient_id", "PatientMaster", "pat_id"),
             fk_edge("req_id", "LabReq", "req_id"),
@@ -1123,7 +504,7 @@ fn alt_schema_binding_accuracy() {
         degraded: true,
         override_version: 0,
     };
-    let usable = sb.usable_lines();
+    let usable = sb.usable_lines(PROD_MIN_CONFIDENCE);
 
     eprintln!("Alt schema: {exact}/{total} exact, {} usable lines: {:?}", usable.len(), usable.iter().map(|l| l.slug()).collect::<Vec<_>>());
 
@@ -1201,13 +582,28 @@ fn exactly_one_event_time_per_bound_table() {
 }
 
 /// Acceptance criterion 6 (integration): no PII column has non-empty enum_values.
+///
+/// Fed `dev_seed_enum_values()` (plan 03e), not an empty map: this is the same
+/// DDL-derived enum data the golden suite binds against, so the guard exercises
+/// real categorical labels landing on real columns rather than trivially
+/// passing because nothing was ever supplied. Before 03e this test's fixture
+/// (the old hand-written `dev_seed_cards()`) declared a `mortality_records`
+/// table with a `national_id` column — a column that does not exist in
+/// `01_schema.sql` (`national_id` lives on `patients`) — so part of the
+/// surface this guard checked was never real. The DDL-derived fixture cannot
+/// declare a column the schema doesn't have (see the `ddl.rs` canaries), so
+/// the phantom is gone; the eprintln below reports the guard's actual PII
+/// coverage post-regeneration.
 #[test]
 fn no_pii_enum_values_in_dev_seed() {
     let cards = dev_seed_cards();
-    let bindings = bind_cards(&cards, PROD_MIN_CONFIDENCE, 3, None, None, &HashMap::new());
+    let enum_values = dev_seed_enum_values();
+    let bindings = bind_cards(&cards, PROD_MIN_CONFIDENCE, 3, None, None, &enum_values);
+    let mut pii_columns: Vec<String> = Vec::new();
     for tb in &bindings {
         for cb in &tb.columns {
             if cb.is_pii {
+                pii_columns.push(format!("{}.{}", tb.table_name, cb.column_name));
                 assert!(
                     cb.enum_values.is_empty(),
                     "PII column {}.{} must have empty enum_values",
@@ -1216,4 +612,10 @@ fn no_pii_enum_values_in_dev_seed() {
             }
         }
     }
+    pii_columns.sort();
+    eprintln!(
+        "no_pii_enum_values_in_dev_seed: {} real PII columns covered: {:?}",
+        pii_columns.len(),
+        pii_columns
+    );
 }

@@ -15,7 +15,7 @@ use crate::aggregation::validate;
 use crate::auth::guard::AuthUser;
 use crate::documentdb::DocumentDb;
 use crate::error::AppResult;
-use crate::foundry::router::AgentKind;
+use crate::foundry::router::ModelRole;
 use crate::foundry::{FoundryManager, GuardedChatStream};
 use crate::state::AppState;
 use crate::telemetry::{RequestTrace, Stage};
@@ -188,26 +188,6 @@ pub fn build_list_narration_user(
     msg
 }
 
-// ---------------------------------------------------------------------------
-// Intent-to-kind mapping (shared with agents/routes.rs)
-// ---------------------------------------------------------------------------
-
-/// Map a `QueryIntent` to the corresponding `AgentKind`.
-///
-/// `Enumeration` falls back to `Chat` for the `/agents` path since that route
-/// does not yet have a dedicated list handler. `/chat` handles enumeration directly
-/// via `run_structured`.
-pub fn intent_to_kind(intent: QueryIntent) -> AgentKind {
-    match intent {
-        QueryIntent::Trend => AgentKind::Trends,
-        QueryIntent::Aggregation => AgentKind::HealthQuery,
-        QueryIntent::Lookup => AgentKind::PatientLookup,
-        QueryIntent::Narrative => AgentKind::Summarize,
-        // Enumeration uses the list path in /chat; /agents falls back to semantic.
-        QueryIntent::Enumeration | QueryIntent::MultiHop => AgentKind::Chat,
-    }
-}
-
 // Model-based intent classification now lives in the intent router
 // (`router::route`, Tier 2 — `FoundryManager::plan_route`), which uses a forced
 // tool call rather than free-text JSON parsing. See `plans/17-intent-router-v2.md`.
@@ -291,12 +271,9 @@ pub async fn run_structured(
 ) -> AppResult<Structured> {
     match intent {
         QueryIntent::Aggregation | QueryIntent::Trend => {
-            let kind = if intent == QueryIntent::Trend {
-                AgentKind::Trends
-            } else {
-                AgentKind::HealthQuery
-            };
-            let spec = state.spec_for(kind);
+            // Planning a pipeline is the PlanSpec role regardless of intent; the
+            // Trend/Aggregation distinction only changes the planner prompt below.
+            let spec = state.spec_for(ModelRole::PlanSpec);
             let planner_system = build_agg_planner_system(catalog, intent);
 
             // Exact unfiltered patient totals do not need model planning. Besides
@@ -338,8 +315,11 @@ pub async fn run_structured(
 
             // 4. Open grounded narration stream (no tools — model only summarises).
             let narration_user = build_narration_user(question, &rows);
-            let mut narration_spec = state.spec_for(kind);
+            let mut narration_spec = state.spec_for(ModelRole::Narrate);
             narration_spec.tools = false; // narration never uses tool calling
+            // Trend narration benefits from deliberate reasoning about direction and
+            // magnitude; a flat aggregation does not.
+            narration_spec.thinking = intent == QueryIntent::Trend;
             let narration_stream = trace
                 .time(
                     Stage::Narrate,
@@ -355,7 +335,7 @@ pub async fn run_structured(
         }
 
         QueryIntent::Enumeration => {
-            let spec = state.spec_for(AgentKind::HealthQuery); // planner role
+            let spec = state.spec_for(ModelRole::PlanSpec); // planner role
             let planner_system = build_list_planner_system(catalog);
 
             // 1. Plan: model emits a RunList tool call.
@@ -387,7 +367,7 @@ pub async fn run_structured(
                 offset,
                 validated.limit.unwrap_or(list::DEFAULT_LIST_LIMIT),
             );
-            let mut narration_spec = state.spec_for(AgentKind::HealthQuery);
+            let mut narration_spec = state.spec_for(ModelRole::Narrate);
             narration_spec.tools = false;
             let narration_stream = trace
                 .time(

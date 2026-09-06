@@ -11,3 +11,23 @@
 {"id":"narrative","question":"Explain what hypertension means","route_expected":"semantic","intent_expected":null}
 {"id":"patient-history","question":"Show the patient history for SYN-P0002","route_expected":"semantic","intent_expected":null}
 {"id":"clinical-greeting-guard","question":"Hey how many patients have diabetes?","route_expected":"structured","intent_expected":"aggregation"}
+{"id":"ward-bed-count","question":"How many beds are free in ICU?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"ward_board"}
+{"id":"ward-admitted-now","question":"Who is admitted right now?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"ward_board"}
+{"id":"ward-long-stay","question":"Which patients have been in over 14 days?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"ward_board"}
+{"id":"ed-category1","question":"How many category 1 patients arrived last month?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"emergency"}
+{"id":"ed-ambulance","question":"How many arrived by ambulance?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"emergency"}
+{"id":"maternity-deliveries","question":"How many deliveries last month?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"maternity"}
+{"id":"maternity-caesarean","question":"How many caesarean deliveries last month?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"maternity"}
+{"id":"theatre-cancelled","question":"How many operations were cancelled?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"theatre"}
+{"id":"pharmacy-stock","question":"Which medicines are out of stock?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"pharmacy"}
+{"id":"pharmacy-expiry","question":"What expires within 30 days?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"pharmacy"}
+{"id":"revenue-outstanding","question":"What is outstanding by insurer?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"revenue"}
+{"id":"revenue-rejected-claims","question":"Which claims were rejected?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"revenue"}
+{"id":"patient-lookup-identity","question":"Tell me about PT-00042","route_expected":"semantic","intent_expected":null}
+{"id":"front-desk-no-show","question":"What is our no-show rate?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"front_desk"}
+{"id":"diagnostics-critical","question":"Which results are critical and unreviewed?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"diagnostics"}
+{"id":"quality-falls","question":"How many falls this quarter?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"quality_safety"}
+{"id":"chronic-lost-followup","question":"Who has been lost to follow-up in the HIV clinic?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"chronic_care"}
+{"id":"workforce-licence-expiry","question":"Whose practising licence expires this quarter?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"workforce"}
+{"id":"theatre-list-tomorrow","question":"What is on tomorrow's list?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"theatre"}
+{"id":"pharmacy-dispensed","question":"How much amoxicillin did we dispense last quarter?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"pharmacy"}

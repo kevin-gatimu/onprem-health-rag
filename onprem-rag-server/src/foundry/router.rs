@@ -1,33 +1,63 @@
-//! Task-aware model router: `AgentKind` → `ModelSpec`.
+//! Task-aware model router: `ModelRole` → `ModelSpec`.
 //!
-//! The router is stateless — it maps a task kind to a spec (alias + device preference
-//! + generation params). The `FoundryManager` resolves the spec to a concrete device
-//! variant at call time (`resolve_variant`, `ensure_loaded_lru`). Keeping routing
-//! separate from loading makes each independently testable and lets the routing table
-//! evolve without touching the load/LRU machinery.
+//! The router is stateless — it maps a *model role* (what a model call is for) to a
+//! spec (alias + device preference + generation params). The `FoundryManager` resolves
+//! the spec to a concrete device variant at call time (`resolve_variant`,
+//! `ensure_loaded_lru`). Keeping routing separate from loading makes each
+//! independently testable and lets the routing table evolve without touching the
+//! load/LRU machinery.
+//!
+//! `ModelRole` is deliberately *not* the product identity. Which agent the user is
+//! talking to lives in `agents::kind::AgentKind`; this enum only says what a given
+//! model call is being asked to do. Before plan 05 the two were fused into one
+//! overloaded `AgentKind`, which meant adding a hospital service line implied adding
+//! a model role.
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-/// The kind of agent task being performed. Controls model selection, device placement,
-/// and generation params (temperature, thinking mode, tool use).
-/// `snake_case` serialization matches the `POST /agents/<kind>` URL segment (Phase 3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// What a single model call is for. Controls model selection, device placement, and
+/// generation params (temperature, thinking mode, tool use).
+///
+/// `snake_case` serialization matches the `role` ids used by `GET /models/roles` and
+/// the persisted override keys in `settings.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AgentKind {
-    PatientLookup,
-    HealthQuery,
-    Trends,
-    Summarize,
-    Chat,
-    MultiHop,
-    QueryRewrite,
+pub enum ModelRole {
+    /// Grounded conversational answer over retrieved passages.
+    Grounded,
+    /// Narrate already-computed rows (aggregation results, record lists).
+    Narrate,
+    /// History-aware query rewrite and multi-query expansion.
+    Rewrite,
+    /// Intent classification (router Tier 2) — forced tool call, deterministic.
     Classify,
+    /// Clinical entity extraction from free text at ingest.
     Extract,
+    /// Post-answer faithfulness verification.
     Verify,
-    /// NL-to-SQL generation: Qwen on GPU, deterministic, plain SQL output.
+    /// NL-to-SQL generation: deterministic, plain SQL output.
     TextToSql,
+    /// Aggregation / `QuerySpec` planning — emits a spec, never prose.
+    PlanSpec,
+    /// Conversation-history compaction.
+    Compact,
+}
+
+impl ModelRole {
+    /// Every role, for exhaustive tests and admin listings.
+    pub const ALL: &'static [ModelRole] = &[
+        ModelRole::Grounded,
+        ModelRole::Narrate,
+        ModelRole::Rewrite,
+        ModelRole::Classify,
+        ModelRole::Extract,
+        ModelRole::Verify,
+        ModelRole::TextToSql,
+        ModelRole::PlanSpec,
+        ModelRole::Compact,
+    ];
 }
 
 /// Coarse accelerator target used to select a device variant at load time.
@@ -56,7 +86,7 @@ impl Device {
 }
 
 /// Per-call generation spec: which model to use, on which device, with which params.
-/// Produced by `ModelSpec::for_kind`; consumed by `FoundryManager::generate_stream_with`
+/// Produced by `ModelSpec::for_role`; consumed by `FoundryManager::generate_stream_with`
 /// and `FoundryManager::complete_with`.
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
@@ -82,39 +112,27 @@ pub struct ModelSpec {
 }
 
 impl ModelSpec {
-    /// Build a `ModelSpec` for a given agent kind, reading model aliases from `cfg`.
+    /// Build a `ModelSpec` for a model role, reading model aliases from `cfg`.
     ///
-    /// Device placement rationale:
-    /// All standard roles use one shared Qwen GPU variant so the resident cap bounds
-    /// memory without cross-family model swaps.
-    pub fn for_kind(kind: AgentKind, cfg: &Config) -> ModelSpec {
+    /// Temperature table (plan 05 §1): Grounded 0.3, Narrate 0.2, Rewrite 0.1,
+    /// Classify 0.0, TextToSql 0.0, PlanSpec 0.0, Extract 0.1, Verify 0.1, Compact 0.2.
+    /// Thinking is off for every role by default; `AgentMode::Trends` turns it on for
+    /// `Narrate` at the call site, which is the only place the mode is known.
+    ///
+    /// Device placement rationale: all roles use one shared Qwen GPU variant so the
+    /// resident cap bounds memory without cross-family model swaps.
+    pub fn for_role(role: ModelRole, cfg: &Config) -> ModelSpec {
         let r = &cfg.router;
-        match kind {
-            AgentKind::PatientLookup => ModelSpec {
-                alias: r.lookup.clone(),
+        match role {
+            ModelRole::Grounded => ModelSpec {
+                alias: r.chat.clone(),
                 thinking: false,
-                temperature: 0.1,
-                tools: true,
-                device_pref: vec![Device::Gpu],
-                max_tokens: None,
-            },
-            AgentKind::HealthQuery => ModelSpec {
-                alias: r.health_query.clone(),
-                thinking: false,
-                temperature: 0.2,
-                tools: true,
-                device_pref: vec![Device::Gpu],
-                max_tokens: None,
-            },
-            AgentKind::Trends => ModelSpec {
-                alias: r.trends.clone(),
-                thinking: true,
                 temperature: 0.3,
-                tools: true,
+                tools: false,
                 device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
-            AgentKind::Summarize => ModelSpec {
+            ModelRole::Narrate => ModelSpec {
                 alias: r.summarize.clone(),
                 thinking: false,
                 temperature: 0.2,
@@ -122,25 +140,9 @@ impl ModelSpec {
                 device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
-            AgentKind::Chat => ModelSpec {
-                alias: r.chat.clone(),
-                thinking: false,
-                temperature: 0.3,
-                tools: false,
-                device_pref: vec![Device::Gpu],
-                max_tokens: None,
-            },
-            AgentKind::MultiHop => ModelSpec {
-                alias: r.chat.clone(),
-                thinking: true,
-                temperature: 0.3,
-                tools: true,
-                device_pref: vec![Device::Gpu],
-                max_tokens: None,
-            },
-            // QueryRewrite is a short-output fast-lane task: low temperature for
-            // determinism, no thinking, GPU preferred but CPU is fine as a fallback.
-            AgentKind::QueryRewrite => ModelSpec {
+            // Rewrite is a short-output fast-lane task: low temperature for
+            // determinism, no thinking.
+            ModelRole::Rewrite => ModelSpec {
                 alias: r.fast.clone(),
                 thinking: false,
                 temperature: 0.1,
@@ -149,7 +151,7 @@ impl ModelSpec {
                 max_tokens: None,
             },
             // Classification shares the same GPU resident as every other role.
-            AgentKind::Classify => ModelSpec {
+            ModelRole::Classify => ModelSpec {
                 alias: r.classify.clone(),
                 thinking: false,
                 temperature: 0.0,
@@ -157,7 +159,7 @@ impl ModelSpec {
                 device_pref: vec![Device::Gpu],
                 max_tokens: Some(128),
             },
-            AgentKind::Extract => ModelSpec {
+            ModelRole::Extract => ModelSpec {
                 alias: r.extractor.clone(),
                 thinking: false,
                 temperature: 0.1,
@@ -165,7 +167,7 @@ impl ModelSpec {
                 device_pref: vec![Device::Gpu],
                 max_tokens: None,
             },
-            AgentKind::Verify => ModelSpec {
+            ModelRole::Verify => ModelSpec {
                 alias: r.verifier.clone(),
                 thinking: false,
                 temperature: 0.1,
@@ -175,7 +177,7 @@ impl ModelSpec {
             },
             // SQL is emitted directly rather than through constrained tool grammar,
             // which is unsupported by some local ONNX model variants.
-            AgentKind::TextToSql => ModelSpec {
+            ModelRole::TextToSql => ModelSpec {
                 alias: r.sql_model.clone(),
                 thinking: false,
                 temperature: 0.0,
@@ -183,16 +185,34 @@ impl ModelSpec {
                 device_pref: vec![Device::Gpu],
                 max_tokens: Some(256),
             },
+            // Spec planning is schema-bound and deterministic — the same discipline as
+            // SQL — but the output is a tool call, so `tools` stays on.
+            ModelRole::PlanSpec => ModelSpec {
+                alias: r.plan_spec.clone(),
+                thinking: false,
+                temperature: 0.0,
+                tools: true,
+                device_pref: vec![Device::Gpu],
+                max_tokens: None,
+            },
+            ModelRole::Compact => ModelSpec {
+                alias: r.fast.clone(),
+                thinking: false,
+                temperature: 0.2,
+                tools: false,
+                device_pref: vec![Device::Gpu],
+                max_tokens: None,
+            },
         }
     }
 }
 
-/// The settings/override key for a kind. One shared Core LLM serves every generative
-/// role, so every kind resolves through the single `"chat"` override — stale per-role
+/// The settings/override key for a role. One shared Core LLM serves every generative
+/// role, so every role resolves through the single `"chat"` override — stale per-role
 /// overrides persisted before the unification are deliberately ignored, otherwise a
 /// divergent role (e.g. `text_to_sql` pinned at an older model) forces an LRU swap
 /// and a multi-second cold start on nearly every request.
-pub fn override_key(_kind: AgentKind) -> &'static str {
+pub fn override_key(_role: ModelRole) -> &'static str {
     "chat"
 }
 
@@ -209,16 +229,16 @@ mod tests {
     #[test]
     fn extract_prefers_gpu() {
         let cfg = test_cfg();
-        let spec = ModelSpec::for_kind(AgentKind::Extract, &cfg);
+        let spec = ModelSpec::for_role(ModelRole::Extract, &cfg);
         assert_eq!(spec.device_pref, vec![Device::Gpu]);
         assert_eq!(spec.alias, cfg.router.extractor);
         assert!(!spec.thinking, "Extract should not use chain-of-thought");
     }
 
     #[test]
-    fn chat_prefers_gpu_only() {
+    fn grounded_prefers_gpu_only() {
         let cfg = test_cfg();
-        let spec = ModelSpec::for_kind(AgentKind::Chat, &cfg);
+        let spec = ModelSpec::for_role(ModelRole::Grounded, &cfg);
         assert_eq!(spec.device_pref, vec![Device::Gpu]);
         assert_eq!(spec.alias, cfg.router.chat);
     }
@@ -226,14 +246,54 @@ mod tests {
     #[test]
     fn verify_matches_extract_placement() {
         let cfg = test_cfg();
-        let spec = ModelSpec::for_kind(AgentKind::Verify, &cfg);
+        let spec = ModelSpec::for_role(ModelRole::Verify, &cfg);
         assert_eq!(spec.device_pref, vec![Device::Gpu]);
     }
 
+    /// Plan 05 §1: the per-role temperature table is a contract other modules rely on.
     #[test]
-    fn trends_uses_thinking() {
+    fn role_temperature_table_matches_plan() {
         let cfg = test_cfg();
-        let spec = ModelSpec::for_kind(AgentKind::Trends, &cfg);
-        assert!(spec.thinking);
+        let expected = [
+            (ModelRole::Grounded, 0.3_f32),
+            (ModelRole::Narrate, 0.2),
+            (ModelRole::Rewrite, 0.1),
+            (ModelRole::Classify, 0.0),
+            (ModelRole::TextToSql, 0.0),
+            (ModelRole::PlanSpec, 0.0),
+            (ModelRole::Extract, 0.1),
+            (ModelRole::Verify, 0.1),
+            (ModelRole::Compact, 0.2),
+        ];
+        for (role, temp) in expected {
+            let spec = ModelSpec::for_role(role, &cfg);
+            assert!(
+                (spec.temperature - temp).abs() < f32::EPSILON,
+                "{role:?} temperature should be {temp}, got {}",
+                spec.temperature
+            );
+            assert!(!spec.thinking, "{role:?} should default to thinking off");
+        }
+        assert_eq!(
+            ModelRole::ALL.len(),
+            expected.len(),
+            "every ModelRole needs a temperature assertion"
+        );
+    }
+
+    /// PlanSpec follows the SQL model unless explicitly overridden.
+    #[test]
+    fn plan_spec_defaults_to_sql_model() {
+        let cfg = test_cfg();
+        let spec = ModelSpec::for_role(ModelRole::PlanSpec, &cfg);
+        assert_eq!(spec.alias, cfg.router.sql_model);
+    }
+
+    /// Every role resolves through the single shared override key.
+    #[test]
+    fn every_role_uses_the_chat_override_key() {
+        for role in ModelRole::ALL {
+            assert_eq!(override_key(*role), "chat");
+        }
     }
 }

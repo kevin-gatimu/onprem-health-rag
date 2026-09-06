@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 // ---------------------------------------------------------------------------
 
 // Re-export so external call sites continue to resolve via `crate::nl2sql::routes::*`.
-pub(crate) use super::prepare::{PreparedNlQuery, prepare_auto_query, prepare_auto_query_deterministic};
+pub(crate) use super::prepare::{
+    PreparedNlQuery, SourceScope, prepare_auto_query, prepare_auto_query_deterministic,
+};
 // resolve_followup_question is called by agents/routes.rs via crate::nl2sql::routes::resolve_followup_question.
 pub(crate) use super::text::{
     resolve_followup_question,

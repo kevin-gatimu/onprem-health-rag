@@ -158,15 +158,15 @@ impl AppState {
         }
     }
 
-    /// `ModelSpec` for a kind, with any persisted per-role override applied over the
-    /// `ONPREM_MODEL_*` env default. This is what routed callers (`/agents/<kind>`)
-    /// should use instead of `ModelSpec::for_kind` directly.
+    /// `ModelSpec` for a model role, with any persisted per-role override applied over
+    /// the `ONPREM_MODEL_*` env default. This is what every caller should use instead of
+    /// `ModelSpec::for_role` directly.
     pub fn spec_for(
         &self,
-        kind: crate::foundry::router::AgentKind,
+        role: crate::foundry::router::ModelRole,
     ) -> crate::foundry::router::ModelSpec {
-        let mut spec = crate::foundry::router::ModelSpec::for_kind(kind, &self.config);
-        if let Some(v) = self.router_override(crate::foundry::router::override_key(kind)) {
+        let mut spec = crate::foundry::router::ModelSpec::for_role(role, &self.config);
+        if let Some(v) = self.router_override(crate::foundry::router::override_key(role)) {
             spec.alias = v;
         }
         spec

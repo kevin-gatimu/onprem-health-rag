@@ -75,27 +75,27 @@ impl TryFrom<&QuerySpec> for PlannedSpec {
                 let op = match &m.op {
                     MeasureOp::Count => "COUNT(*)".into(),
                     MeasureOp::CountDistinct => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("COUNT(DISTINCT {col})")
                     }
                     MeasureOp::Sum => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("SUM({col})")
                     }
                     MeasureOp::Avg => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("AVG({col})")
                     }
                     MeasureOp::Min => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("MIN({col})")
                     }
                     MeasureOp::Max => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("MAX({col})")
                     }
                     MeasureOp::Median => {
-                        let col = m.target.as_ref().map(describe_col).unwrap_or_default();
+                        let col = m.target.as_ref().map(describe_target).unwrap_or_default();
                         format!("MEDIAN({col})")
                     }
                     MeasureOp::Rate { .. } => "rate(%)".into(),
@@ -204,6 +204,25 @@ fn describe_col(col: &super::spec::ColumnRef) -> String {
     }
 }
 
+/// Describe a measure/projection target for the plan DTO the UI shows.
+///
+/// A derived duration must render as arithmetic with its unit, not as a column
+/// name — the plan panel is where a reader checks that "average length of stay"
+/// really means discharge minus admission in days (plan 03g §1).
+fn describe_target(v: &super::spec::ValueExpr) -> String {
+    use super::spec::ValueExpr;
+    match v {
+        ValueExpr::Column(cr) => describe_col(cr),
+        ValueExpr::Duration(d) => format!(
+            "({} - {}) in {} [{}]",
+            describe_col(&d.end),
+            describe_col(&d.start),
+            d.unit.as_str(),
+            d.open.narration(),
+        ),
+    }
+}
+
 fn describe_value(v: &super::spec::FilterValue) -> String {
     use super::spec::FilterValue;
     match v {
@@ -241,6 +260,9 @@ fn describe_time_range(r: &TimeRange) -> String {
         TimeRange::Last { n, unit } => format!("last_{n}_{}", unit.as_str()),
         TimeRange::Next { n, unit } => format!("next_{n}_{}", unit.as_str()),
         TimeRange::Within { n, unit } => format!("within_{n}_{}", unit.as_str()),
+        TimeRange::WithinThisWeek => "within_this_week".into(),
+        TimeRange::WithinThisMonth => "within_this_month".into(),
+        TimeRange::WithinThisQuarter => "within_this_quarter".into(),
     }
 }
 
@@ -277,6 +299,8 @@ mod tests {
             limit: None,
             joins: vec![],
             projection: vec![],
+            related: vec![],
+            duration_filters: vec![],
             provenance: SpecProvenance { rule: "R1".into(), focus_subs: vec![] },
         }
     }

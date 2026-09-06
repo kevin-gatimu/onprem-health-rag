@@ -196,7 +196,7 @@ pub async fn start_ingest(
     let router_cache = state.router_cache_handle();
     let binding_cache = state.binding_cache();
     let foundry = state.foundry_handle();
-    let extract_spec = state.spec_for(crate::foundry::router::AgentKind::Extract);
+    let extract_spec = state.spec_for(crate::foundry::router::ModelRole::Extract);
     let source_id = req.source_id.clone();
     let job = job_id.clone();
     let tables = req.tables.clone();
@@ -322,7 +322,7 @@ pub async fn resume_ingest(
     let router_cache = state.router_cache_handle();
     let binding_cache = state.binding_cache();
     let foundry = state.foundry_handle();
-    let extract_spec = state.spec_for(crate::foundry::router::AgentKind::Extract);
+    let extract_spec = state.spec_for(crate::foundry::router::ModelRole::Extract);
     let job_id = job.to_string();
     let response_job_id = job_id.clone();
     tokio::spawn(async move {

@@ -101,33 +101,62 @@ pub struct SchemaBinding {
 
 impl SchemaBinding {
     /// Service lines that have at least one owned concept bound at confidence
-    /// ≥ 0.55.  Returned in tier order (tier-1 first).
-    pub fn usable_lines(&self) -> Vec<ServiceLine> {
+    /// ≥ `min_confidence`.  Returned in tier order (tier-1 first).
+    ///
+    /// Pass `ONPREM_BINDING_MIN_CONFIDENCE` (default 0.55) from `Config` at
+    /// call sites that have config access; use `0.55` in pure tests via the
+    /// `PROD_MIN_CONFIDENCE` constant in `ontology/tests/mod.rs`.
+    pub fn usable_lines(&self, min_confidence: f32) -> Vec<ServiceLine> {
         let mut result: Vec<ServiceLine> = ServiceLine::ALL
             .iter()
             .copied()
-            .filter(|&line| self.line_is_usable(line))
+            .filter(|&line| self.line_is_usable(line, min_confidence))
             .collect();
         result.sort_by_key(|l| (l.tier(), l.slug()));
         result
     }
 
-    fn line_is_usable(&self, line: ServiceLine) -> bool {
-        // A line is usable if ≥1 of its *owned* concepts is bound at ≥0.55.
-        // Shared concepts (Patient, Encounter, Provider, Department, DiagnosisCode)
-        // are explicitly excluded: they are accessible by all service lines but
-        // do not make a line independently usable on their own.
-        // NOTE: ServiceLine::concepts() is NOT edited here; those lists correctly
-        // describe what each line may *read* (used by plan-05 linker scoping).
-        // Usability is a separate, stricter question over the same list.
+    /// True if this service line has at least one *owned* concept bound at
+    /// ≥ `min_confidence`.  Shared concepts (Patient, Encounter, Provider,
+    /// Department, DiagnosisCode) are explicitly excluded: they are accessible
+    /// by every line but do not make a line independently usable on their own.
+    ///
+    /// Pass `config.binding_min_confidence` at call sites that have config
+    /// access; tests use the `PROD_MIN_CONFIDENCE` constant (0.55).
+    ///
+    /// Two different questions over the same ownership list:
+    /// - *usability* = "does this line have its own subject matter?" (shared **excluded**)
+    /// - *scope*     = "what may this line read?"                   (shared **included**)
+    /// Use [`tables_for_line`] for the second question.
+    pub fn line_is_usable(&self, line: ServiceLine, min_confidence: f32) -> bool {
         line.concepts()
             .iter()
             .filter(|&&c| !SHARED_CONCEPTS.contains(&c))
             .any(|&concept| {
                 self.tables
                     .iter()
-                    .any(|t| t.concept == concept && t.confidence >= 0.55)
+                    .any(|t| t.concept == concept && t.confidence >= min_confidence)
             })
+    }
+
+    /// All table bindings that this service line may read: tables for its own
+    /// concepts **plus** all shared-concept tables (Patient, Encounter, Provider,
+    /// Department, DiagnosisCode).  The shared tables are included because almost
+    /// every service-line query joins out to Patient or Encounter.
+    ///
+    /// Two different questions over the same ownership list:
+    /// - *usability* = "does this line have its own subject matter?" (shared **excluded**)
+    /// - *scope*     = "what may this line read?"                   (shared **included**)
+    /// This function answers the scope question.
+    ///
+    /// Scope is a **read allow-list, not a security boundary**.  RBAC stays in `auth/`.
+    pub fn tables_for_line(&self, line: ServiceLine) -> Vec<&TableBinding> {
+        let owned: std::collections::HashSet<crate::ontology::concepts::EntityConcept> =
+            line.concepts().iter().copied().collect();
+        self.tables
+            .iter()
+            .filter(|t| owned.contains(&t.concept) || SHARED_CONCEPTS.contains(&t.concept))
+            .collect()
     }
 
     /// First table binding with the given concept, if any.
@@ -142,7 +171,11 @@ impl SchemaBinding {
     }
 
     /// Coverage statistics.
-    pub fn coverage(&self) -> BindingCoverage {
+    ///
+    /// `min_confidence` determines which lines count as usable (passed to
+    /// [`usable_lines`]).  Use `config.binding_min_confidence` at HTTP call
+    /// sites; tests use `PROD_MIN_CONFIDENCE` (0.55).
+    pub fn coverage(&self, min_confidence: f32) -> BindingCoverage {
         let total = self.tables.len();
         let bound = self
             .tables
@@ -159,7 +192,7 @@ impl SchemaBinding {
             bound_tables: bound,
             orphan_tables: total - bound,
             exact_concepts: exact,
-            usable_lines: self.usable_lines(),
+            usable_lines: self.usable_lines(min_confidence),
         }
     }
 
@@ -269,6 +302,57 @@ mod tests {
         assert_eq!(path[0].to_table, "patients");
     }
 
+    /// §0.4 asymmetry: a line whose only bound tables are shared-concept tables is
+    /// NOT usable (it has no own subject matter), but its scope is NON-EMPTY (it can
+    /// still read those shared tables).  Both assertions in one test so the distinction
+    /// cannot silently collapse.
+    #[test]
+    fn line_is_usable_vs_tables_for_line_asymmetry() {
+        use crate::ontology::concepts::EntityConcept;
+        use crate::ontology::roles::ColumnRole;
+        // Build a binding where Maternity has ONLY a Patient table (shared concept).
+        // Maternity is therefore NOT usable (no owned concept), but its scope
+        // must include the Patient table.
+        let binding = SchemaBinding {
+            source_id: "asym".into(),
+            bound_at: Utc::now(),
+            tables: vec![TableBinding {
+                table_name: "patients".into(),
+                concept: EntityConcept::Patient, // Patient is a SHARED concept
+                confidence: 0.95,
+                service_lines: vec![], // shared — not in any specific line's service_lines
+                columns: vec![ColumnBinding {
+                    column_name: "id".into(),
+                    role: ColumnRole::PrimaryKey,
+                    is_pii: false,
+                    enum_values: vec![],
+                }],
+                patient_path: Some(vec![]),
+                event_time_col: None,
+                degraded: false,
+            }],
+            degraded: false,
+            override_version: 0,
+        };
+
+        // Maternity owns AntenatalVisit, Delivery, Newborn, etc. — none are in the binding.
+        // So Maternity is NOT usable.
+        assert!(
+            !binding.line_is_usable(ServiceLine::Maternity, 0.55),
+            "Maternity must not be usable when only shared-concept tables are bound"
+        );
+        // But the scope for Maternity INCLUDES Patient (shared).
+        let scope = binding.tables_for_line(ServiceLine::Maternity);
+        assert!(
+            !scope.is_empty(),
+            "Maternity scope must include shared-concept tables even when line is not usable"
+        );
+        assert!(
+            scope.iter().any(|t| t.table_name == "patients"),
+            "Maternity scope must contain the patients table (shared concept)"
+        );
+    }
+
     /// `usable_lines` respects the 0.55 confidence threshold.
     #[test]
     fn usable_lines_threshold() {
@@ -303,7 +387,7 @@ mod tests {
             override_version: 0,
         };
 
-        let usable = binding.usable_lines();
+        let usable = binding.usable_lines(0.55);
         // PatientChart is usable (Diagnosis at 0.95 ≥ 0.55)
         assert!(usable.contains(&ServiceLine::PatientChart));
         // Revenue should not be usable (Bill at 0.40 < 0.55)

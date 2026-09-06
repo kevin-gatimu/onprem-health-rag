@@ -85,13 +85,20 @@ pub async fn route(
 ) -> AppResult<Json<RouteResponse>> {
     let _generation_permit = state.admission.generation().await?;
     let foundry = state.foundry().ok();
-    let decision = crate::router::route(
+    let bindings = state.bindings();
+    let catalog = state.catalog();
+    let decision = crate::router::route_dispatch(
         &body.question,
         body.has_history,
         &state.config,
         foundry,
-        &state.spec_for(crate::foundry::router::AgentKind::Classify),
+        &state.spec_for(crate::foundry::router::ModelRole::Classify),
         &state.router_cache,
+        &bindings,
+        &catalog,
+        None,
+        None, // /chat is not a fixed-line agent tab
+        crate::agents::kind::AgentMode::Ask,
     )
     .await;
 
@@ -104,9 +111,11 @@ pub async fn route(
             }),
         ),
         crate::router::RouteClass::Hybrid { cohort_intent } => (Some(*cohort_intent), None),
-        crate::router::RouteClass::Conversational
+        crate::router::RouteClass::Capability
+        | crate::router::RouteClass::Conversational
         | crate::router::RouteClass::ConversationMeta
-        | crate::router::RouteClass::Semantic => (None, None),
+        | crate::router::RouteClass::Semantic
+        | crate::router::RouteClass::Clarify { .. } => (None, None),
     };
 
     Ok(Json(RouteResponse {
@@ -156,7 +165,7 @@ pub async fn search(
             Stage::RewriteExpand,
             prepare_queries_with(
                 foundry,
-                &state.spec_for(crate::foundry::router::AgentKind::QueryRewrite),
+                &state.spec_for(crate::foundry::router::ModelRole::Rewrite),
                 &state.config,
                 &body.history,
                 &body.query,
@@ -288,23 +297,29 @@ pub async fn chat(
         })
         .await?;
 
-    // Intent Router v2: Tier 0 conversational gate -> Tier 1 lexical -> Tier 2 model
-    // classify, fail-open to semantic. Structured routes (Aggregation/Trend/Enumeration)
-    // go through plan->validate->execute->narrate; conversational replies skip retrieval;
-    // everything else (including hybrid, until its Phase-C executor lands) is semantic.
-    // Any structured failure falls back silently to semantic — a correct grounded answer
-    // beats an error. See plans/17-intent-router-v2.md.
+    // Intent Router (v2 default, v3 when ONPREM_ROUTER_V3=true): tiered routing
+    // from Tier 0 conversational gate through lexical, deterministic parse, model
+    // classifier, and clarify branch.  All structured routes go through
+    // plan→validate→execute→narrate; semantic fallback is always available.
+    // See plans/new/02-intent-router-v3.md and plans/17-intent-router-v2.md.
     let has_history = !memory.is_empty();
+    let bindings = state.bindings();
+    let catalog = state.catalog();
     let decision = trace
         .time(
             Stage::Route,
-            crate::router::route(
+            crate::router::route_dispatch(
                 &body.question,
                 has_history,
                 &state.config,
                 Some(foundry),
-                &state.spec_for(crate::foundry::router::AgentKind::Classify),
+                &state.spec_for(crate::foundry::router::ModelRole::Classify),
                 &state.router_cache,
+                &bindings,
+                &catalog,
+                None, // focus populated by plan 06
+                None, // /chat is not a fixed-line agent tab
+                crate::agents::kind::AgentMode::Ask,
             ),
         )
         .await;
@@ -317,11 +332,29 @@ pub async fn chat(
     let routed_json = decision.to_sse_json();
 
     let chat_data: ChatData = match &decision.class {
+        crate::router::RouteClass::Capability => {
+            // "What can you do?" is answered from the schema binding, with no
+            // model call, so the reply names this deployment's real departments
+            // instead of a plausible-sounding guess. `/chat` has no agent tab,
+            // so the answer is Ask's.
+            let bindings = state.bindings();
+            let binding = bindings
+                .values()
+                .max_by_key(|b| b.usable_lines(state.config.binding_min_confidence).len())
+                .cloned();
+            ChatData::DirectStructured {
+                answer: crate::agents::persona::capability_answer(
+                    crate::agents::kind::AgentKind::Ask,
+                    binding.as_deref(),
+                ),
+            }
+        }
+
         crate::router::RouteClass::Conversational => {
             generation_permit = Some(state.admission.generation().await?);
             // Cheap, warm, retrieval-free reply. Honour any persisted "chat" role
             // override, but nudge temperature up and cap the length — this is small talk.
-            let mut spec = state.spec_for(crate::foundry::router::AgentKind::Chat);
+            let mut spec = state.spec_for(crate::foundry::router::ModelRole::Grounded);
             spec.tools = false;
             spec.temperature = 0.4;
             spec.max_tokens = Some(160);
@@ -343,7 +376,7 @@ pub async fn chat(
             // Answer from working memory alone — no retrieval, no citations. The
             // conversational reply path already covers the empty-citations SSE
             // contract, so this just builds a memory-only prompt and reuses it.
-            let mut spec = state.spec_for(crate::foundry::router::AgentKind::Chat);
+            let mut spec = state.spec_for(crate::foundry::router::ModelRole::Grounded);
             spec.tools = false;
             spec.temperature = 0.2;
             let system = "Answer the user's question about THIS conversation's own history, \
@@ -368,7 +401,7 @@ pub async fn chat(
         crate::router::RouteClass::Structured { intent, backend } => {
             let intent = *intent;
             let sql_data = if *backend == crate::router::StructuredBackend::SourceSql {
-                match crate::nl2sql::routes::prepare_auto_query(state.inner(), &body.question).await
+                match crate::nl2sql::routes::prepare_auto_query(state.inner(), &body.question, None).await
                 {
                     Ok(Some(prepared)) => {
                         trace.stage_detail(
@@ -504,6 +537,24 @@ pub async fn chat(
                 .await?
             }
         }
+
+        crate::router::RouteClass::Clarify { question, .. } => {
+            // A required slot was missing; stream the clarification question back to
+            // the user as a short conversational reply — no retrieval, no citation.
+            generation_permit = Some(state.admission.generation().await?);
+            let mut spec = state.spec_for(crate::foundry::router::ModelRole::Grounded);
+            spec.tools = false;
+            spec.temperature = 0.2;
+            spec.max_tokens = Some(120);
+            let reply_stream = foundry
+                .generate_stream_with(
+                    &spec,
+                    "You are a helpful health-records assistant. Ask exactly the clarifying question below — do not add anything else.",
+                    question,
+                )
+                .await?;
+            ChatData::Conversational { reply_stream }
+        }
     };
 
     // Clone owned, Send data into the generator (EventStream! is 'static — no borrows).
@@ -517,8 +568,8 @@ pub async fn chat(
     let cfg = state.config.clone();
     // Resolved on the request so a persisted per-role override is honoured; the
     // generator is 'static and cannot borrow `&AppState`.
-    let verify_spec = state.spec_for(crate::foundry::router::AgentKind::Verify);
-    let compact_spec = state.spec_for(crate::foundry::router::AgentKind::QueryRewrite);
+    let verify_spec = state.spec_for(crate::foundry::router::ModelRole::Verify);
+    let compact_spec = state.spec_for(crate::foundry::router::ModelRole::Rewrite);
 
     Ok(EventStream! {
         use futures::StreamExt;
@@ -867,7 +918,7 @@ async fn resolve_followup_sql(
         question,
         memory.tail.iter().map(|turn| turn.content.as_str()),
     )?;
-    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &augmented).await {
+    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &augmented, None).await {
         Ok(Some(prepared)) => {
             tracing::info!(%augmented, "anaphoric follow-up answered via deterministic SQL");
             Some(source_sql_chat_data(prepared))
@@ -892,7 +943,7 @@ async fn resolve_semantic_sql(
         question,
         memory.tail.iter().map(|turn| turn.content.as_str()),
     )?;
-    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &candidate).await {
+    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &candidate, None).await {
         Ok(Some(prepared)) => {
             tracing::info!(%candidate, "semantic question answered via deterministic SQL");
             Some(source_sql_chat_data(prepared))
@@ -935,7 +986,7 @@ async fn build_semantic_chat_data(
             Stage::RewriteExpand,
             prepare_queries_with(
                 foundry,
-                &state.spec_for(crate::foundry::router::AgentKind::QueryRewrite),
+                &state.spec_for(crate::foundry::router::ModelRole::Rewrite),
                 &state.config,
                 &rewrite_turns,
                 question,
@@ -986,7 +1037,7 @@ async fn build_semantic_chat_data(
                 .time(
                     Stage::Generate,
                     foundry.generate_stream_with(
-                        &state.spec_for(crate::foundry::router::AgentKind::Chat),
+                        &state.spec_for(crate::foundry::router::ModelRole::Grounded),
                         SYSTEM_PROMPT,
                         &prompt,
                     ),

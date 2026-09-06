@@ -28,17 +28,44 @@ pub fn invalidate_source(source_id: &str) {
     }
 }
 
+/// Retain only cards whose table name is in `scope` (plan 05 §3, hook 1).
+///
+/// Applied **before** scoring so the explicit-mention boost in
+/// `prioritize_table_mentions` cannot lift an out-of-scope table back into the
+/// candidate set. `None` or an empty scope means no narrowing.
+///
+/// The resulting card list is what `prepare_auto_query_deterministic` turns into
+/// the `allowed_tables` argument of the existing `validate::validate_sql` guard,
+/// so narrowing here narrows that one guard rather than introducing a second.
+fn apply_scope(scored: &mut Vec<(f32, TableCard)>, scope: Option<&[String]>) {
+    let Some(scope) = scope else { return };
+    if scope.is_empty() {
+        return;
+    }
+    scored.retain(|(_, card)| {
+        scope
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&card.table_name))
+    });
+}
+
 /// Find the most relevant tables for a question by cosine similarity over the
 /// cardVector embeddings. Returns at most `top_k` cards, ranked best-first.
+///
+/// `scope` is an agent's read allow-list of physical table names (see
+/// `agents::kind::AgentKind::scope`); `None` means no narrowing. It is a
+/// relevance boundary, not an authorisation one.
 pub async fn link(
     db: &DocumentDb,
     config: &Config,
     question: &str,
     source_id: &str,
     top_k: usize,
+    scope: Option<&[String]>,
 ) -> AppResult<Vec<TableCard>> {
     let query_vec = embed_query(config, question).await?;
     let mut scored = rank_cached_cards(db, &query_vec, &[source_id.to_string()]).await?;
+    apply_scope(&mut scored, scope);
     prioritize_table_mentions(&mut scored, question);
     Ok(select_with_relationships(scored, top_k))
 }
@@ -51,12 +78,14 @@ pub async fn link_best_source(
     question: &str,
     source_ids: &[String],
     top_k: usize,
+    scope: Option<&[String]>,
 ) -> AppResult<Option<(String, Vec<TableCard>)>> {
     if source_ids.is_empty() {
         return Ok(None);
     }
     let query_vec = embed_query(config, question).await?;
     let mut scored = rank_cached_cards(db, &query_vec, source_ids).await?;
+    apply_scope(&mut scored, scope);
     prioritize_table_mentions(&mut scored, question);
     let Some(source_id) = scored.first().map(|(_, card)| card.source_id.clone()) else {
         return Ok(None);

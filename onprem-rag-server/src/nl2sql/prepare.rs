@@ -6,7 +6,7 @@
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
-use crate::foundry::router::AgentKind;
+use crate::foundry::router::ModelRole;
 use crate::state::AppState;
 
 use super::catalog::refresh_catalog;
@@ -14,6 +14,29 @@ use super::execute::run_select;
 use super::validate::validate_sql;
 use super::text::summarize_result;
 use super::{generate, linker};
+
+/// The read allow-list an agent applies to SQL planning (plan 05 §3, hook 1).
+///
+/// `tables` narrows the linker's candidate cards; `pin_source` restricts which
+/// registered source may answer. Both are relevance boundaries — the security
+/// boundary is `src/auth/`, and every SQL statement still passes the single
+/// `validate::validate_sql` guard with `allowed_tables` derived from the cards
+/// that survived this narrowing.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SourceScope {
+    pub tables: Vec<String>,
+    pub pin_source: Option<String>,
+}
+
+impl SourceScope {
+    fn tables(&self) -> Option<&[String]> {
+        if self.tables.is_empty() {
+            None
+        } else {
+            Some(self.tables.as_slice())
+        }
+    }
+}
 
 /// Wire-format event for the `sql` SSE field (used by http.rs).
 #[derive(Debug, Serialize)]
@@ -43,8 +66,9 @@ pub(crate) struct PreparedNlQuery {
 pub(crate) async fn prepare_auto_query(
     state: &AppState,
     question: &str,
+    scope: Option<&SourceScope>,
 ) -> AppResult<Option<PreparedNlQuery>> {
-    let Some((source_id, cards)) = link_auto_source(state, question).await? else {
+    let Some((source_id, cards)) = link_auto_source(state, question, scope).await? else {
         return Ok(None);
     };
     prepare_with_cards(state, &source_id, question, cards)
@@ -58,6 +82,7 @@ pub(crate) async fn prepare_auto_query(
 pub(crate) async fn prepare_auto_query_deterministic(
     state: &AppState,
     question: &str,
+    scope: Option<&SourceScope>,
 ) -> AppResult<Option<PreparedNlQuery>> {
     // Name-only overview wording does not mention a table. Add a linking hint so
     // the patients card is selected, while compiling the untouched question.
@@ -66,7 +91,7 @@ pub(crate) async fn prepare_auto_query_deterministic(
     } else {
         question.to_string()
     };
-    let Some((source_id, cards)) = link_auto_source(state, &link_question).await? else {
+    let Some((source_id, cards)) = link_auto_source(state, &link_question, scope).await? else {
         return Ok(None);
     };
     if cards.is_empty() {
@@ -96,20 +121,29 @@ pub(crate) async fn prepare_auto_query_deterministic(
 pub(crate) async fn link_auto_source(
     state: &AppState,
     question: &str,
+    scope: Option<&SourceScope>,
 ) -> AppResult<Option<(String, Vec<crate::nl2sql::spec::TableCard>)>> {
     if !state.config.router.text2sql_enabled {
         return Ok(None);
     }
-    let source_ids = crate::connectors::routes::connected_source_ids(&state.db).await?;
+    let mut source_ids = crate::connectors::routes::connected_source_ids(&state.db).await?;
+    // An explicit source pin removes the other sources from consideration rather
+    // than reordering them: picking "the first that matches" is exactly the
+    // positional resolution this codebase has been bitten by before.
+    if let Some(pin) = scope.and_then(|s| s.pin_source.as_deref()) {
+        source_ids.retain(|id| id == pin);
+    }
     if source_ids.is_empty() {
         return Ok(None);
     }
+    let scope_tables = scope.and_then(|s| s.tables());
     let mut linked = linker::link_best_source(
         &state.db,
         &state.config,
         question,
         &source_ids,
         state.config.router.nl2sql_tables_max,
+        scope_tables,
     )
     .await?;
 
@@ -136,6 +170,7 @@ pub(crate) async fn link_auto_source(
             question,
             &source_ids,
             state.config.router.nl2sql_tables_max,
+            scope_tables,
         )
         .await?;
     }
@@ -154,6 +189,7 @@ pub(crate) async fn prepare_query(
         question,
         source_id,
         state.config.router.nl2sql_tables_max,
+        None,
     )
     .await?;
     prepare_with_cards(state, source_id, question, cards).await
@@ -204,7 +240,7 @@ pub(crate) async fn prepare_with_cards(
     }
 
     let foundry = state.foundry()?;
-    let spec = state.spec_for(AgentKind::TextToSql);
+    let spec = state.spec_for(ModelRole::TextToSql);
     let few_shots: Vec<crate::nl2sql::spec::SqlExample> =
         Vec::with_capacity(state.config.router.nl2sql_fewshots);
     let prompt_token_budget = state.config.router.nl2sql_prompt_token_budget;
@@ -349,7 +385,7 @@ pub(crate) fn ir_shadow_run(
         }
     };
 
-    let bound = match bind(spec, &binding, schema_cards, allowed_tables) {
+    let bound = match bind(spec, &binding, schema_cards, allowed_tables, question) {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(source_id, error = %e, "ir_shadow: bind_error");
