@@ -176,6 +176,75 @@ fn enhance_text_query(query: &str) -> String {
     }
 }
 
+/// A read allow-list applied to retrieval candidates (plan 05 §3, hook 3).
+///
+/// The filter narrows *what an agent looks at*. It is not an access-control
+/// decision: every passage it can admit was already readable by this user, and
+/// authorisation stays entirely in `src/auth/`. Its job is relevance — stopping
+/// a Maternity question from answering out of `payments` rows.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalFilter {
+    /// Physical table names in scope. Empty = no table narrowing.
+    pub tables: Vec<String>,
+    /// Restrict to these ingested sources. Empty = all sources.
+    pub source_ids: Vec<String>,
+    /// Restrict to specific source rows (used by focus/handover). Empty = all.
+    pub row_pks: Vec<String>,
+    /// When set, keep only passages whose row primary key or text carries this
+    /// patient key.
+    pub patient_key: Option<String>,
+    /// `true` for a fixed service-line agent: the scope is a hard filter and an
+    /// empty result is an honest "not in this department's data".
+    /// `false` for Ask: the filter is advisory and never removes candidates.
+    pub explicit: bool,
+}
+
+impl RetrievalFilter {
+    /// Build the filter for an agent's scope. `explicit` mirrors
+    /// `AgentKind::scope_is_explicit`.
+    pub fn for_scope(tables: Vec<String>, explicit: bool) -> Self {
+        RetrievalFilter {
+            tables,
+            explicit,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this filter can remove anything at all.
+    fn is_active(&self) -> bool {
+        self.explicit
+            && (!self.tables.is_empty()
+                || !self.source_ids.is_empty()
+                || !self.row_pks.is_empty()
+                || self.patient_key.is_some())
+    }
+
+    /// Does a candidate hit survive the filter?
+    fn admits(&self, hit: &crate::documentdb::vector::Hit) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        if !self.tables.is_empty() && !self.tables.iter().any(|t| t == &hit.table) {
+            return false;
+        }
+        if !self.source_ids.is_empty() && !self.source_ids.iter().any(|s| s == &hit.source_id) {
+            return false;
+        }
+        if !self.row_pks.is_empty() && !self.row_pks.iter().any(|r| r == &hit.row_pk) {
+            return false;
+        }
+        if let Some(key) = &self.patient_key {
+            let key_lower = key.to_ascii_lowercase();
+            let in_pk = hit.row_pk.to_ascii_lowercase().contains(&key_lower);
+            let in_text = hit.text.to_ascii_lowercase().contains(&key_lower);
+            if !in_pk && !in_text {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Run retrieval while recording PHI-safe per-stage timings in the request summary.
 pub async fn retrieve_observed(
     db: &DocumentDb,
@@ -194,10 +263,41 @@ pub async fn retrieve_observed(
         rerank_enabled,
         top_k,
         Some(trace),
+        None,
     )
     .await
 }
 
+/// `retrieve_observed` with an agent scope applied to the candidate set.
+///
+/// Filtering happens after the search sides return and **before** RRF fusion, so
+/// ranks are computed over the admitted candidates only — filtering after fusion
+/// would leave gaps in the fused ranking and silently underfill `top_k`.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_observed_filtered(
+    db: &DocumentDb,
+    config: &Config,
+    queries: &[String],
+    mode: RetrievalMode,
+    rerank_enabled: bool,
+    top_k: usize,
+    trace: &RequestTrace,
+    filter: &RetrievalFilter,
+) -> AppResult<Vec<Passage>> {
+    retrieve_inner(
+        db,
+        config,
+        queries,
+        mode,
+        rerank_enabled,
+        top_k,
+        Some(trace),
+        Some(filter),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn retrieve_inner(
     db: &DocumentDb,
     config: &Config,
@@ -206,6 +306,7 @@ async fn retrieve_inner(
     rerank_enabled: bool,
     top_k: usize,
     trace: Option<&RequestTrace>,
+    filter: Option<&RetrievalFilter>,
 ) -> AppResult<Vec<Passage>> {
     let queries: Vec<String> = queries
         .iter()
@@ -269,7 +370,11 @@ async fn retrieve_inner(
         .into_iter()
         .zip(futures::future::join_all(futs).await)
     {
-        let ranking = collect(&mut by_id, result?);
+        let mut hits = result?;
+        if let Some(filter) = filter {
+            hits.retain(|hit| filter.admits(hit));
+        }
+        let ranking = collect(&mut by_id, hits);
         let rank_map = if is_vector {
             &mut vector_ranks
         } else {

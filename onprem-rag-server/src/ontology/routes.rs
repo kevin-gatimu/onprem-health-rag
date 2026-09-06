@@ -2,24 +2,23 @@
 //!
 //! | Method | Path                                          | Auth  | Description                          |
 //! |--------|-----------------------------------------------|-------|--------------------------------------|
-//! | GET    | /agents                                       | user  | List service lines + usable sources  |
 //! | GET    | /sources/<id>/binding                         | user  | Latest binding for a source          |
 //! | POST   | /sources/<id>/binding/rebuild                 | admin | Trigger a binding rebuild            |
 //! | GET    | /sources/<id>/binding/history                 | admin | Binding history (newest first)       |
+//!
+//! `GET /agents` used to live here; it moved to `agents::registry` in plan 05.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use rocket::serde::json::{Json, json};
 use rocket::{State, get, post};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::nl2sql::catalog::get_catalog_cards;
 use crate::ontology::binding::{BindingCoverage, SchemaBinding};
-use crate::ontology::binder::{build_binding, BindingOverrides};
-use crate::ontology::concepts::EntityConcept;
+use crate::ontology::binder::build_binding;
 use crate::ontology::service_line::ServiceLine;
 use crate::ontology::store;
 use crate::state::AppState;
@@ -28,30 +27,6 @@ use crate::state::AppState;
 // Response types
 // ---------------------------------------------------------------------------
 
-/// One row in the `/agents` listing.
-#[derive(Debug, Serialize)]
-pub struct ServiceLineInfo {
-    pub slug: &'static str,
-    pub label: &'static str,
-    pub blurb: &'static str,
-    pub tier: u8,
-    pub concepts: Vec<&'static str>,
-    pub examples: Vec<ExampleInfo>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ExampleInfo {
-    pub question: &'static str,
-    pub required_concepts: Vec<&'static str>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AgentsResponse {
-    pub service_lines: Vec<ServiceLineInfo>,
-    /// Map of source_id → list of usable service line slugs for that source.
-    pub source_usable_lines: HashMap<String, Vec<String>>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct BindingResponse {
     pub source_id: String,
@@ -59,6 +34,10 @@ pub struct BindingResponse {
     pub degraded: bool,
     pub coverage: BindingCoverage,
     pub usable_lines: Vec<String>,
+    /// Tables in the schema catalog that fall in **no** service line's scope
+    /// (data-map §6, plan 05 §3). The invariant is `orphans: []`; a non-empty
+    /// list is an admin-visible gap in the ontology, not an error.
+    pub orphans: Vec<String>,
     pub tables: Vec<TableSummary>,
 }
 
@@ -73,9 +52,9 @@ pub struct TableSummary {
 }
 
 impl BindingResponse {
-    fn from_binding(b: &SchemaBinding) -> Self {
-        let coverage = b.coverage();
-        let usable = b.usable_lines().iter().map(|l| l.slug().to_string()).collect();
+    fn from_binding(b: &SchemaBinding, min_confidence: f32) -> Self {
+        let coverage = b.coverage(min_confidence);
+        let usable = b.usable_lines(min_confidence).iter().map(|l| l.slug().to_string()).collect();
         let tables = b
             .tables
             .iter()
@@ -88,62 +67,31 @@ impl BindingResponse {
                 patient_path_hops: t.patient_path.as_ref().map(|p| p.len()),
             })
             .collect();
+        // A table is an orphan when no service line's scope contains it. Scope is
+        // the union over all 13 lines, so this is the live form of the "no
+        // orphans" test that runs against the fixture.
+        let mut orphans: Vec<String> = b
+            .tables
+            .iter()
+            .filter(|t| {
+                !ServiceLine::ALL
+                    .iter()
+                    .any(|line| b.tables_for_line(*line).iter().any(|s| s.table_name == t.table_name))
+            })
+            .map(|t| t.table_name.clone())
+            .collect();
+        orphans.sort();
+
         BindingResponse {
             source_id: b.source_id.clone(),
             bound_at: b.bound_at.to_rfc3339(),
             degraded: b.degraded,
             coverage,
             usable_lines: usable,
+            orphans,
             tables,
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// GET /agents
-// ---------------------------------------------------------------------------
-
-/// List all service lines and, for each connected source, which lines are usable.
-#[get("/agents")]
-pub async fn list_agents(
-    state: &State<AppState>,
-    _user: AuthUser,
-) -> AppResult<Json<AgentsResponse>> {
-    let service_lines: Vec<ServiceLineInfo> = ServiceLine::ALL
-        .iter()
-        .map(|&line| ServiceLineInfo {
-            slug: line.slug(),
-            label: line.label(),
-            blurb: line.blurb(),
-            tier: line.tier(),
-            concepts: line.concepts().iter().map(|c| c.slug()).collect(),
-            examples: line
-                .examples()
-                .iter()
-                .map(|(q, concepts)| ExampleInfo {
-                    question: q,
-                    required_concepts: concepts.iter().map(|c| c.slug()).collect(),
-                })
-                .collect(),
-        })
-        .collect();
-
-    // Collect usable lines from all cached bindings
-    let bindings = state.bindings();
-    let mut source_usable_lines: HashMap<String, Vec<String>> = HashMap::new();
-    for (source_id, binding) in &bindings {
-        let usable: Vec<String> = binding
-            .usable_lines()
-            .iter()
-            .map(|l| l.slug().to_string())
-            .collect();
-        source_usable_lines.insert(source_id.clone(), usable);
-    }
-
-    Ok(Json(AgentsResponse {
-        service_lines,
-        source_usable_lines,
-    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -157,14 +105,15 @@ pub async fn get_binding(
     source_id: &str,
 ) -> AppResult<Json<BindingResponse>> {
     // Check in-memory cache first
+    let min_conf = state.config.binding_min_confidence;
     if let Some(binding) = state.binding_for(source_id) {
-        return Ok(Json(BindingResponse::from_binding(&binding)));
+        return Ok(Json(BindingResponse::from_binding(&binding, min_conf)));
     }
     // Fall back to DB
     let binding = store::load_binding(&state.db, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(BindingResponse::from_binding(&binding)))
+    Ok(Json(BindingResponse::from_binding(&binding, min_conf)))
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +153,7 @@ pub async fn rebuild_binding(
     )
     .await?;
 
-    let coverage = binding.coverage();
+    let coverage = binding.coverage(state.config.binding_min_confidence);
     store::save_binding_nonfatal(&state.db, &binding).await;
     state.set_binding(source_id.to_string(), Arc::new(binding));
 
@@ -229,6 +178,7 @@ pub async fn get_binding_history(
     source_id: &str,
 ) -> AppResult<Json<Vec<BindingResponse>>> {
     user.require_admin()?;
+    let min_conf = state.config.binding_min_confidence;
     let history = store::load_binding_history(&state.db, source_id).await?;
-    Ok(Json(history.iter().map(BindingResponse::from_binding).collect()))
+    Ok(Json(history.iter().map(|b| BindingResponse::from_binding(b, min_conf)).collect()))
 }

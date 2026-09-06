@@ -1279,7 +1279,7 @@ impl FoundryManager {
         .await
     }
 
-    /// Extract clinical entities from one record's text (`AgentKind::Extract`).
+    /// Extract clinical entities from one record's text (`ModelRole::Extract`).
     ///
     /// The caller is `ingest::extract`, which stamps the code systems and discards an
     /// empty result. Errors are expected and handled there - a row that cannot be
@@ -1302,7 +1302,7 @@ impl FoundryManager {
         .await
     }
 
-    /// Check an answer's claims against its retrieved passages (`AgentKind::Verify`).
+    /// Check an answer's claims against its retrieved passages (`ModelRole::Verify`).
     ///
     /// The caller is `verify::check`, which folds the per-claim verdicts into an
     /// overall status and falls open to `skipped` on any error.

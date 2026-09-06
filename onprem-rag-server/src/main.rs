@@ -154,7 +154,7 @@ async fn rocket() -> _ {
         let foundry = app_state.foundry_handle();
         // Warm the shared Core LLM (all generative roles resolve to it) so the first
         // request doesn't pay the load + EP graph-setup cost.
-        let core_spec = app_state.spec_for(crate::foundry::router::AgentKind::Chat);
+        let core_spec = app_state.spec_for(crate::foundry::router::ModelRole::Grounded);
         tokio::spawn(async move {
             let local_models = async {
                 let embed_ok = crate::embed::embed_query(&wc, "warmup")
@@ -335,7 +335,7 @@ async fn rocket() -> _ {
         .mount(
             "/",
             rocket::routes![
-                ontology::routes::list_agents,
+                agents::registry::list_agents,
                 ontology::routes::get_binding,
                 ontology::routes::rebuild_binding,
                 ontology::routes::get_binding_history,

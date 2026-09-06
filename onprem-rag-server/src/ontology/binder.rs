@@ -587,6 +587,19 @@ fn compute_patient_paths(
 /// `created_at`, `updated_at`, `modified_at`, `created_on`, `updated_on`).
 /// Fall back to any EventTime column.  `StartTime`/`EndTime` are acceptable
 /// when no EventTime is found.
+///
+/// NOTE (defect-closure sweep, see nl2sql/ir/bind.rs): this function still
+/// picks the first declared column when more than one domain EventTime
+/// candidate exists (e.g. `incident_reports.occurred_at` vs `.reported_at`),
+/// which is the same "position, not meaning" defect class fixed on the LIVE
+/// column-selection path in `nl2sql::ir::bind::column_with_role_hint_in_table`.
+/// It was deliberately NOT changed here: `event_time_col` is informational
+/// only (exposed via the `/ontology` schema route; the query pipeline
+/// resolves its own EventTime column independently in `nl2sql::ir::bind` and
+/// never reads this field), and `ontology::tests::exactly_one_event_time_per_bound_table`
+/// asserts every table with EventTime columns gets a non-`None` value here —
+/// an assertion this task has no mandate to relax. Left as a flagged,
+/// unfixed site rather than silently worked around; see the sweep report.
 fn select_event_time(columns: &[ColumnBinding]) -> Option<String> {
     let generic_names = [
         "created_at", "updated_at", "modified_at", "created_on",
@@ -1166,6 +1179,135 @@ pub mod tests {
             card_vector: None,
             card_text: table_name.to_string(),
         }
+    }
+
+    /// Verifies the fix to PersonFullName's bare "name" token.
+    ///
+    /// (a) Genuine person-name columns from the real schemas must still
+    ///     classify as a PII person-name role with is_pii == true.
+    /// (b) Non-person "*_name" columns from the real schemas (dev and alt)
+    ///     must NOT be PersonFullName, must NOT be is_pii, and must reach
+    ///     ColumnRole::Description — previously they were all PersonFullName
+    ///     because the bare "name" substring token matched every column whose
+    ///     name contained the substring "name".
+    #[test]
+    fn name_token_pii_classification() {
+        // (a) Genuine person-name columns
+        let person_card = make_card(
+            "people_test",
+            100,
+            vec![
+                // PersonFullName: only the qualified tokens remain
+                ("full_name",   "varchar", false, false),
+                // PersonGivenName: first_name, middle_name
+                ("first_name",  "varchar", false, false),
+                ("middle_name", "varchar", false, false),
+                // PersonFamilyName: last_name
+                ("last_name",   "varchar", false, false),
+            ],
+            vec![],
+        );
+        // (b) Non-person "*_name" columns from dev schema:
+        //   generic_name (medication_catalog), brand_name (medication_catalog),
+        //   panel_name (lab_test_catalog / lab_orders), test_name (lab_results),
+        //   condition_name (patient_medical_history / patient_family_history),
+        //   procedure_name (procedures), short_name (insurance_providers),
+        //   file_name (patient_documents), disease_name (mortality_records),
+        //   clinic_name (provider_schedules).
+        // Also bare "name" columns from: counties, departments, wards,
+        //   allergen_catalog, vaccine_catalog, insurance_providers,
+        //   care_programs, equipment.
+        // Alt schema: generic_name, brand_name (DrugMaster), name (TestCatalog /
+        //   ClinDept).
+        let non_person_card = make_card(
+            "non_person_test",
+            100,
+            vec![
+                ("generic_name",   "varchar", false, false),
+                ("brand_name",     "varchar", false, false),
+                ("panel_name",     "varchar", false, false),
+                ("test_name",      "varchar", false, false),
+                ("condition_name", "varchar", false, false),
+                ("procedure_name", "varchar", false, false),
+                ("short_name",     "varchar", false, false),
+                ("file_name",      "varchar", false, false),
+                ("disease_name",   "varchar", false, false),
+                ("clinic_name",    "varchar", false, false),
+            ],
+            vec![],
+        );
+        // Bare "name" columns (departments, wards, insurance_providers, etc.)
+        let bare_name_card = make_card(
+            "departments_test",
+            100,
+            vec![("name", "varchar", false, false)],
+            vec![],
+        );
+
+        let bindings = bind_cards(
+            &[person_card, non_person_card, bare_name_card],
+            0.05, 3, None, None, &HashMap::new(),
+        );
+
+        let person_tb = bindings.iter().find(|t| t.table_name == "people_test").unwrap();
+
+        // (a) Person-name columns — all must be PII
+        {
+            let cb = person_tb.columns.iter().find(|c| c.column_name == "full_name").unwrap();
+            assert_eq!(cb.role, ColumnRole::PersonFullName, "full_name must be PersonFullName");
+            assert!(cb.is_pii, "full_name must be is_pii");
+        }
+        {
+            let cb = person_tb.columns.iter().find(|c| c.column_name == "first_name").unwrap();
+            assert_eq!(cb.role, ColumnRole::PersonGivenName, "first_name must be PersonGivenName");
+            assert!(cb.is_pii, "first_name must be is_pii");
+        }
+        {
+            let cb = person_tb.columns.iter().find(|c| c.column_name == "middle_name").unwrap();
+            assert_eq!(cb.role, ColumnRole::PersonGivenName, "middle_name must be PersonGivenName");
+            assert!(cb.is_pii, "middle_name must be is_pii");
+        }
+        {
+            let cb = person_tb.columns.iter().find(|c| c.column_name == "last_name").unwrap();
+            assert_eq!(cb.role, ColumnRole::PersonFamilyName, "last_name must be PersonFamilyName");
+            assert!(cb.is_pii, "last_name must be is_pii");
+        }
+
+        // (b) Non-person "*_name" columns — NOT PersonFullName, role.is_pii()==false,
+        //     and reach Description.
+        //
+        // Note: ColumnBinding.is_pii is the OR of the role-level is_pii() AND the
+        // connectors::routes::is_likely_pii() keyword heuristic (which also carries a
+        // bare "name" substring keyword for conservative intake PII tagging).  The
+        // relevant invariant for this fix is the ROLE-level classification: none of
+        // these columns should be assigned PersonFullName (whose is_pii() == true),
+        // and each should reach Description (whose is_pii() == false).  The binding-
+        // level is_pii field is not checked here because it is controlled by a
+        // separate, intentionally-conservative system outside src/ontology.
+        let non_person_tb = bindings.iter().find(|t| t.table_name == "non_person_test").unwrap();
+        for col_name in [
+            "generic_name", "brand_name", "panel_name", "test_name",
+            "condition_name", "procedure_name", "short_name", "file_name",
+            "disease_name", "clinic_name",
+        ] {
+            let cb = non_person_tb.columns.iter().find(|c| c.column_name == col_name).unwrap();
+            assert_ne!(cb.role, ColumnRole::PersonFullName,
+                "{col_name} must NOT be PersonFullName");
+            assert!(!cb.role.is_pii(),
+                "{col_name} role.is_pii() must be false (role={:?})", cb.role);
+            assert_eq!(cb.role, ColumnRole::Description,
+                "{col_name} must reach Description");
+        }
+
+        // Bare "name" column (departments, wards, allergen_catalog, etc.)
+        let bare_tb = bindings.iter().find(|t| t.table_name == "departments_test").unwrap();
+        let bare_col = bare_tb.columns.iter().find(|c| c.column_name == "name").unwrap();
+        assert_ne!(bare_col.role, ColumnRole::PersonFullName,
+            "bare 'name' column must NOT be PersonFullName");
+        assert!(!bare_col.role.is_pii(),
+            "bare 'name' role.is_pii() must be false");
+        assert_eq!(bare_col.role, ColumnRole::Description,
+            "bare 'name' column must reach Description");
     }
 
     #[test]

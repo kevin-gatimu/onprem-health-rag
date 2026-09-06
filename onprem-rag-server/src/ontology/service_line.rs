@@ -175,7 +175,7 @@ impl ServiceLine {
                 AntenatalVisit, Delivery, Newborn, Admission, ProgramEnrollment,
             ],
             ServiceLine::Theatre => &[
-                Surgery, Procedure, ProcedureCode, Consent, Equipment, Admission,
+                Surgery, Procedure, ProcedureCode, Consent, Equipment,
             ],
             ServiceLine::Pharmacy => &[
                 Prescription, PrescriptionItem, Medication, MedicationAdministration,
@@ -385,7 +385,7 @@ impl ServiceLine {
             ProviderSchedule => &[ServiceLine::FrontDesk, ServiceLine::Workforce],
             ProviderTimeOff  => &[ServiceLine::FrontDesk, ServiceLine::Workforce],
             // Ward Board
-            Admission        => &[ServiceLine::WardBoard, ServiceLine::Emergency, ServiceLine::Maternity, ServiceLine::Theatre],
+            Admission        => &[ServiceLine::WardBoard, ServiceLine::Emergency, ServiceLine::Maternity],
             BedAssignment    => &[ServiceLine::WardBoard],
             Bed              => &[ServiceLine::WardBoard, ServiceLine::Facilities],
             Ward             => &[ServiceLine::WardBoard, ServiceLine::Facilities],

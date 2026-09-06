@@ -138,6 +138,36 @@ impl Catalog {
         }
     }
 
+    /// Narrow the catalog to a service line's read allow-list (plan 05 §3, hook 2).
+    ///
+    /// The returned catalog is used for **both** the planner prompt and
+    /// validation, so a model that hallucinates an out-of-scope collection is
+    /// rejected by the same `validate` guard that already rejects unknown ones —
+    /// no second allow-list, no second decision point.
+    ///
+    /// An empty `scope` means "no narrowing" (the Ask agent) and returns a full
+    /// clone. A scope that matches nothing returns an empty catalog, which fails
+    /// closed: every collection name the planner could emit is rejected.
+    ///
+    /// This is a *read* allow-list. It says what an agent may look at; it says
+    /// nothing about what a user is permitted to do (see `src/auth/`).
+    pub fn scoped(&self, scope: &[String]) -> Catalog {
+        let collections = if scope.is_empty() {
+            self.collections.clone()
+        } else {
+            self.collections
+                .iter()
+                .filter(|(name, _)| scope.iter().any(|t| t == *name))
+                .map(|(name, meta)| (name.clone(), meta.clone()))
+                .collect()
+        };
+        Catalog {
+            collections,
+            code_vocab: self.code_vocab.clone(),
+            synonyms: self.synonyms.clone(),
+        }
+    }
+
     /// Return `true` if `collection` is allow-listed.
     pub fn has_collection(&self, collection: &str) -> bool {
         self.collections.contains_key(collection)

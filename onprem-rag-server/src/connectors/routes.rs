@@ -583,8 +583,24 @@ pub struct SchemaAnalysis {
 
 /// Column-name substrings that indicate PII in health records. Matched
 /// case-insensitively against each column name.
+///
+/// NOTE: the bare `"name"` token was deliberately removed (see the parallel fix
+/// to `ColumnRole::PersonFullName` in `ontology/roles.rs`). A bare "name"
+/// substring matches dozens of non-person columns (generic_name, brand_name,
+/// condition_name, panel_name, care_programs.name, equipment.name, …) and was
+/// suppressing their `enum_values` — starving Stage B value-domain evidence in
+/// the disambiguation cascade. Genuine person-name columns are covered by the
+/// explicit tokens below: `"first_name"`, `"last_name"`, `"middle_name"`,
+/// `"full_name"`, and `"fullname"` (matching the token set in `ROLE_TOKENS`
+/// for the three person-name roles, so there is ONE coherent definition rather
+/// than two independently-tuned ones). `"guarantor"`, `"next_of_kin"`, and
+/// `"contact"` already catch compound patterns like `guarantor_name` and
+/// `contact_name`, so no bare "name" fallback is needed for those either.
 const PII_KEYWORDS: &[&str] = &[
-    "name",
+    // Person-name: explicit qualifiers only — no bare "name" (see note above)
+    "full_name",
+    "fullname",
+    "middle_name",
     "first_name",
     "last_name",
     "dob",
@@ -705,7 +721,7 @@ pub async fn analyze_schema(
 
         if let Ok(raw) = foundry
             .complete_with(
-                &state.spec_for(crate::foundry::router::AgentKind::Extract),
+                &state.spec_for(crate::foundry::router::ModelRole::Extract),
                 system,
                 &user,
             )
@@ -769,4 +785,72 @@ pub async fn analyze_schema(
         pii_columns,
         data_quality_notes,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::is_likely_pii;
+
+    /// Verifies that the PII_KEYWORDS list covers every genuine person-name
+    /// column pattern from both schemas (dev and alt) and does NOT flag
+    /// non-person `*_name` columns that were wrongly marked as PII by the old
+    /// bare `"name"` token.
+    ///
+    /// (a) All person-name columns must be flagged PII.
+    /// (b) Non-person `*_name` columns (drug, lab, entity names) must NOT be
+    ///     flagged PII — previously they were, which suppressed their
+    ///     `enum_values` and starved Stage B value-domain evidence in the
+    ///     disambiguation cascade.
+    #[test]
+    fn pii_name_columns_both_directions() {
+        // (a) Genuine person-name columns — dev schema (patients + providers)
+        for col in [
+            "first_name",   // patients.first_name, providers.first_name
+            "last_name",    // patients.last_name,  providers.last_name
+            "middle_name",  // patients.middle_name
+            "full_name",    // forward-compat / real-schema full_name
+            "fullname",     // alternate spelling
+        ] {
+            assert!(
+                is_likely_pii(col),
+                "person-name column '{col}' must be is_likely_pii (person PII)"
+            );
+        }
+        // Also via compound columns where the OTHER keyword already fires
+        assert!(is_likely_pii("patient_first_name"),  "patient_first_name must be PII");
+        assert!(is_likely_pii("guarantor_name"),      "guarantor_name → 'guarantor' fires");
+        assert!(is_likely_pii("next_of_kin_name"),    "next_of_kin_name → 'next_of_kin' fires");
+
+        // (b) Non-person *_name columns from the real dev + alt schemas
+        for col in [
+            // dev — medication_catalog
+            "generic_name",
+            "brand_name",
+            // dev — lab
+            "panel_name",
+            "test_name",
+            // dev — clinical
+            "condition_name",
+            "procedure_name",
+            // dev — entity / administrative
+            "clinic_name",
+            "disease_name",
+            "short_name",
+            "file_name",
+            // dev — bare entity names (departments, wards, allergen_catalog,
+            //        vaccine_catalog, insurance_providers, care_programs, equipment)
+            "name",
+            // alt — DrugMaster
+            // generic_name / brand_name already above
+        ] {
+            assert!(
+                !is_likely_pii(col),
+                "non-person column '{col}' must NOT be is_likely_pii"
+            );
+        }
+    }
 }

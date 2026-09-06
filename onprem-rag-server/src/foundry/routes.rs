@@ -7,7 +7,7 @@ use rocket::serde::json::Json;
 use rocket::{State, get, post, put};
 use serde::{Deserialize, Serialize};
 
-use super::router::{AgentKind, Device};
+use super::router::{Device, ModelRole as SpecRole};
 use super::{EpRegistration, ExecutionProvider, HardwareInfo, ModelSummary, VariantInfo};
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
@@ -244,12 +244,12 @@ pub async fn model_roles(
     // `variants` is filled in a second pass below, once the union lookup is done.
     // Stashes each role's `device_pref` (keyed by role id) so the second pass can
     // order variants by the role's actual device preference without re-deriving
-    // `AgentKind` from the role string.
+    // the model role from the role string.
     let mut device_prefs: std::collections::HashMap<String, Vec<Device>> =
         std::collections::HashMap::new();
     let mut foundry_role =
-        |role: &str, label: &str, kind: AgentKind, usage: &str, status: &str| -> ModelRole {
-            let spec = state.spec_for(kind);
+        |role: &str, label: &str, spec_role: SpecRole, usage: &str, status: &str| -> ModelRole {
+            let spec = state.spec_for(spec_role);
             device_prefs.insert(role.to_string(), spec.device_pref.clone());
             ModelRole {
                 role: role.to_string(),
@@ -271,49 +271,49 @@ pub async fn model_roles(
         foundry_role(
             "chat",
             "Chat",
-            AgentKind::Chat,
+            SpecRole::Grounded,
             "Grounded conversational Q&A over your records (semantic RAG).",
             "active",
         ),
         foundry_role(
             "health_query",
             "Health Query",
-            AgentKind::HealthQuery,
+            SpecRole::PlanSpec,
             "Plans and narrates exact aggregations (counts, group-by) — the structured analytics path.",
             "active",
         ),
         foundry_role(
             "trends",
             "Trends",
-            AgentKind::Trends,
+            SpecRole::Narrate,
             "Time-bucketed trend aggregations with temporal interpretation.",
             "active",
         ),
         foundry_role(
             "summarize",
             "Summarize",
-            AgentKind::Summarize,
+            SpecRole::Narrate,
             "Long-context faithful summaries of a patient history or cohort.",
             "active",
         ),
         foundry_role(
             "lookup",
             "Patient Lookup",
-            AgentKind::PatientLookup,
+            SpecRole::Grounded,
             "Fast literal record lookup; refuses when the record is absent.",
             "active",
         ),
         foundry_role(
             "fast",
             "Query rewrite & expansion",
-            AgentKind::QueryRewrite,
+            SpecRole::Rewrite,
             "Internal only: history-aware query rewrite, multi-query expansion, intent classify. Never user-facing.",
             "active",
         ),
         foundry_role(
             "classify",
             "Intent classify",
-            AgentKind::Classify,
+            SpecRole::Classify,
             "Intent router Tier 2: a forced tool call that routes an ambiguous question to \
              conversational, structured, semantic, or hybrid when the cheap lexical pass can't \
              decide. Cached per question; shares the configured GPU model.",
@@ -322,14 +322,14 @@ pub async fn model_roles(
         foundry_role(
             "extractor",
             "Ingestion extractor",
-            AgentKind::Extract,
+            SpecRole::Extract,
             "Pulls structured fields from free-text notes at ingest and maps them to ICD-10 / RxNorm / LOINC, stored on each record as `extracted`. Off unless ONPREM_EXTRACT_ENABLED=true — it adds a model call per eligible row.",
             "active",
         ),
         foundry_role(
             "verifier",
             "Faithfulness verifier",
-            AgentKind::Verify,
+            SpecRole::Verify,
             "Safety pass: checks every clinical claim in an answer is supported by the              retrieved passages, and reports the unsupported ones. Runs after the answer              has streamed, so it delays only the verdict. Off unless              ONPREM_VERIFY_ENABLED=true.",
             "active",
         ),
@@ -506,7 +506,7 @@ const SHARED_LLM_ROLES: &[&str] = &[
 /// picks it up immediately (no restart required). Admin only.
 ///
 /// The `"chat"` role also drives the legacy `/chat` + `/generate` current model, since
-/// those bypass the `AgentKind` router and read `FoundryManager::current_model()` directly.
+/// those bypass the model-role router and read `FoundryManager::current_model()` directly.
 #[put("/settings/router", data = "<body>")]
 pub async fn set_router(
     state: &State<AppState>,

@@ -66,6 +66,10 @@ pub struct MessageOut {
     /// Routed kind for agent assistant messages; `None` for user messages and plain chat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// Agent mode (`ask` | `trends` | `handover`) the answer was produced in.
+    /// `None` on messages written before plan 05.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Structured aggregation result for structured-path agent assistant messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredResult>,
@@ -127,10 +131,27 @@ pub async fn list_agent_conversations(
     user: AuthUser,
     kind: &str,
 ) -> AppResult<Json<Vec<ConversationOut>>> {
+    // Accept both the new slugs and the legacy mechanism names for one release:
+    // a conversation stored as `health_query` must still list under `ask`.
+    // Matching is by name through the same table the endpoint uses, never by
+    // position in a list of candidates.
+    let mut kinds: Vec<String> = vec![kind.to_string()];
+    if let Some((parsed, _)) = crate::agents::kind::AgentKind::parse(kind) {
+        let slug = parsed.slug().to_string();
+        if !kinds.contains(&slug) {
+            kinds.push(slug);
+        }
+        for (legacy, legacy_kind, _) in crate::agents::kind::LEGACY_KINDS {
+            if *legacy_kind == parsed && !kinds.iter().any(|k| k == legacy) {
+                kinds.push((*legacy).to_string());
+            }
+        }
+    }
+
     let docs: Vec<Document> = state
         .db
         .chat_conversations()
-        .find(doc! { "user_id": &user.id, "agent_kind": kind })
+        .find(doc! { "user_id": &user.id, "agent_kind": { "$in": kinds } })
         .sort(doc! { "updated_at": -1, "_id": -1 })
         .await?
         .try_collect()
@@ -425,6 +446,40 @@ pub(crate) async fn persist_user_message(
     Ok(())
 }
 
+/// Prefix the conversation title with the department that answered
+/// (plan 05 section 7): "Maternity · Deliveries last month".
+///
+/// Only applied to the **first** assistant message of a conversation, and only
+/// when the title does not already carry a prefix -- a later turn routed to a
+/// different department must not rename the thread. Failure is non-fatal: a
+/// title is cosmetic and must never cost an answer.
+pub(crate) async fn prefix_title_with_line(
+    db: &DocumentDb,
+    conversation_id: &str,
+    line_label: &str,
+) -> AppResult<()> {
+    let oid = parse_oid(conversation_id)?;
+    let assistant_messages = db
+        .chat_messages()
+        .count_documents(doc! { "conversation_id": conversation_id, "role": "assistant" })
+        .await?;
+    if assistant_messages != 1 {
+        return Ok(());
+    }
+    let Some(conv) = db.chat_conversations().find_one(doc! { "_id": oid }).await? else {
+        return Ok(());
+    };
+    let title = conv.get_str("title").unwrap_or("");
+    if title.is_empty() || title.contains(TITLE_SEPARATOR) {
+        return Ok(());
+    }
+    let prefixed = truncate_title(&format!("{line_label}{TITLE_SEPARATOR}{title}"));
+    db.chat_conversations()
+        .update_one(doc! { "_id": oid }, doc! { "$set": { "title": prefixed } })
+        .await?;
+    Ok(())
+}
+
 /// Whether the conversation's most recent message has this exact role and content.
 /// Used to recognise a retry of a turn that never got an answer.
 async fn newest_message_is(
@@ -526,6 +581,7 @@ pub(crate) async fn persist_agent_assistant_message(
     user_id: &str,
     content: &str,
     agent_kind: &str,
+    mode: &str,
     citations: &[crate::retrieval::Passage],
     structured_json: Option<&str>,
 ) -> AppResult<()> {
@@ -539,6 +595,7 @@ pub(crate) async fn persist_agent_assistant_message(
         "role": "assistant",
         "content": content,
         "agent_kind": agent_kind,
+        "mode": mode,
         "created_at": now,
     };
 
@@ -571,6 +628,9 @@ pub(crate) fn parse_oid(id: &str) -> AppResult<ObjectId> {
     ObjectId::parse_str(id)
         .map_err(|_| AppError::BadRequest(format!("invalid conversation id: {id}")))
 }
+
+/// Separator between the answering department and the question in a title.
+const TITLE_SEPARATOR: &str = " · ";
 
 /// Truncate `s` at 60 chars (on char boundary), appending `…` if longer.
 fn truncate_title(s: &str) -> String {
@@ -640,6 +700,7 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
         .and_then(|s| serde_json::from_str::<crate::verify::VerifyReport>(s).ok());
 
     let agent_kind = d.get_str("agent_kind").ok().map(str::to_string);
+    let mode = d.get_str("mode").ok().map(str::to_string);
 
     MessageOut {
         id: d
@@ -651,6 +712,7 @@ fn msg_doc_to_out(d: &Document) -> MessageOut {
         citations,
         verify,
         agent_kind,
+        mode,
         structured,
         sql_result,
         created_at: read_dt_field(d, "created_at"),

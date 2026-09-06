@@ -1,4 +1,4 @@
-//! Ingestion clinical extractor — `AgentKind::Extract` (plan 25).
+//! Ingestion clinical extractor — `ModelRole::Extract` (plan 25).
 //!
 //! Reads a row's free-text projection and returns the clinical entities it names,
 //! each mapped to a standard vocabulary: conditions to ICD-10, medications to RxNorm,

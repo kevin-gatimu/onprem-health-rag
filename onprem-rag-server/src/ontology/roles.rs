@@ -50,8 +50,11 @@ pub enum ColumnRole {
     Measure,
     /// Duration in minutes/days/hours
     Duration,
-    /// Boolean flag
+    /// Boolean flag (generic is_*/has_*)
     Flag,
+    /// Boolean flag for clinical criticality — distinct from Flag/abnormality.
+    /// Binds to `is_critical`, `critical_flag`; never falls back to `is_abnormal`.
+    Criticality,
     /// Coded value (ICD-10, procedure code, ATC)
     Code,
     Description,
@@ -95,6 +98,7 @@ impl ColumnRole {
         ColumnRole::Measure,
         ColumnRole::Duration,
         ColumnRole::Flag,
+        ColumnRole::Criticality,
         ColumnRole::Code,
         ColumnRole::Description,
         ColumnRole::FreeText,
@@ -134,6 +138,7 @@ impl ColumnRole {
             ColumnRole::Measure => "measure",
             ColumnRole::Duration => "duration",
             ColumnRole::Flag => "flag",
+            ColumnRole::Criticality => "criticality",
             ColumnRole::Code => "code",
             ColumnRole::Description => "description",
             ColumnRole::FreeText => "free_text",
@@ -266,7 +271,15 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
         "subtotal", "discount", "cover", "balance", "charge", "rate", "tariff",
         "premium", "copay", "deductible", "reimburs",
     ], type_class: Some(TypeClass::Numeric) },
-    RoleTokens { role: ColumnRole::Duration, tokens: &["minutes", "hours", "days", "duration", "los", "length_of_stay", "wait_time", "turnaround"], type_class: Some(TypeClass::Numeric) },
+    // NOTE: do not add a bare "los" token here. It was removed because it is a
+    // substring of "blood_loss_ml" ("...b_l_o_s_s..." contains "los"), which
+    // silently misclassified a surgery/delivery blood-loss measurement as a
+    // length-of-stay Duration column — a second, spurious Duration candidate
+    // that made `AVG(surgery duration)` genuinely ambiguous once "pick the
+    // first declared column" was retired (see the defect-closure sweep in
+    // nl2sql/ir/bind.rs). "length_of_stay" (the intended, unambiguous spelling)
+    // already matches `length_of_stay_days` without the risky abbreviation.
+    RoleTokens { role: ColumnRole::Duration, tokens: &["minutes", "hours", "days", "duration", "length_of_stay", "wait_time", "turnaround"], type_class: Some(TypeClass::Numeric) },
     // Quantity role — stock / dispensed units (must precede Measure so "quantity_on_hand", "qty_*"
     // aren't swallowed by the generic "quantity" token inside Measure).
     RoleTokens { role: ColumnRole::Quantity, tokens: &[
@@ -307,13 +320,28 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
         "icd", "atc_code", "procedure_code", "drug_code", "code", "_no", "_number",
     ], type_class: None },
     // Name columns (PII)
-    RoleTokens { role: ColumnRole::PersonFullName, tokens: &["full_name", "fullname", "name"], type_class: Some(TypeClass::Text) },
-    RoleTokens { role: ColumnRole::PersonGivenName, tokens: &["first_name", "given_name", "forename", "firstname"], type_class: Some(TypeClass::Text) },
+    // NOTE: PersonFullName intentionally does NOT claim the bare "name" token.
+    // "name" as a substring matches dozens of non-person columns (generic_name,
+    // brand_name, condition_name, department name, ward name, test_name, etc.).
+    // Using the bare token here would silently mark all of them as PII and
+    // suppress their enum_values — exactly the defect class that removed "los"
+    // from Duration (see the "los"/"blood_loss_ml" note below).  The explicit
+    // person-qualifier tokens (full_name, fullname, middle_name) cover every
+    // genuine full-name column in the schemas; the bare "name" fallback lives on
+    // Description so that non-person name columns reach a sensible role.
+    RoleTokens { role: ColumnRole::PersonFullName, tokens: &["full_name", "fullname"], type_class: Some(TypeClass::Text) },
+    RoleTokens { role: ColumnRole::PersonGivenName, tokens: &["first_name", "middle_name", "given_name", "forename", "firstname"], type_class: Some(TypeClass::Text) },
     RoleTokens { role: ColumnRole::PersonFamilyName, tokens: &["last_name", "surname", "family_name", "lastname"], type_class: Some(TypeClass::Text) },
     // Contact / Identifier (PII)
     RoleTokens { role: ColumnRole::Contact, tokens: &["phone", "email", "mobile", "tel", "contact", "fax"], type_class: None },
     RoleTokens { role: ColumnRole::Identifier, tokens: &["national_id", "passport", "id_number", "id_no", "nin", "ssn"], type_class: None },
-    // Flags
+    // Criticality — checked BEFORE generic Flag so is_critical/critical_flag match
+    // here, not via the broader "is_" prefix that Flag uses.  Do not add tokens
+    // that overlap with the abnormality/Flag column names.
+    RoleTokens { role: ColumnRole::Criticality, tokens: &[
+        "is_critical", "critical_flag",
+    ], type_class: Some(TypeClass::Bool) },
+    // Generic boolean flags
     RoleTokens { role: ColumnRole::Flag, tokens: &[
         "is_", "has_", "active", "enabled", "approved", "current", "notifiable",
         "controlled", "formulary", "surgical", "abnormal", "resuscitation",
@@ -325,6 +353,129 @@ pub static ROLE_TOKENS: &[RoleTokens] = &[
     RoleTokens { role: ColumnRole::Location, tokens: &["room", "location", "floor", "store", "region", "area", "zone", "district", "ward_name", "clinic_name", "theatre_no"], type_class: Some(TypeClass::Text) },
 ];
 
+/// Generic row-bookkeeping timestamp names — audit metadata ("when this row was
+/// last touched"), not a domain fact about the entity.  When a table has both a
+/// purpose-named `EventTime` column (e.g. `encounter_date`) and one of these,
+/// the purpose-named one is preferred; a name on this list is only used when
+/// it is the *sole* `EventTime`-role column on the table.
+///
+/// Shared by `ontology::binder::select_event_time` (informational
+/// `TableBinding.event_time_col`) and `nl2sql::ir::bind`'s column-selection
+/// (the column actually used to build SQL), so both sites make the same
+/// preference decision instead of drifting apart.
+pub const GENERIC_TIMESTAMP_NAMES: &[&str] = &[
+    "created_at", "updated_at", "modified_at", "created_on",
+    "updated_on", "deleted_at", "created_date", "modified_date",
+];
+
+/// Whether `name` is a generic bookkeeping timestamp (see
+/// [`GENERIC_TIMESTAMP_NAMES`]), case-insensitively.
+pub fn is_generic_timestamp_name(name: &str) -> bool {
+    GENERIC_TIMESTAMP_NAMES.iter().any(|g| name.eq_ignore_ascii_case(g))
+}
+
+// ---------------------------------------------------------------------------
+// Column-name ↔ question-word normalisation
+// ---------------------------------------------------------------------------
+//
+// Shared by `nl2sql::ir::bind`'s role disambiguation (plans/new/03b-defect-closure-brief.md
+// follow-up: "where the question itself disambiguates, select on that evidence").
+// A single normalisation lives here so a column name and a question word are
+// reduced to the SAME token space by the SAME rules, whether the comparison is
+// "does the question name this column" (bind.rs stage A) or "does this FK
+// edge's own column name match a word in the question" (bind.rs's FK-edge
+// disambiguation) — one mechanism, reused, not two independently-tuned ones.
+
+/// Trailing suffixes that mark a column as temporal bookkeeping rather than
+/// carrying domain meaning on their own — stripped before splitting so
+/// `"issue_date"` contributes the token `"issue"`, not `"issue"` plus a
+/// meaningless `"date"`.
+const TEMPORAL_NAME_SUFFIXES: &[&str] = &["_at", "_on", "_date", "_time"];
+
+/// If `s` ends in a doubled consonant (e.g. the `"rr"` in `"referr"`, left
+/// over after stripping `-ed`/`-ing` from `"referred"`/`"referring"`), also
+/// push the singled-consonant form (`"refer"`). English doubles a final
+/// consonant before a vowel suffix precisely when the base word is meant to
+/// stay the same (`refer` → `referred`, `occur` → `occurred`, `cancel` →
+/// `cancelled`) — this recovers that base form generically, for any word
+/// with the pattern, rather than listing specific verbs.
+fn push_undoubled(s: &str, out: &mut Vec<String>) {
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return;
+    }
+    let last = bytes[bytes.len() - 1];
+    let prev = bytes[bytes.len() - 2];
+    if last == prev && !matches!(last, b'a' | b'e' | b'i' | b'o' | b'u') {
+        out.push(s[..s.len() - 1].to_string());
+    }
+}
+
+/// Cheap, purely suffix-based stemming for the handful of English
+/// inflections that show up in both column names and hospital-question
+/// phrasing: `-ing`, `-ed` (with and without a dropped trailing `e` or a
+/// doubled final consonant — see [`push_undoubled`]), and plural `-s`. This
+/// is NOT a linguistic stemmer — it exists only so that `"booked"`
+/// (question) and `"booked_at"` (column), `"issued"` (question) and
+/// `"issue_date"` (column), or `"referred"` (question/descriptor) and
+/// `"referred_on"` (column) land on a common token without hard-coding any
+/// of those words.
+///
+/// Returns every plausible base form; callers compare token *sets*, so
+/// over-generating candidates is safe — it can only create a match where
+/// the surface forms are genuinely related by one of these suffixes.
+pub fn word_stems(word: &str) -> Vec<String> {
+    let w = word.to_ascii_lowercase();
+    let mut out = vec![w.clone()];
+    if w.len() > 4 {
+        if let Some(stem) = w.strip_suffix("ing") {
+            out.push(stem.to_string());
+            push_undoubled(stem, &mut out);
+        }
+    }
+    if w.len() > 3 {
+        if let Some(stem) = w.strip_suffix("ed") {
+            out.push(stem.to_string());
+            push_undoubled(stem, &mut out);
+        }
+        if let Some(stem) = w.strip_suffix('d') {
+            out.push(stem.to_string());
+        }
+        if !w.ends_with("ss") {
+            if let Some(stem) = w.strip_suffix('s') {
+                out.push(stem.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Reduce a physical column name to its semantic token set: lowercase, strip
+/// one trailing temporal suffix (see [`TEMPORAL_NAME_SUFFIXES`]), split on
+/// `_`, and stem each piece (see [`word_stems`]). Tokens shorter than 3
+/// characters are dropped — they are almost always leftover suffix debris
+/// (`"in"` from `checked_in_at`, `"up"` from `follow_up_date`) rather than
+/// evidence of anything, and keeping them invites spurious matches against
+/// unrelated short question words.
+///
+/// `"booked_at"` → `{"booked", "book", "booke"}`.
+/// `"issue_date"` → `{"issue"}`.
+/// `"follow_up_date"` → `{"follow"}` (`"up"` dropped as too short).
+pub fn column_semantic_tokens(col: &str) -> Vec<String> {
+    let mut name = col.to_ascii_lowercase();
+    for suf in TEMPORAL_NAME_SUFFIXES {
+        if name.len() > suf.len() && name.ends_with(suf) {
+            name.truncate(name.len() - suf.len());
+            break;
+        }
+    }
+    name.split('_')
+        .filter(|s| !s.is_empty())
+        .flat_map(word_stems)
+        .filter(|t| t.len() >= 3)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,7 +483,7 @@ mod tests {
 
     #[test]
     fn all_count_and_unique_slugs() {
-        let expected = 35;
+        let expected = 36;
         assert_eq!(
             ColumnRole::ALL.len(),
             expected,
@@ -344,5 +495,31 @@ mod tests {
             expected,
             "every ColumnRole slug must be unique; duplicate found"
         );
+    }
+
+    #[test]
+    fn column_semantic_tokens_strip_suffix_and_split() {
+        assert_eq!(
+            column_semantic_tokens("booked_at"),
+            vec!["booked".to_string(), "book".to_string(), "booke".to_string()]
+        );
+        assert_eq!(column_semantic_tokens("issue_date"), vec!["issue".to_string()]);
+        // "up" is dropped: shorter than the 3-char floor.
+        assert_eq!(column_semantic_tokens("follow_up_date"), vec!["follow".to_string()]);
+    }
+
+    #[test]
+    fn word_stems_cover_ed_and_plural_inflection() {
+        assert!(word_stems("issued").contains(&"issue".to_string()));
+        assert!(word_stems("booked").contains(&"book".to_string()));
+        assert!(word_stems("encounters").contains(&"encounter".to_string()));
+        assert!(word_stems("reported").contains(&"report".to_string()));
+    }
+
+    #[test]
+    fn word_stems_undouble_final_consonant() {
+        assert!(word_stems("referred").contains(&"refer".to_string()));
+        assert!(word_stems("occurred").contains(&"occur".to_string()));
+        assert!(word_stems("cancelled").contains(&"cancel".to_string()));
     }
 }

@@ -1,4 +1,4 @@
-//! Faithfulness verifier — `AgentKind::Verify` (plan 25).
+//! Faithfulness verifier — `ModelRole::Verify` (plan 25).
 //!
 //! A second, cheap pass over an answer the system has already produced: break the
 //! answer into its clinical claims and check each one against the passages that were

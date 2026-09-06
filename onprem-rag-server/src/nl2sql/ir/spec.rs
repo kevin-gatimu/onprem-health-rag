@@ -41,8 +41,21 @@ pub struct QuerySpec {
     pub limit: Option<u32>,
     /// FK joins added by the binder.
     pub joins: Vec<JoinRef>,
-    /// Columns to SELECT for List / Lookup shapes.
-    pub projection: Vec<ColumnRef>,
+    /// Expressions to SELECT for List / Lookup shapes.
+    pub projection: Vec<ValueExpr>,
+    /// Reverse-FK semi-join / anti-join scopes (plan 03f).
+    /// Each scope compiles to an EXISTS / NOT EXISTS correlated subquery.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<RelatedScope>,
+    /// Row-level thresholds on a *derived* duration ("stays over 14 days"),
+    /// AND-ed into the WHERE clause alongside `filters` (plan 03g §1).
+    ///
+    /// A separate list from `filters` because the predicate's left-hand side is
+    /// an expression over two columns, not a single `ColumnRef`. Both compile
+    /// through the same arithmetic helper, so there is exactly one
+    /// implementation of the timestamp difference in the codebase.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duration_filters: Vec<DurationFilter>,
     /// Parsing provenance for logging, evaluation, and UI annotations.
     pub provenance: SpecProvenance,
 }
@@ -106,9 +119,14 @@ pub enum Shape {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Measure {
     pub op: MeasureOp,
-    /// Target column (not needed for `Count`).
-    pub target: Option<ColumnRef>,
+    /// Target expression (not needed for `Count`) — a stored column, or a
+    /// duration derived from two temporal columns (see `ValueExpr`).
+    pub target: Option<ValueExpr>,
     /// SQL alias for this measure in the SELECT list.
+    ///
+    /// For a `ValueExpr::Duration` target the alias **names the unit**
+    /// (`avg_los_days`, `avg_turnaround_hours`) so a wrong unit is visible in
+    /// the result set rather than silent — plan 03g §1.
     pub alias: String,
 }
 
@@ -222,6 +240,13 @@ pub enum TimeRange {
     Next { n: u32, unit: BucketUnit },
     /// "within N days"
     Within { n: u32, unit: BucketUnit },
+    /// Bounded "expires/due this week" — lower AND upper bound (start..end of period).
+    /// Distinct from `ThisWeek` which only emits a lower bound ("occurred this week").
+    WithinThisWeek,
+    /// Bounded "expires/due this month" — lower AND upper bound.
+    WithinThisMonth,
+    /// Bounded "expires/due this quarter" — lower AND upper bound.
+    WithinThisQuarter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +340,190 @@ impl ColumnRef {
 }
 
 // ---------------------------------------------------------------------------
+// Derived temporal measures (plan 03g)
+// ---------------------------------------------------------------------------
+
+/// The unit a derived duration is expressed in.
+///
+/// The unit is **not optional and never inferred at compile time** (plan 03g
+/// §1). Length of stay is conventionally days, lab turnaround hours, a triage
+/// wait minutes; getting it wrong is a 24× or 60× error that still reads as a
+/// plausible number. It therefore travels in the IR next to the endpoints, and
+/// the compiled column alias names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurationUnit {
+    Days,
+    Hours,
+    Minutes,
+}
+
+impl DurationUnit {
+    /// Seconds in one unit — the divisor applied to the normalised
+    /// elapsed-seconds difference the compiler emits (plan 03g §2).
+    pub fn seconds(self) -> i64 {
+        match self {
+            DurationUnit::Days => 86_400,
+            DurationUnit::Hours => 3_600,
+            DurationUnit::Minutes => 60,
+        }
+    }
+
+    /// Lowercase unit word, used as the alias suffix (`..._days`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DurationUnit::Days => "days",
+            DurationUnit::Hours => "hours",
+            DurationUnit::Minutes => "minutes",
+        }
+    }
+}
+
+/// How an interval whose end timestamp is NULL is treated (plan 03g §3).
+///
+/// A currently-admitted patient has no discharge timestamp. Their stay is not
+/// zero and it is not missing — it is *ongoing*. `AVG` skips NULLs, so leaving
+/// this implicit silently computes "average stay of the patients who already
+/// left", biased short precisely because the long stayers are still there.
+/// The choice is therefore carried in the IR, the two variants compile to
+/// different SQL, and the explanation sentence states which was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenInterval {
+    /// Exclude open intervals with an explicit `end IS NOT NULL` predicate, so
+    /// the excluded population is visible in the SQL rather than an accident of
+    /// aggregate NULL semantics.
+    CompletedOnly,
+    /// Treat an open interval as ending at the frozen `now` passed to
+    /// `compile` — "how long have the current inpatients been here".
+    AsOfNow,
+}
+
+impl OpenInterval {
+    /// Clause used in the explanation sentence (plan 03g §3: "the narration
+    /// must state it").
+    pub fn narration(self) -> &'static str {
+        match self {
+            OpenInterval::CompletedOnly => "completed intervals only (open intervals excluded)",
+            OpenInterval::AsOfNow => "open intervals measured up to now",
+        }
+    }
+}
+
+/// A measure no column stores: the elapsed time between two temporal columns,
+/// in an explicit unit.
+///
+/// Both endpoints are ordinary `ColumnRef`s and are resolved by `bind()`
+/// through the same role lookup as every other column — by role and concept,
+/// never by position in a candidate list. If either endpoint is absent or
+/// ambiguous, binding refuses; a "temporal column of roughly the right kind" is
+/// never substituted (plan 03g §4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DerivedDuration {
+    /// Interval start (typically `ColumnRole::StartTime`).
+    pub start: ColumnRef,
+    /// Interval end (typically `ColumnRole::EndTime`).
+    pub end: ColumnRef,
+    pub unit: DurationUnit,
+    pub open: OpenInterval,
+}
+
+impl DerivedDuration {
+    /// Alias for a duration that appears in a select list without a measure to
+    /// name it (a `List`-shape projection). It still names the unit, because an
+    /// unlabelled arithmetic column is the 24×-error hazard plan 03g §1 is about.
+    pub fn default_alias(&self) -> String {
+        format!("duration_{}", self.unit.as_str())
+    }
+}
+
+/// A scalar expression usable as a measure target or a projected column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "v")]
+pub enum ValueExpr {
+    /// A single stored column.
+    Column(ColumnRef),
+    /// A duration derived from two temporal columns (plan 03g).
+    Duration(DerivedDuration),
+}
+
+impl ValueExpr {
+    /// The underlying column, when this expression is a plain column.
+    pub fn as_column(&self) -> Option<&ColumnRef> {
+        match self {
+            ValueExpr::Column(cr) => Some(cr),
+            ValueExpr::Duration(_) => None,
+        }
+    }
+
+    /// The derived duration, when this expression is one.
+    pub fn as_duration(&self) -> Option<&DerivedDuration> {
+        match self {
+            ValueExpr::Duration(d) => Some(d),
+            ValueExpr::Column(_) => None,
+        }
+    }
+}
+
+impl From<ColumnRef> for ValueExpr {
+    fn from(cr: ColumnRef) -> Self {
+        ValueExpr::Column(cr)
+    }
+}
+
+/// A row-level threshold on a derived duration ("admitted over 14 days").
+///
+/// Shares `DerivedDuration` — and therefore the compiler's single
+/// elapsed-seconds helper — with the aggregated form, so a threshold and an
+/// average of the same interval can never disagree about the arithmetic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurationFilter {
+    pub duration: DerivedDuration,
+    pub op: FilterOp,
+    /// Compared in `duration.unit` — "over 14 days" is `Num(14.0)` with
+    /// `unit: Days`, never a minutes-normalised 20160.
+    pub value: FilterValue,
+}
+
+// ---------------------------------------------------------------------------
+// Related scope (reverse-FK semi-join / anti-join)
+// ---------------------------------------------------------------------------
+
+/// A single-hop reverse-FK scope added to the WHERE clause as an
+/// `EXISTS` (semi-join) or `NOT EXISTS` (anti-join) subquery.
+///
+/// Created by the parser when a domain predicate targets a concept different
+/// from the subject (e.g. "missed" → `Appointment.Status` while the subject
+/// is `Patient`).  Resolved by the binder via a reverse-FK index.
+///
+/// See plan 03f for the hard constraints: single hop only, FK→anchor PK,
+/// exactly-one-candidate, no row multiplication.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedScope {
+    /// The child concept whose table is referenced in the subquery.
+    pub concept: EntityConcept,
+    /// Predicates inside the EXISTS/NOT EXISTS correlated subquery.
+    pub filters: Vec<Filter>,
+    /// Optional time filter on the child table (rare but structurally correct).
+    pub time: Option<TimeScope>,
+    /// `false` → `EXISTS` (semi-join).  `true` → `NOT EXISTS` (anti-join).
+    pub negated: bool,
+    /// Resolved by `bind()`.  `None` before binding.
+    pub physical: Option<RelatedPhysical>,
+}
+
+/// Physical resolution of a `RelatedScope` (filled by `bind()`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelatedPhysical {
+    /// Physical table name for the child (e.g. `"appointments"`).
+    pub child_table: String,
+    /// Column on the child table that is the FK (e.g. `"patient_id"`).
+    pub child_fk_col: String,
+    /// Column on the anchor table that is the PK (e.g. `"id"`).
+    pub anchor_pk_col: String,
+}
+
+// ---------------------------------------------------------------------------
 // Join reference
 // ---------------------------------------------------------------------------
 
@@ -357,6 +566,10 @@ pub struct SpecProvenance {
 pub enum MissingSlot {
     /// Subject concept could not be resolved from the question.
     Subject,
+    /// A specific patient identifier was needed but not present.
+    Patient,
+    /// A time range was needed but could not be parsed from the question.
+    TimeRange,
     /// A dimension column was ambiguous (candidates provided separately).
     Dimension,
     /// A required measure column was unbound in this schema.
@@ -414,6 +627,8 @@ mod tests {
             limit: None,
             joins: vec![],
             projection: vec![],
+            related: vec![],
+            duration_filters: vec![],
             provenance: SpecProvenance { rule: "R1".into(), focus_subs: vec![] },
         };
         assert_eq!(make_spec(Shape::Scalar).intent(), QueryIntent::Aggregation);
@@ -453,6 +668,8 @@ mod tests {
             limit: None,
             joins: vec![],
             projection: vec![],
+            related: vec![],
+            duration_filters: vec![],
             provenance: SpecProvenance { rule: "R1".into(), focus_subs: vec![] },
         };
         let json = serde_json::to_string(&spec).expect("serialize");

@@ -1,26 +1,33 @@
-//! `POST /agents/<kind>` — SSE endpoint for task-aware AI agents.
+//! `POST /agents/<kind>` — SSE endpoint for the hospital agent roster.
 //!
-//! Routes by `AgentKind`:
-//! - **Semantic** (Chat, PatientLookup, Summarize): retrieval + `generate_stream_with`.
-//!   PatientLookup first attempts a conservative live-SQL overview. Emits: `routed`
-//!   -> `citations` -> `token`* -> `done`.
-//! - **Structured** (HealthQuery, Trends): `plan_aggregation` -> `validate` -> `execute`
-//!   -> grounded narration.  Emits: `routed` -> `spec` -> `rows` -> `pipeline` -> `token`* -> `done`.
-//!   Semantic questions on these tabs (no structural intent per the shared router)
-//!   fall through to the same retrieval pipeline as the semantic kinds.
+//! One shared flow serves every agent (plan 05 §2). The old file branched per
+//! mechanism-named kind (`health_query`, `trends`, `patient_lookup`,
+//! `summarize`); those branches are gone. What an agent *is* now only decides
+//! two things: the read scope handed to the four ownership hooks, and the
+//! persona the narrator is given.
 //!
-//! The SSE event set is a strict superset of `/chat` so the bridge relay can be
-//! generalised without breaking existing clients.
+//! ```text
+//! parse kind + mode  →  load memory + focus
+//!                    →  capability answer (no model) | out-of-scope redirect
+//!                    →  otherwise route (fixed_line = kind.line(), mode)
+//!                    →  execute: deterministic SQL | DocDb aggregation | retrieval
+//!                    →  narrate with the binding-derived persona
+//!                    →  persist (agent_kind = slug, mode)
+//! ```
 //!
-//! Everything below happens *before* the stream opens, so live pipeline stages
-//! cannot ride on it. Pass `run_id` in the body and subscribe to
-//! `GET /runs/<run_id>/progress` for those (see `progress.rs`).
+//! **Scope is a read allow-list, not a security boundary.** It decides what an
+//! agent may look at. Whether *this user* may do anything at all is decided in
+//! `src/auth/` (the `AuthUser` guard on this route) and nowhere else.
+//!
+//! Every SQL statement still passes the single `nl2sql::validate::validate_sql`
+//! guard; scoping narrows the `allowed_tables` that guard is given rather than
+//! adding a second check.
 //!
 //! # Event contract (SSE event names -> JSON payload shapes)
 //!
 //! | Event      | Payload                                          | When                         |
 //! |------------|--------------------------------------------------|------------------------------|
-//! | `routed`   | JSON-encoded string (e.g. `"health_query"`)      | First event, both paths      |
+//! | `routed`   | Route decision JSON (`RouteDecision::to_sse_json`)| First event, every path      |
 //! | `citations`| `[{id,source_id,row_pk,text,fields,score,...}]`  | Semantic path                |
 //! | `spec`     | `RunAggregation` JSON object                     | Structured path, after plan  |
 //! | `rows`     | `[{"label": String, "value": f64}]`              | Structured path, after exec  |
@@ -34,19 +41,22 @@ use rocket::serde::json::Json;
 use rocket::{State, post};
 use serde::Deserialize;
 
+use crate::agents::kind::{AgentKind, AgentMode};
+use crate::agents::persona;
 use crate::aggregation::execute;
-use crate::aggregation::intent::{QueryIntent, classify_lexical};
+use crate::aggregation::intent::QueryIntent;
 use crate::aggregation::validate;
-use crate::answer::{NARRATION_SYSTEM_PROMPT, build_agg_planner_system, build_narration_user};
+use crate::answer::{build_agg_planner_system, build_narration_user};
 use crate::auth::guard::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::foundry::{GuardedChatStream, router::AgentKind};
+use crate::foundry::GuardedChatStream;
+use crate::foundry::router::ModelRole;
 use crate::memory::WorkingMemory;
-use crate::rag::{
-    SYSTEM_PROMPT, apply_context_budget, build_prompt, expand_queries_with, prepare_queries_with,
-    rewrite_query_with,
-};
-use crate::retrieval;
+use crate::ontology::binding::SchemaBinding;
+use crate::rag::{apply_context_budget, build_prompt, expand_queries_with, prepare_queries_with};
+use crate::retrieval::{self, RetrievalFilter};
+use crate::router::focus::ConversationFocus;
+use crate::router::{RouteClass, RouteDecision};
 use crate::state::AppState;
 use crate::telemetry::{RequestTrace, Stage};
 
@@ -60,13 +70,19 @@ pub struct AgentRequest {
     /// The user's question or query.
     pub question: String,
     /// When present, the server persists the exchange to this conversation and
-    /// loads history from the DB (semantic path). Absent -> stateless (eval-safe).
+    /// loads history from the DB. Absent -> stateless (eval-safe).
     #[serde(default)]
     pub conversation_id: Option<String>,
     /// Client-minted id for this run; when present every pipeline stage is
     /// published to `GET /runs/<run_id>/progress` for the activity strip.
     #[serde(default)]
     pub run_id: Option<String>,
+    /// Trends / Handover toggles from the UI. Defaults to `Ask`.
+    #[serde(default)]
+    pub mode: AgentMode,
+    /// Optional source pin when several sources are bound.
+    #[serde(default)]
+    pub source_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -77,32 +93,25 @@ pub struct AgentRequest {
 /// of the generator means setup errors become HTTP errors (not mid-stream events)
 /// and we avoid smuggling non-`Send` temporaries into the async generator.
 enum AgentData {
-    SemanticDirect {
-        /// Deterministic live-source answer rendered as ordinary agent text.
-        answer: String,
-    },
+    /// A complete, model-free answer (capability, redirect, clarify,
+    /// deterministic record narration).
+    Direct { answer: String },
+    /// Deterministic live-SQL result rendered in the structured shape.
     StructuredDirect {
-        /// Synthetic aggregation-shaped provenance for the existing agent UI.
         spec_json: String,
-        /// SQL rows adapted to chart-ready `AggRow` values.
         rows_json: String,
-        /// Live-SQL provenance, carried in the existing query disclosure event.
         pipeline_json: String,
-        /// Deterministic result narration; no model call is needed.
         answer: String,
     },
+    /// DocumentDB aggregation with a streamed narration.
     Structured {
-        /// Serialised `RunAggregation` spec (provenance).
         spec_json: String,
-        /// Serialised `Vec<AggRow>` for the UI chart/table.
         rows_json: String,
-        /// Serialised executed pipeline (provenance).
         pipeline_json: String,
-        /// Already-opened narration stream (iterate inside EventStream!).
         narration_stream: GuardedChatStream,
     },
+    /// Retrieval + grounded generation.
     Semantic {
-        /// Serialised `Vec<Passage>` for citations.
         citations_json: String,
         /// `None` when the score gate refuses to answer.
         gen_stream: Option<GuardedChatStream>,
@@ -113,11 +122,12 @@ enum AgentData {
 // Route
 // ---------------------------------------------------------------------------
 
-/// `POST /agents/<kind>` — task-aware SSE agent endpoint.
+/// `POST /agents/<kind>` — the hospital agent endpoint.
 ///
-/// `<kind>` is one of: `auto` (default selector), `health_query`, `trends`,
-/// `patient_lookup`, `summarize`, `chat`. `auto` is intercepted before
-/// `parse_kind`; truly unknown kinds return `400`.
+/// `<kind>` is `ask`, any service-line slug (`maternity`, `ward_board`, …), or —
+/// for one release — a legacy name (`health_query`, `trends`, `patient_lookup`,
+/// `summarize`, `chat`) which maps to `Ask` with a mode. Unknown kinds are a
+/// `400`, never a silently substituted neighbour.
 #[post("/agents/<kind>", data = "<body>")]
 pub async fn agent(
     state: &State<AppState>,
@@ -129,35 +139,30 @@ pub async fn agent(
     if let Some(run_id) = body.run_id.clone() {
         trace.attach_progress(state.run_progress.clone(), run_id);
     }
-    let mut generation_permit = None;
 
-    // Resolve the effective kind. `auto` uses the shared router; explicit kinds
-    // skip classification and record only the resolved agent role.
-    let resolved_kind: AgentKind = if kind.eq_ignore_ascii_case("auto") {
-        let decision = trace
-            .time(
-                Stage::Route,
-                crate::router::route(
-                    &body.question,
-                    false,
-                    &state.config,
-                    state.foundry().ok(),
-                    &state.spec_for(AgentKind::Classify),
-                    &state.router_cache,
-                ),
-            )
-            .await;
-        trace.set_route(
-            decision.route_label(),
-            Some(decision.tier),
-            Some(decision.cached),
-        );
-        crate::router::class_to_agent_kind(&decision.class)
+    let (agent_kind, legacy_mode) = parse_kind(kind)?;
+    let req = body.into_inner();
+    // An explicit body mode wins; a legacy path name supplies one when the body
+    // has none (old clients never send `mode`).
+    let mode = if req.mode == AgentMode::Ask {
+        legacy_mode
     } else {
-        parse_kind(kind)?
+        req.mode
     };
 
-    let req = body.into_inner();
+    let kind_slug = agent_kind.slug().to_string();
+    trace.set_route(format!("agent_{kind_slug}"), None, None);
+
+    // Binding for this turn: the pinned source if one was given, else the
+    // richest available. Personas, scope and redirects all read from it.
+    let bindings = state.bindings();
+    let binding: Option<std::sync::Arc<SchemaBinding>> = match req.source_id.as_deref() {
+        Some(pin) => bindings.get(pin).cloned(),
+        None => bindings
+            .values()
+            .max_by_key(|b| b.usable_lines(state.config.binding_min_confidence).len())
+            .cloned(),
+    };
 
     // Conversation persistence (pre-stream so errors surface as HTTP status, not
     // mid-stream events).
@@ -170,302 +175,258 @@ pub async fn agent(
                 verify_owned(&state.db, cid, &user.id).await?;
                 let history = load_history(&state.db, cid, &user.id, 10).await;
                 persist_user_message(&state.db, cid, &user.id, &req.question).await?;
-                Ok::<Vec<crate::rag::ChatTurn>, crate::error::AppError>(history)
+                Ok::<Vec<crate::rag::ChatTurn>, AppError>(history)
             } else {
-                Ok::<Vec<crate::rag::ChatTurn>, crate::error::AppError>(Vec::new())
+                Ok::<Vec<crate::rag::ChatTurn>, AppError>(Vec::new())
             }
         })
         .await?;
     let memory = WorkingMemory::from_turns(history.clone());
 
-    let kind_str: String = serde_json::to_value(resolved_kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "chat".to_string());
-    if !kind.eq_ignore_ascii_case("auto") {
-        trace.set_route(format!("agent_{kind_str}"), None, None);
-    }
+    // Focus is populated by plan 06; the line comes from the tab so the persona
+    // and the router agree about which department is answering.
+    let focus = ConversationFocus {
+        line: agent_kind.line(),
+        ..ConversationFocus::default()
+    };
 
+    let catalog = state.catalog();
+
+    // -----------------------------------------------------------------
+    // Two model-free short circuits, then routing.
+    //
+    // 1. A capability question is answered from the binding, so it is truthful
+    //    about *this* deployment and costs no model call.
+    // 2. A question that plainly names another department's data is redirected
+    //    by name. Ownership here decides only what this agent *reads*; whether
+    //    the user may read anything at all was settled by the `AuthUser` guard.
+    // -----------------------------------------------------------------
+    let (decision, direct_answer): (RouteDecision, Option<String>) =
+        if crate::router::conversational::is_capability(&req.question) {
+            (
+                capability_decision(agent_kind, &req.question),
+                Some(persona::capability_answer(agent_kind, binding.as_deref())),
+            )
+        } else if let Some(redirect) = crate::agents::kind::out_of_scope_redirect(
+            agent_kind,
+            &req.question,
+            binding.as_deref(),
+            None,
+        ) {
+            let message = redirect.message.clone();
+            (
+                redirect_decision(agent_kind, &req.question, &redirect),
+                Some(message),
+            )
+        } else {
+            // Route once, for every agent, with the tab's line fixed.
+            let decision = trace
+                .time(
+                    Stage::Route,
+                    crate::router::route_dispatch(
+                        &req.question,
+                        !history.is_empty(),
+                        &state.config,
+                        state.foundry().ok(),
+                        &state.spec_for(ModelRole::Classify),
+                        &state.router_cache,
+                        &bindings,
+                        &catalog,
+                        Some(&focus),
+                        agent_kind.line(),
+                        mode,
+                    ),
+                )
+                .await;
+            trace.set_route(
+                decision.route_label(),
+                Some(decision.tier),
+                Some(decision.cached),
+            );
+            (decision, None)
+        };
+
+    // The agent's read allow-list. A line agent narrows to its own tables; Ask
+    // takes whatever the router resolved (possibly nothing = whole corpus).
+    let scope: Vec<String> = {
+        let own = agent_kind.scope(binding.as_deref(), decision.entities.patient_key.as_deref());
+        if own.is_empty() { decision.scope.clone() } else { own }
+    };
+
+    let system_prompt = persona::system_prompt(agent_kind, mode, binding.as_deref(), &focus);
+
+    let mut generation_permit = None;
     let mut persist_passages: Vec<crate::retrieval::Passage> = Vec::new();
     let mut persist_structured_json: Option<String> = None;
 
-    let data: AgentData = match resolved_kind {
-        // -----------------------------------------------------------------
-        // Patient lookup: prefer a conservative live-source patient overview.
-        // A miss or source failure falls through to the unchanged semantic path.
-        // -----------------------------------------------------------------
-        AgentKind::PatientLookup if should_try_deterministic_sql(resolved_kind, &req.question) => {
+    let data: AgentData = match direct_answer {
+        Some(answer) => AgentData::Direct { answer },
+        None => match &decision.class {
+        // Model-free classes: the answer text is already decided.
+        RouteClass::Capability => AgentData::Direct {
+            answer: persona::capability_answer(agent_kind, binding.as_deref()),
+        },
+        RouteClass::Clarify { question, .. } => AgentData::Direct {
+            answer: question.clone(),
+        },
+
+        // Structured: live SQL first, DocumentDB aggregation second, retrieval last.
+        RouteClass::Structured { intent, .. } => {
+            let source_scope = crate::nl2sql::routes::SourceScope {
+                tables: scope.clone(),
+                pin_source: req
+                    .source_id
+                    .clone()
+                    .or_else(|| decision.source_id.clone()),
+            };
             let deterministic = trace
                 .time(
                     Stage::Execute,
                     crate::nl2sql::routes::prepare_auto_query_deterministic(
                         state.inner(),
-                        &req.question,
+                        &decision.resolved_question,
+                        Some(&source_scope),
                     ),
                 )
                 .await
                 .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "patient lookup deterministic SQL failed; using semantic retrieval");
+                    tracing::warn!(%error, "agent deterministic SQL failed; using aggregation planner");
                     None
                 });
 
-            if let Some(prepared) = deterministic {
-                AgentData::SemanticDirect {
-                    answer: narrate_patient_rows(&prepared.columns, &prepared.rows),
-                }
-            } else {
-                build_semantic_agent_data(
-                    state.inner(),
-                    resolved_kind,
-                    &memory,
-                    &req.question,
-                    None,
-                    &trace,
-                    &mut generation_permit,
-                    &mut persist_passages,
-                )
-                .await?
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // Summaries of recent records are ordered source queries, not semantic
-        // retrieval. Keep this narrow and silently retain the semantic fallback.
-        // -----------------------------------------------------------------
-        AgentKind::Summarize if should_try_deterministic_sql(resolved_kind, &req.question) => {
-            let deterministic = trace
-                .time(
-                    Stage::Execute,
-                    crate::nl2sql::routes::prepare_auto_query_deterministic(
-                        state.inner(),
-                        &req.question,
-                    ),
-                )
-                .await
-                .unwrap_or_else(|error| {
-                    tracing::warn!(%error, "summary deterministic SQL failed; using semantic retrieval");
-                    None
-                });
-
-            if let Some(prepared) = deterministic {
-                AgentData::SemanticDirect {
-                    answer: narrate_recent_rows(&prepared.columns, &prepared.rows, &prepared.sql),
-                }
-            } else {
-                build_semantic_agent_data(
-                    state.inner(),
-                    resolved_kind,
-                    &memory,
-                    &req.question,
-                    None,
-                    &trace,
-                    &mut generation_permit,
-                    &mut persist_passages,
-                )
-                .await?
-            }
-        }
-
-        // -----------------------------------------------------------------
-        // Structured analytical path: HealthQuery + Trends
-        // -----------------------------------------------------------------
-        AgentKind::HealthQuery | AgentKind::Trends => {
-            // Not `state.foundry()?`: a question the live source can answer
-            // deterministically needs no model at all, so an unavailable Foundry
-            // must not turn it into a 503 here. The paths that do need a model
-            // ask for it themselves.
-            let foundry_opt = state.foundry().ok();
-
-            // Rewrite against working memory *first*. A follow-up ("list their
-            // names") only becomes answerable once it carries the subject of the
-            // previous turn, and every decision below — deterministic SQL,
-            // routing, planning — reads the resolved form. Doing this after the
-            // SQL attempt, as this used to, meant follow-ups could never hit the
-            // live source and fell through to a planner that had no way to know
-            // what "their" referred to. No-op (no model call) without history.
-            let rewrite_spec = state.spec_for(AgentKind::QueryRewrite);
-            let standalone = match foundry_opt {
-                Some(foundry) => {
-                    trace
-                        .time(
-                            Stage::RewriteExpand,
-                            rewrite_query_with(
-                                foundry,
-                                &rewrite_spec,
-                                &memory.rewrite_turns(),
-                                &req.question,
-                            ),
-                        )
-                        .await
-                }
-                None => req.question.clone(),
-            };
-
-            // Prefer the same validated live-SQL templates used by `/chat`. A miss or
-            // source failure is deliberately non-fatal: the existing DocumentDB
-            // aggregation planner remains the fallback.
-            let deterministic = if should_try_deterministic_sql(resolved_kind, &standalone) {
-                trace
-                    .time(
-                        Stage::Execute,
-                        crate::nl2sql::routes::prepare_auto_query_deterministic(
-                            state.inner(),
-                            &standalone,
-                        ),
-                    )
-                    .await
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(%error, "agent deterministic SQL failed; using aggregation planner");
-                        None
-                    })
-            } else {
-                None
-            };
-
-            // Second, cheaper chance for pronoun follow-ups the rewrite model left
-            // unresolved: ground them on an identifier from a prior turn. Model-free,
-            // so a miss costs nothing.
+            // Cheap, model-free second chance for pronoun follow-ups.
             let deterministic = match deterministic {
                 Some(prepared) => Some(prepared),
-                None => resolve_followup_sql(state.inner(), &req.question, &memory).await,
+                None => {
+                    resolve_followup_sql(state.inner(), &req.question, &memory, &source_scope).await
+                }
             };
 
-            if let Some(prepared) = deterministic {
-                trace.stage_detail(
-                    Stage::Execute,
-                    format!("{} rows from the live database", prepared.rows.len()),
-                );
-                let (spec_json, rows_json, pipeline_json, answer) =
-                    deterministic_structured_result(prepared, resolved_kind);
-                persist_structured_json = Some(format!(
-                    "{{\"spec\":{spec_json},\"rows\":{rows_json},\"pipeline\":{pipeline_json}}}"
-                ));
-                AgentData::StructuredDirect {
-                    spec_json,
-                    rows_json,
-                    pipeline_json,
-                    answer,
-                }
-            } else {
-                // Unified routing: explicit structured tabs still honour semantic
-                // questions through the same tiered router `auto` uses; anything
-                // not confidently structural falls through to shared retrieval.
-                let decision = trace
-                    .time(
-                        Stage::Route,
-                        crate::router::route(
-                            &standalone,
-                            !history.is_empty(),
-                            &state.config,
-                            state.foundry().ok(),
-                            &state.spec_for(AgentKind::Classify),
-                            &state.router_cache,
-                        ),
-                    )
-                    .await;
-
-                let catalog = state.catalog();
-                // With nothing ingested there is no collection the planner could
-                // name, so every spec it produces fails validation. Skip straight
-                // to retrieval (or, above, the live source) instead of spending a
-                // model call to earn a guaranteed error.
-                let structured_possible = can_run_docdb_aggregation(&decision.class, &catalog);
-
-                let aggregated = if structured_possible {
-                    match run_docdb_aggregation(
-                        state.inner(),
-                        &user,
-                        resolved_kind,
-                        &standalone,
-                        &catalog,
-                        &trace,
-                        &mut generation_permit,
-                    )
-                    .await
-                    {
-                        Ok((data, structured_json)) => {
-                            persist_structured_json = Some(structured_json);
-                            Some(data)
-                        }
-                        // Planning, validation and execution are all best-effort:
-                        // a small model emitting a malformed spec, or naming a
-                        // collection that was never ingested, used to abort the
-                        // whole request with a raw 400 in the chat transcript.
-                        // A grounded semantic answer is a far better outcome.
-                        Err(error) => {
-                            tracing::info!(
-                                kind = ?resolved_kind,
-                                %error,
-                                "agent aggregation failed; falling back to semantic retrieval"
-                            );
-                            None
-                        }
+            match deterministic {
+                Some(prepared) => {
+                    trace.stage_detail(
+                        Stage::Execute,
+                        format!("{} rows from the live database", prepared.rows.len()),
+                    );
+                    let (spec_json, rows_json, pipeline_json, answer) =
+                        deterministic_structured_result(prepared, mode);
+                    persist_structured_json = Some(format!(
+                        "{{\"spec\":{spec_json},\"rows\":{rows_json},\"pipeline\":{pipeline_json}}}"
+                    ));
+                    AgentData::StructuredDirect {
+                        spec_json,
+                        rows_json,
+                        pipeline_json,
+                        answer,
                     }
-                } else {
-                    None
-                };
-
-                match aggregated {
-                    Some(data) => data,
-                    None => {
-                        build_semantic_agent_data(
+                }
+                None => {
+                    // Hook 2: the planner prompt AND the validator see the same
+                    // scoped catalog, so an out-of-scope collection is rejected
+                    // by the existing guard.
+                    let scoped = catalog.scoped(&scope);
+                    let aggregated = if scoped.collections.is_empty() {
+                        // Nothing in scope is ingested; a planner call here would
+                        // buy a guaranteed validation error instead of an answer.
+                        None
+                    } else {
+                        match run_docdb_aggregation(
                             state.inner(),
-                            resolved_kind,
-                            &memory,
-                            &req.question,
-                            Some(standalone),
+                            &user,
+                            *intent,
+                            mode,
+                            &decision.resolved_question,
+                            &scoped,
+                            &system_prompt,
                             &trace,
                             &mut generation_permit,
-                            &mut persist_passages,
                         )
-                        .await?
+                        .await
+                        {
+                            Ok((data, structured_json)) => {
+                                persist_structured_json = Some(structured_json);
+                                Some(data)
+                            }
+                            Err(error) => {
+                                tracing::info!(
+                                    kind = %kind_slug,
+                                    %error,
+                                    "agent aggregation failed; falling back to semantic retrieval"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    match aggregated {
+                        Some(data) => data,
+                        None => {
+                            build_semantic_agent_data(
+                                state.inner(),
+                                agent_kind,
+                                &memory,
+                                &decision,
+                                &scope,
+                                &system_prompt,
+                                &trace,
+                                &mut generation_permit,
+                                &mut persist_passages,
+                            )
+                            .await?
+                        }
                     }
                 }
             }
         }
 
-        // -----------------------------------------------------------------
-        // Semantic path: Chat, PatientLookup, Summarize (+ other kinds)
-        // -----------------------------------------------------------------
+        // Everything else answers from retrieval with the persona and the filter.
         _ => {
             build_semantic_agent_data(
                 state.inner(),
-                resolved_kind,
+                agent_kind,
                 &memory,
-                &req.question,
-                None,
+                &decision,
+                &scope,
+                &system_prompt,
                 &trace,
                 &mut generation_permit,
                 &mut persist_passages,
             )
             .await?
         }
+        },
     };
 
     let db = state.db.clone();
     // Read before the generator opens (it cannot borrow `&AppState`); picks the
     // honest "no answer" wording — see `rag::no_grounding_message`.
-    let store_is_empty = state.catalog().collections.is_empty();
+    let store_is_empty = catalog.collections.is_empty();
     let uid = user.id.clone();
     let persist_cid = req.conversation_id.clone();
     let foundry_handle = state.foundry_handle();
     let cfg = state.config.clone();
-    let compact_spec = state.spec_for(AgentKind::QueryRewrite);
+    let compact_spec = state.spec_for(ModelRole::Compact);
+    let routed_json = decision.to_sse_json();
+    let mode_slug = mode.slug().to_string();
+    // Plan 05 section 7: an Ask thread that the router sent to a department is
+    // titled with that department. A fixed tab already says which one it is.
+    let title_line: Option<&'static str> = match agent_kind {
+        AgentKind::Ask => decision.service_line.map(|l| l.label()),
+        AgentKind::Line(_) => None,
+    };
 
     Ok(EventStream! {
         use futures::StreamExt;
 
         let _generation_permit = generation_permit;
 
-        yield Event::data(serde_json::to_string(&kind_str).unwrap_or_default())
-            .event("routed");
+        yield Event::data(routed_json).event("routed");
 
         let mut full_answer = String::new();
         let mut had_error = false;
         let _generation = trace.stage_guard(Stage::Generate);
 
         match data {
-            AgentData::SemanticDirect { answer } => {
+            AgentData::Direct { answer } => {
                 yield Event::data("[]").event("citations");
                 trace.record_output(&answer);
                 full_answer.push_str(&answer);
@@ -578,7 +539,8 @@ pub async fn agent(
                             cid.as_str(),
                             &uid,
                             &full_answer,
-                            &kind_str,
+                            &kind_slug,
+                            &mode_slug,
                             &persist_passages,
                             persist_structured_json.as_deref(),
                         ),
@@ -587,6 +549,15 @@ pub async fn agent(
                 {
                     tracing::warn!(error = %e, "failed to persist agent assistant message");
                 } else {
+                    if let Some(label) = title_line {
+                        if let Err(e) = crate::routes::conversations::prefix_title_with_line(
+                            &db, cid.as_str(), label,
+                        )
+                        .await
+                        {
+                            tracing::debug!(error = %e, "could not prefix conversation title");
+                        }
+                    }
                     crate::memory::maybe_spawn_compaction(
                         db.clone(), foundry_handle.clone(), cfg.clone(), compact_spec.clone(), cid.clone(),
                     );
@@ -605,69 +576,96 @@ pub async fn agent(
     })
 }
 
-/// Whether the DocumentDB aggregation planner is worth invoking: the router must
-/// have called the question structural *and* something must actually be ingested.
-/// An empty catalog rejects every collection a planner could name, so running it
-/// there buys a guaranteed validation error in place of an answer.
-fn can_run_docdb_aggregation(
-    class: &crate::router::RouteClass,
-    catalog: &crate::aggregation::catalog::Catalog,
-) -> bool {
-    matches!(class, crate::router::RouteClass::Structured { .. }) && !catalog.collections.is_empty()
+// ---------------------------------------------------------------------------
+// Model-free answers
+// ---------------------------------------------------------------------------
+
+/// A Tier-0 decision for a capability answer, so the UI's activity strip shows
+/// the same shape it does for every other route.
+fn capability_decision(kind: AgentKind, question: &str) -> RouteDecision {
+    RouteDecision {
+        class: RouteClass::Capability,
+        tier: 0,
+        cached: false,
+        tier2_attempted: false,
+        entities: Default::default(),
+        deterministic: false,
+        service_line: kind.line(),
+        source_id: None,
+        scope: vec![],
+        query_spec: None,
+        resolved_question: question.to_string(),
+    }
 }
 
-fn should_try_deterministic_sql(kind: AgentKind, question: &str) -> bool {
-    if question.trim().is_empty() {
-        return false;
-    }
-    match kind {
-        AgentKind::PatientLookup => crate::nl2sql::routes::is_patient_overview_question(question),
-        // Only structurally-marked questions; semantic follow-ups ("what are they
-        // about") must reach the retrieval pipeline instead.
-        AgentKind::HealthQuery | AgentKind::Trends => matches!(
-            classify_lexical(question),
-            Some(QueryIntent::Aggregation | QueryIntent::Trend | QueryIntent::Enumeration)
-        ),
-        AgentKind::Summarize => crate::nl2sql::routes::is_recent_records_question(question),
-        _ => false,
+/// A Tier-0 clarify decision naming the department that owns the data.
+fn redirect_decision(
+    kind: AgentKind,
+    question: &str,
+    redirect: &crate::agents::kind::ScopeRedirect,
+) -> RouteDecision {
+    RouteDecision {
+        class: RouteClass::Clarify {
+            question: redirect.message.clone(),
+            slot: crate::nl2sql::ir::spec::MissingSlot::Subject,
+        },
+        tier: 0,
+        cached: false,
+        tier2_attempted: false,
+        entities: Default::default(),
+        deterministic: false,
+        service_line: kind.line(),
+        source_id: None,
+        scope: vec![redirect.table.clone()],
+        query_spec: None,
+        resolved_question: question.to_string(),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Structured execution
+// ---------------------------------------------------------------------------
 
 /// Plan → validate → execute a DocumentDB aggregation and open its narration
-/// stream. Extracted from the route so every failure inside it is one `Err` the
-/// caller can trade for a semantic answer; inline `?`s here used to abort the
-/// whole request with a raw `400` in the middle of a conversation.
+/// stream. Every failure inside is one `Err` the caller can trade for a semantic
+/// answer rather than aborting the request mid-conversation.
 ///
-/// Returns the SSE payload plus the JSON blob persisted with the message.
+/// `catalog` is already scoped to the agent's allow-list, and it is the same
+/// catalog handed to `validate` — narrowing what the planner may name and what
+/// the validator will accept in one move, through the existing guard.
 #[allow(clippy::too_many_arguments)]
 async fn run_docdb_aggregation(
     state: &AppState,
     user: &AuthUser,
-    kind: AgentKind,
-    standalone: &str,
+    intent: QueryIntent,
+    mode: AgentMode,
+    question: &str,
     catalog: &crate::aggregation::catalog::Catalog,
+    system_prompt: &str,
     trace: &RequestTrace,
     generation_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> AppResult<(AgentData, String)> {
     let foundry = state.foundry()?;
     *generation_permit = Some(state.admission.generation().await?);
-    let spec = state.spec_for(kind);
-    let intent = if kind == AgentKind::Trends {
+
+    // Trends mode is a trend question whatever the lexical intent said.
+    let intent = if mode == AgentMode::Trends {
         QueryIntent::Trend
     } else {
-        QueryIntent::Aggregation
+        intent
     };
     let planner_system = build_agg_planner_system(catalog, intent);
+    let planner_spec = state.spec_for(ModelRole::PlanSpec);
 
     // 1. Plan: model emits a RunAggregation tool call.
     let planned = trace
         .time(
             Stage::Plan,
-            foundry.plan_aggregation(&spec, &planner_system, standalone),
+            foundry.plan_aggregation(&planner_spec, &planner_system, question),
         )
         .await?;
 
-    // 2. Validate + sanitize against the current catalog.
+    // 2. Validate + sanitize against the scoped catalog.
     let validated = trace.time_sync(Stage::Validate, || validate(&planned, catalog))?;
 
     // 3. Execute pipeline against DocumentDB.
@@ -692,14 +690,17 @@ async fn run_docdb_aggregation(
     let structured_json =
         format!("{{\"spec\":{spec_json},\"rows\":{rows_json},\"pipeline\":{pipeline_json}}}");
 
-    // 4. Open the grounded narration stream.
-    let narration_user = build_narration_user(standalone, &rows);
-    let mut narration_spec = state.spec_for(kind);
+    // 4. Open the grounded narration stream, using the agent's persona.
+    let narration_user = build_narration_user(question, &rows);
+    let mut narration_spec = state.spec_for(ModelRole::Narrate);
     narration_spec.tools = false; // narration never calls tools
+    // Trends is the one place chain-of-thought earns its cost: describing a
+    // direction over buckets is reasoning, not transcription.
+    narration_spec.thinking = mode == AgentMode::Trends;
     let narration_stream = trace
         .time(
             Stage::Narrate,
-            foundry.generate_stream_with(&narration_spec, NARRATION_SYSTEM_PROMPT, &narration_user),
+            foundry.generate_stream_with(&narration_spec, system_prompt, &narration_user),
         )
         .await?;
 
@@ -715,18 +716,21 @@ async fn run_docdb_aggregation(
 }
 
 /// Ground an anaphoric follow-up ("list their names") on an identifier from a
-/// prior turn and try the deterministic SQL compiler only. Mirrors `/chat`'s
-/// resolver: model-free, so it is safe to attempt on every follow-up.
+/// prior turn and try the deterministic SQL compiler only. Model-free, so it is
+/// safe to attempt on every follow-up.
 async fn resolve_followup_sql(
     state: &AppState,
     question: &str,
     memory: &WorkingMemory,
+    scope: &crate::nl2sql::routes::SourceScope,
 ) -> Option<crate::nl2sql::routes::PreparedNlQuery> {
     let augmented = crate::nl2sql::routes::resolve_followup_question(
         question,
         memory.tail.iter().map(|turn| turn.content.as_str()),
     )?;
-    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &augmented).await {
+    match crate::nl2sql::routes::prepare_auto_query_deterministic(state, &augmented, Some(scope))
+        .await
+    {
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::debug!(%error, "agent follow-up SQL resolution failed; continuing");
@@ -735,56 +739,68 @@ async fn resolve_followup_sql(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Semantic execution
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
 async fn build_semantic_agent_data(
     state: &AppState,
     kind: AgentKind,
     memory: &WorkingMemory,
-    question: &str,
-    prepared_standalone: Option<String>,
+    decision: &RouteDecision,
+    scope: &[String],
+    system_prompt: &str,
     trace: &RequestTrace,
     generation_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
     persist_passages: &mut Vec<crate::retrieval::Passage>,
 ) -> AppResult<AgentData> {
-    // Release any permit the caller already holds (structured path that failed and
-    // fell through to here) before asking for another — assigning would evaluate
-    // the new acquire while the old permit is still alive, deadlocking a
-    // single-permit semaphore.
+    // Release any permit the caller already holds (structured path that failed
+    // and fell through) before asking for another — assigning would evaluate the
+    // new acquire while the old permit is alive, deadlocking a single-permit
+    // semaphore.
     generation_permit.take();
     *generation_permit = Some(state.admission.generation().await?);
     let foundry = state.foundry()?;
-    let generation_spec = state.spec_for(kind);
-    let rewrite_spec = state.spec_for(AgentKind::QueryRewrite);
-    // Callers that already rewrote the question (structured fall-through) skip
-    // the second rewrite model call and only expand.
-    let (standalone, queries) = match prepared_standalone {
-        Some(standalone) => {
-            let queries = trace
-                .time(
-                    Stage::RewriteExpand,
-                    expand_queries_with(foundry, &rewrite_spec, &state.config, &standalone),
-                )
-                .await;
-            (standalone, queries)
-        }
-        None => {
-            let rewrite_turns = memory.rewrite_turns();
-            trace
-                .time(
-                    Stage::RewriteExpand,
-                    prepare_queries_with(
-                        foundry,
-                        &rewrite_spec,
-                        &state.config,
-                        &rewrite_turns,
-                        question,
-                    ),
-                )
-                .await
-        }
+    let generation_spec = state.spec_for(ModelRole::Grounded);
+    let rewrite_spec = state.spec_for(ModelRole::Rewrite);
+
+    // The router already resolved anaphora; expanding that form avoids a second
+    // rewrite model call on the same question.
+    let standalone = decision.resolved_question.clone();
+    let queries = trace
+        .time(
+            Stage::RewriteExpand,
+            expand_queries_with(foundry, &rewrite_spec, &state.config, &standalone),
+        )
+        .await;
+    let queries = if queries.is_empty() {
+        trace
+            .time(
+                Stage::RewriteExpand,
+                prepare_queries_with(
+                    foundry,
+                    &rewrite_spec,
+                    &state.config,
+                    &memory.rewrite_turns(),
+                    &standalone,
+                ),
+            )
+            .await
+            .1
+    } else {
+        queries
     };
+
     let broad = retrieval::is_broad_question(&standalone);
     let _retrieval_permit = state.admission.retrieval().await?;
-    let passages = retrieval::retrieve_observed(
+
+    // Hook 3: the agent's read allow-list, applied to retrieval candidates.
+    // `explicit` is false for Ask, which reads the whole corpus by design.
+    let mut filter = RetrievalFilter::for_scope(scope.to_vec(), kind.scope_is_explicit());
+    filter.patient_key = decision.entities.patient_key.clone();
+
+    let passages = retrieval::retrieve_observed_filtered(
         &state.db,
         &state.config,
         &queries,
@@ -792,6 +808,7 @@ async fn build_semantic_agent_data(
         state.config.rerank_enabled && !broad,
         state.config.context_top_k,
         trace,
+        &filter,
     )
     .await?;
     let refuse = trace.time_sync(Stage::Gate, || {
@@ -819,7 +836,7 @@ async fn build_semantic_agent_data(
             trace
                 .time(
                     Stage::Generate,
-                    foundry.generate_stream_with(&generation_spec, SYSTEM_PROMPT, &prompt),
+                    foundry.generate_stream_with(&generation_spec, system_prompt, &prompt),
                 )
                 .await?,
         )
@@ -830,70 +847,19 @@ async fn build_semantic_agent_data(
     })
 }
 
-fn narrate_patient_rows(columns: &[String], rows: &[Vec<serde_json::Value>]) -> String {
-    if rows.is_empty() {
-        return "No matching patient record was found.".to_string();
-    }
-    rows.iter()
-        .map(|row| {
-            columns
-                .iter()
-                .zip(row)
-                .filter(|(_, value)| !value.is_null())
-                .map(|(column, value)| {
-                    let label = column.replace('_', " ");
-                    let value = value
-                        .as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| value.to_string());
-                    format!("{label}: {value}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+// ---------------------------------------------------------------------------
+// Live-SQL result adaptation
+// ---------------------------------------------------------------------------
 
-fn narrate_recent_rows(columns: &[String], rows: &[Vec<serde_json::Value>], sql: &str) -> String {
-    if rows.is_empty() {
-        return "No recent records were found.".to_string();
-    }
-    let limit = sql
-        .rsplit_once(" LIMIT ")
-        .and_then(|(_, value)| value.parse::<usize>().ok())
-        .unwrap_or(rows.len());
-    let table = sql
-        .split_once(" FROM ")
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .and_then(|name| name.rsplit('.').next())
-        .unwrap_or("records")
-        .replace('_', " ");
-    let lines = rows
-        .iter()
-        .map(|row| {
-            columns
-                .iter()
-                .zip(row)
-                .filter(|(_, value)| !value.is_null())
-                .map(|(_, value)| json_label(value))
-                .collect::<Vec<_>>()
-                .join(" — ")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("The {limit} most recent {table}:\n{lines}")
-}
-
-/// Adapt a validated live-SQL result to the established structured-agent SSE
-/// shape. Scalar results become one `(all)` bar; grouped/trend results use the
-/// first column as the label and the rightmost numeric column as the value.
+/// Adapt a validated live-SQL result to the structured-agent SSE shape. Scalar
+/// results become one `(all)` bar; grouped/trend results use the first column as
+/// the label and the rightmost numeric column as the value.
 fn deterministic_structured_result(
     prepared: crate::nl2sql::routes::PreparedNlQuery,
-    kind: AgentKind,
+    mode: AgentMode,
 ) -> (String, String, String, String) {
     let rows = sql_rows_to_agg_rows(&prepared.rows);
-    let time_bucket = if kind == AgentKind::Trends {
+    let time_bucket = if mode == AgentMode::Trends {
         prepared
             .columns
             .first()
@@ -962,15 +928,16 @@ fn json_label(value: &serde_json::Value) -> String {
 // Kind parsing
 // ---------------------------------------------------------------------------
 
-/// Parse the URL path segment into `AgentKind`. Returns `BadRequest` for unknown
-/// values so the error is an HTTP response, not a mid-stream `error` event.
-/// `"auto"` is handled before this function is called and will never reach it.
-fn parse_kind(s: &str) -> AppResult<AgentKind> {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).map_err(|_| {
-        AppError::BadRequest(format!(
-            "unknown agent kind '{s}'; valid: auto, patient_lookup, health_query, trends, \
-             summarize, chat, multi_hop, query_rewrite, classify, extract, verify"
-        ))
+/// Parse the URL path segment into `(AgentKind, AgentMode)`. Unknown values are
+/// a `400` — never resolved to whichever agent happens to be first in a list.
+fn parse_kind(s: &str) -> AppResult<(AgentKind, AgentMode)> {
+    AgentKind::parse(s).ok_or_else(|| {
+        let valid = AgentKind::all()
+            .iter()
+            .map(|k| k.slug())
+            .collect::<Vec<_>>()
+            .join(", ");
+        AppError::BadRequest(format!("unknown agent kind '{s}'; valid: {valid}"))
     })
 }
 
@@ -983,134 +950,32 @@ fn token_event(text: &str) -> Event {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        can_run_docdb_aggregation, narrate_patient_rows, narrate_recent_rows,
-        should_try_deterministic_sql, sql_rows_to_agg_rows,
-    };
-    use crate::aggregation::catalog::{Catalog, CollectionMeta};
-    use crate::aggregation::intent::QueryIntent;
-    use crate::config::Config;
-    use crate::foundry::router::{AgentKind, ModelSpec};
+    use super::*;
+    use crate::ontology::service_line::ServiceLine;
 
     #[test]
-    fn health_query_dispatches_to_deterministic_sql_first() {
-        let question = "How many lab results were abnormal?";
-        assert!(should_try_deterministic_sql(
-            AgentKind::HealthQuery,
-            question
-        ));
-        assert!(!should_try_deterministic_sql(
-            AgentKind::PatientLookup,
-            question
-        ));
-        assert!(!should_try_deterministic_sql(
-            AgentKind::Summarize,
-            question
-        ));
-    }
-
-    #[test]
-    fn aggregation_planner_is_skipped_until_something_is_ingested() {
-        let structured = crate::router::RouteClass::Structured {
-            intent: QueryIntent::Aggregation,
-            backend: crate::router::StructuredBackend::DocDb,
-        };
-        let empty = Catalog::empty();
-        assert!(!can_run_docdb_aggregation(&structured, &empty));
-
-        let mut populated = Catalog::empty();
-        populated.collections.insert(
-            "patients".to_string(),
-            CollectionMeta {
-                label: "Patients".to_string(),
-                fields: Vec::new(),
-                concept: None,
-                service_lines: Vec::new(),
-            },
-        );
-        assert!(can_run_docdb_aggregation(&structured, &populated));
-        // Semantic questions never reach the planner, ingested data or not.
-        assert!(!can_run_docdb_aggregation(
-            &crate::router::RouteClass::Semantic,
-            &populated
-        ));
-    }
-
-    #[test]
-    fn semantic_followups_skip_deterministic_sql_for_structured_agents() {
-        for question in ["What are they about?", "Explain what those results mean."] {
-            assert!(!should_try_deterministic_sql(
-                AgentKind::HealthQuery,
-                question
-            ));
-            assert!(!should_try_deterministic_sql(AgentKind::Trends, question));
+    fn every_agent_slug_parses_and_unknown_ones_are_rejected() {
+        for kind in AgentKind::all() {
+            let (parsed, _) = parse_kind(kind.slug()).expect("roster slug must parse");
+            assert_eq!(parsed, kind);
         }
+        assert!(parse_kind("not_a_department").is_err());
     }
 
     #[test]
-    fn patient_lookup_dispatches_to_deterministic_sql_first() {
-        assert!(should_try_deterministic_sql(
-            AgentKind::PatientLookup,
-            "Find Jane Chebet's record."
-        ));
-    }
-
-    #[test]
-    fn summarize_dispatches_to_deterministic_recent_records() {
-        assert!(should_try_deterministic_sql(
-            AgentKind::Summarize,
-            "Give me an overview of the most recent encounters."
-        ));
-        assert!(!should_try_deterministic_sql(
-            AgentKind::Summarize,
-            "Summarize the encounter notes for Jane Chebet."
-        ));
-    }
-
-    #[test]
-    fn deterministic_recent_records_are_narrated_as_readable_lines() {
-        let answer = narrate_recent_rows(
-            &[
-                "encounter_date".into(),
-                "department".into(),
-                "chief_complaint".into(),
-            ],
-            &[vec![
-                serde_json::json!("2026-08-25"),
-                serde_json::json!("Surgery"),
-                serde_json::json!("Weight loss"),
-            ]],
-            "SELECT encounter_date, department, chief_complaint FROM encounters ORDER BY encounter_date DESC LIMIT 10",
-        );
-        assert_eq!(
-            answer,
-            "The 10 most recent encounters:\n2026-08-25 — Surgery — Weight loss"
-        );
-    }
-
-    #[test]
-    fn patient_lookup_generation_uses_configured_lookup_role() {
-        let mut config = Config::from_env();
-        config.router.lookup = "configured-lookup-model".to_string();
-        let spec = ModelSpec::for_kind(AgentKind::PatientLookup, &config);
-        assert_eq!(spec.alias, "configured-lookup-model");
-    }
-
-    #[test]
-    fn deterministic_patient_lookup_narrates_non_null_fields() {
-        let answer = narrate_patient_rows(
-            &[
-                "patient_no".into(),
-                "first_name".into(),
-                "middle_name".into(),
-            ],
-            &[vec![
-                serde_json::json!("SYN-2024-0001"),
-                serde_json::json!("Jane"),
-                serde_json::Value::Null,
-            ]],
-        );
-        assert_eq!(answer, "patient no: SYN-2024-0001, first name: Jane");
+    fn legacy_paths_still_resolve_to_ask() {
+        for (name, expected_mode) in [
+            ("health_query", AgentMode::Ask),
+            ("trends", AgentMode::Trends),
+            ("patient_lookup", AgentMode::Ask),
+            ("summarize", AgentMode::Handover),
+            ("chat", AgentMode::Ask),
+            ("auto", AgentMode::Ask),
+        ] {
+            let (kind, mode) = parse_kind(name).expect("legacy name must parse");
+            assert_eq!(kind, AgentKind::Ask, "legacy '{name}' maps to Ask");
+            assert_eq!(mode, expected_mode, "legacy '{name}' mode");
+        }
     }
 
     #[test]
@@ -1119,5 +984,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].label, "(all)");
         assert_eq!(rows[0].value, 16.0);
+    }
+
+    #[test]
+    fn line_agents_filter_retrieval_but_ask_does_not() {
+        let scope = vec!["deliveries".to_string()];
+        let line = RetrievalFilter::for_scope(
+            scope.clone(),
+            AgentKind::Line(ServiceLine::Maternity).scope_is_explicit(),
+        );
+        let ask = RetrievalFilter::for_scope(scope, AgentKind::Ask.scope_is_explicit());
+        assert!(line.explicit);
+        assert!(!ask.explicit);
     }
 }

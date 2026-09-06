@@ -35,6 +35,9 @@ pub struct RouterConfig {
     pub classify: String,     // ONPREM_MODEL_CLASSIFY  (intent router Tier 2)
     pub extractor: String,    // ONPREM_MODEL_EXTRACTOR
     pub verifier: String,     // ONPREM_MODEL_VERIFIER
+    /// Aggregation/QuerySpec planner role. Defaults to the text-to-SQL model because
+    /// planning a spec is the same deterministic, schema-bound task as emitting SQL.
+    pub plan_spec: String,    // ONPREM_MODEL_PLAN_SPEC (default: ONPREM_MODEL_TEXT2SQL)
     /// Maximum number of GPU-class models resident in memory simultaneously.
     /// NPU/CPU models are exempt — they live on separate silicon and keeping
     /// Defaults are consolidated onto one Qwen GPU model to bound resident memory.
@@ -51,6 +54,21 @@ pub struct RouterConfig {
     pub model_router_enabled: bool, // ONPREM_ROUTER_MODEL_ENABLED
     /// Capacity of the per-process Tier-2 route-decision LRU cache (entries).
     pub router_cache_size: usize, // ONPREM_ROUTER_CACHE_SIZE
+
+    // --- Intent router v3 (plan 02) ---
+    /// Master switch for router v3. When false (default), v2 `route()` decides
+    /// every request; v3 `route_v3()` is never called.  Plan 08 §4 step 3 flips
+    /// this to true after accuracy gates are met on staging.
+    pub router_v3_enabled: bool, // ONPREM_ROUTER_V3
+    /// Try the Tier-1.5 deterministic `QuerySpec` parse before escalating to
+    /// Tier-2 model.  True by default — this is the primary latency saving.
+    pub router_deterministic_first: bool, // ONPREM_ROUTER_DETERMINISTIC_FIRST
+    /// Emit `Clarify` SSE events when a required slot cannot be filled from the
+    /// question.  True by default; set false to fall through to Semantic instead.
+    pub router_clarify_enabled: bool, // ONPREM_ROUTER_CLARIFY_ENABLED
+    /// Minimum Tier-2 model confidence before the answer is accepted.  Queries
+    /// below this threshold with no focus context trigger a `Clarify(Subject)`.
+    pub router_model_min_confidence: f64, // ONPREM_ROUTER_MODEL_MIN_CONFIDENCE
 
     pub text2sql_enabled: bool,
     pub sql_model: String,
@@ -79,6 +97,9 @@ pub struct RouterConfig {
 
 impl RouterConfig {
     fn from_env() -> Self {
+        // PlanSpec defaults to whatever serves text-to-SQL, so a deployment that pins a
+        // SQL-tuned model automatically gets it for spec planning too.
+        let sql_model = env_or("ONPREM_MODEL_TEXT2SQL", "qwen3-8b");
         RouterConfig {
             chat: env_or("ONPREM_MODEL_CHAT", "qwen3-8b"),
             health_query: env_or("ONPREM_MODEL_HEALTH_QUERY", "qwen3-8b"),
@@ -89,14 +110,19 @@ impl RouterConfig {
             classify: env_or("ONPREM_MODEL_CLASSIFY", "qwen3-8b"),
             extractor: env_or("ONPREM_MODEL_EXTRACTOR", "qwen3-8b"),
             verifier: env_or("ONPREM_MODEL_VERIFIER", "qwen3-8b"),
+            plan_spec: env_or("ONPREM_MODEL_PLAN_SPEC", &sql_model),
             max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 1_usize),
             npu_enabled: env_parse("ONPREM_NPU_ENABLED", false),
             npu_ctx_cap: env_parse("ONPREM_NPU_CTX_CAP", 4224_u64),
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
+            router_v3_enabled: env_parse("ONPREM_ROUTER_V3", false),
+            router_deterministic_first: env_parse("ONPREM_ROUTER_DETERMINISTIC_FIRST", true),
+            router_clarify_enabled: env_parse("ONPREM_ROUTER_CLARIFY_ENABLED", true),
+            router_model_min_confidence: env_parse("ONPREM_ROUTER_MODEL_MIN_CONFIDENCE", 0.5_f64),
 
             text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", true),
-            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "qwen3-8b"),
+            sql_model,
             nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
             nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
             nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
@@ -121,6 +147,12 @@ impl RouterConfig {
         }
     }
 }
+
+/// Default minimum concept-binding confidence (`ONPREM_BINDING_MIN_CONFIDENCE`).
+///
+/// Named so callers that only need the default -- persona and capability
+/// answers, which have no `Config` in hand -- cannot drift from the env default.
+pub const DEFAULT_BINDING_MIN_CONFIDENCE: f32 = 0.55;
 
 /// Fully-resolved server configuration.
 #[derive(Debug, Clone)]
@@ -331,7 +363,10 @@ impl Config {
             schema_poll_concurrency: env_parse("ONPREM_SCHEMA_POLL_CONCURRENCY", 2_usize).max(1),
             schema_profile_sample_rows: env_parse("ONPREM_SCHEMA_PROFILE_SAMPLE_ROWS", 256_usize),
 
-            binding_min_confidence: env_parse("ONPREM_BINDING_MIN_CONFIDENCE", 0.55_f32),
+            binding_min_confidence: env_parse(
+                "ONPREM_BINDING_MIN_CONFIDENCE",
+                DEFAULT_BINDING_MIN_CONFIDENCE,
+            ),
             binding_enum_max: env_parse("ONPREM_BINDING_ENUM_MAX", 25_usize),
             binding_max_hops: env_parse("ONPREM_BINDING_MAX_HOPS", 3_usize),
             binding_enabled: env_parse("ONPREM_BINDING_ENABLED", true),

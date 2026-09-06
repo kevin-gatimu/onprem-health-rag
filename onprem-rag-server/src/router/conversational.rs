@@ -99,6 +99,34 @@ pub fn is_conversation_meta(message: &str) -> bool {
     META.is_match(message)
 }
 
+// Capability questions: "what can you do", "what data do you have", "help".
+// A strict subset of the identity/capability wording that can be answered
+// *factually* from the schema binding rather than improvised by a model.
+// End-anchored for the same reason `IDENTITY` is: "what data do you have on
+// Jane Chebet" is a records question, not a capability question.
+static CAPABILITY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^\s*(what\s+can\s+you\s+do|what\s+do\s+you\s+do|what\s+can\s+i\s+ask(\s+you)?(\s+about)?|what\s+(data|tables|records|information|info)\s+(do\s+you|can\s+you)\s+(have|see|access|read)|what\s+(data|information)\s+is\s+available|what\s+are\s+you\s+able\s+to\s+do|help|what\s+questions\s+can\s+i\s+ask)\s*[?.!]*\s*$",
+    )
+    .unwrap()
+});
+
+/// True when the message is a **capability** question ("what can you do?",
+/// "what data do you have?", "help") — answerable from the schema binding with
+/// no model call (plan 05 §5).
+///
+/// Deliberately a separate predicate from [`is_conversational`], which keeps its
+/// existing behaviour and fixtures: this one is consulted *first* by `route_v3`
+/// and by the agents endpoint, so a capability question gets the truthful,
+/// binding-derived answer instead of a model's guess. Conversation-meta
+/// questions are excluded for the same reason they are excluded there.
+pub fn is_capability(message: &str) -> bool {
+    if is_conversation_meta(message) {
+        return false;
+    }
+    CAPABILITY.is_match(message)
+}
+
 // ---------------------------------------------------------------------------
 // Tests — ≥20 positive / ≥20 negative fixtures, per the plan's Phase A gate.
 // ---------------------------------------------------------------------------
@@ -106,6 +134,33 @@ pub fn is_conversation_meta(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 05 §5: capability questions are recognised as their own class.
+    /// `is_conversational` keeps its existing behaviour — these fixtures assert
+    /// the new predicate only.
+    #[test]
+    fn capability_questions_are_recognised() {
+        for yes in [
+            "what can you do?",
+            "What can you do",
+            "what data do you have?",
+            "What tables can you see?",
+            "what can I ask you about?",
+            "help",
+            "What questions can I ask?",
+        ] {
+            assert!(is_capability(yes), "expected capability: {yes:?}");
+        }
+        for no in [
+            "what data do you have on Jane Chebet",
+            "help me find patient records",
+            "how many deliveries last month",
+            "what have I asked so far?",
+            "hello",
+        ] {
+            assert!(!is_capability(no), "expected NOT capability: {no:?}");
+        }
+    }
 
     #[test]
     fn positive_conversational_fixtures() {
