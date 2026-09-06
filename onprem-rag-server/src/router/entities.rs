@@ -177,6 +177,78 @@ pub fn extract_entities(
 // Scoring helpers
 // ---------------------------------------------------------------------------
 
+/// Return `true` when vocabulary term `kw` should score against lower-cased
+/// question `q`.
+///
+/// **Why two strategies?**  The existing substring test handles inflections
+/// where one form contains the other as a literal prefix: "billing" ↔ "bill",
+/// "patients" ↔ "patient".  It misses divergent-suffix inflections: the
+/// Pharmacy vocabulary contains "expiry" (service_line.rs:235) but the
+/// question "What expires within 30 days?" contains the token "expires".
+/// Both share the stem "expir" (5 chars) yet neither is a substring of the
+/// other, so `q.contains("expiry")` returns `false` and Pharmacy scores 0.
+///
+/// The shared-prefix strategy fixes this class of mismatch by tokenising `q`
+/// on non-alphanumeric boundaries and comparing each token with `kw`
+/// character by character.  A match is declared when the common prefix is at
+/// least **5 characters** — a deliberate caller-set floor; do not adjust it
+/// here.
+///
+/// Assumes `q` has already been lowercased by the caller (see line 99).
+/// A term matches **at most once** regardless of how many tokens satisfy the
+/// rule — the caller counts matched terms, and double-counting would silently
+/// skew `vocab_score` against the 2.0-weighted `concept_score`.
+fn vocab_term_matches(kw: &str, q: &str) -> bool {
+    // Strategy 1 — substring: handles inflections where one form is a prefix
+    // of the other ("billing" ↔ "bill", "patients" ↔ "patient").
+    if q.contains(kw) {
+        return true;
+    }
+
+    // Strategy 2 — shared prefix, restricted to **suffix-divergent** pairs:
+    // neither string may be a prefix of the other.
+    //
+    // That restriction is what keeps the rule from stealing questions between
+    // service lines. The two cross-line collisions a looser version introduced
+    // were both prefix-containment pairs — a bare token "clinic" matching
+    // PatientChart's "clinical", and "shift" matching Workforce's "shifts" —
+    // and in the first case strict `>` tie-breaking in the caller hands the
+    // question to whichever line appears earlier in `ServiceLine::ALL`, so the
+    // false hit can actually win. Prefix containment is also asymmetric in a way
+    // that carries meaning: a question that says "clinic" is not saying
+    // "clinical", and strategy 1 above already covers the direction that does
+    // ("clinical" in the question matching the term "clinic").
+    //
+    // The case this rule exists for diverges in the suffix instead:
+    // "expiry"/"expires" share "expir" and then split, so neither contains nor
+    // prefixes the other, and no amount of substring matching will connect them.
+    if kw.len() < 5 {
+        return false;
+    }
+
+    // Tokenise on non-alphanumeric boundaries so punctuation and possessives
+    // (e.g. "expires?", "30-day") do not defeat the match.
+    for token in q.split(|c: char| !c.is_alphanumeric()) {
+        if token.len() < 5 {
+            continue; // token too short to reach the 5-char floor
+        }
+        // Prefix-containment pairs are strategy 1's business, not this rule's.
+        if kw.starts_with(token) || token.starts_with(kw) {
+            continue;
+        }
+        let shared = kw
+            .chars()
+            .zip(token.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if shared >= 5 {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Weighted argmax over all 13 service lines.
 ///
 /// Score per line:
@@ -210,7 +282,7 @@ fn score_service_lines(
         let vocab_score = line
             .vocabulary()
             .iter()
-            .filter(|&&kw| q.contains(kw))
+            .filter(|&&kw| vocab_term_matches(kw, q))
             .count() as f64;
 
         let focus_bonus = focus

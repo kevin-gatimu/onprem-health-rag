@@ -1770,16 +1770,22 @@ mod tests {
         // follows a *behaviour* change; it was not edited to match broken
         // behaviour.
         //
-        // `theatre-list-tomorrow` and `pharmacy-expiry` still FAIL, deliberately.
-        // Both are real router defects, not stale expectations: "What is on
-        // tomorrow's list?" and "What expires within 30 days?" are structured
-        // enumerations over `surgeries.scheduled_start` and
-        // `stock_batches.expiry_date` respectively, and routing them to semantic
-        // retrieval answers the wrong question. `aggregation::intent` records the
-        // marker removal that caused it and calls the two rows an accepted cost.
-        // They stay red so the defect stays visible; 30/32 = 0.9375 is the honest
-        // floor. Flipping either row to `semantic` would convert a known bug into
-        // a silent pass and is not permitted.
+        // `theatre-list-tomorrow` and `pharmacy-expiry` now pass, and no fixture
+        // row was edited to get there — three matcher defects were fixed instead:
+        //   • `aggregation::intent::contains_any` treated a marker's trailing
+        //     space as a word boundary but only honoured it mid-string, so
+        //     `"list "` never matched "tomorrow's list?".
+        //   • `what` was missing from the interrogative-enumeration family that
+        //     already held `which`/`who`/`whose`, so "What expires…" got no intent.
+        //   • `router::entities::vocab_score` matched vocabulary by naked
+        //     substring, so the verb "expires" missed the noun "expiry" and no
+        //     service line won.
+        // All three were general defects with the same shape, each fixed without
+        // touching a marker list, a vocabulary, or this fixture. 32/32 = 1.000.
+        //
+        // The gate stays at 0.93 rather than being ratcheted to 1.000: the human
+        // sets floors, and a floor pinned to a perfect score turns any future
+        // honest regression into a blocked build rather than a visible number.
         assert!(
             dev_acc >= 0.93,
             "dev binding v3 route accuracy {:.3} below 0.93 gate ({dev_route_ok}/{dev_judged}); \
