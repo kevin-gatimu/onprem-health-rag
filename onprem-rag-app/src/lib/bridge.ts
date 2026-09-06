@@ -963,11 +963,18 @@ export interface StoredMessage {
   structured?: StructuredResult;
   /** Present for chat answers backed by a live operational SQL query. */
   sql_result?: SqlResult;
+  /**
+   * Mode the answer was produced in. VERIFIED: `MessageOut.mode`,
+   * `onprem-rag-server/src/routes/conversations.rs` L72 (`#[serde(skip_serializing_if
+   * = "Option::is_none")]`, so it is absent — never null — on messages written
+   * before plan 05).
+   */
+  mode?: AgentMode;
   // ── SPEC-DERIVED, UNCONFIRMED ─────────────────────────────────────────────
   // The server's persisted message DTO is `MessageOut` in
-  // `onprem-rag-server/src/routes/conversations.rs` L57-76. As of this commit it
-  // carries only `id`, `role`, `content`, `citations`, `verify`, `agent_kind`,
-  // `structured`, `sql_result`, `created_at` — NONE of the six fields below.
+  // `onprem-rag-server/src/routes/conversations.rs` L57-80. As of this commit it
+  // carries `id`, `role`, `content`, `citations`, `verify`, `agent_kind`, `mode`,
+  // `structured`, `sql_result`, `created_at` — but NONE of the five fields below.
   // They are mirrored ahead of plans 04/06 landing, and each is optional so an
   // absent field is simply undefined rather than a parse error. Re-verify every
   // one of them against `MessageOut` before treating any as delivered.
@@ -981,8 +988,6 @@ export interface StoredMessage {
   focus_used?: string[];
   /** Clarification request — present when the router could not resolve a slot (plan 06). */
   clarify?: ClarifyPayload;
-  /** Mode the conversation was in when this answer was produced (plan 07). */
-  mode?: AgentMode;
 }
 
 /**
@@ -999,9 +1004,18 @@ export interface ChatEvent {
 /** The five slot types that can trigger a Clarify decision. */
 export type MissingSlot = "subject" | "patient" | "time_range" | "dimension" | "metric";
 
-/** Route class label as emitted by the server's `route_label()`. */
+/**
+ * Route class label as emitted by the server's `route_label()`.
+ *
+ * VERIFIED, exhaustive against `RouteDecision::route_label`
+ * (`onprem-rag-server/src/router/mod.rs` L152-161). `"capability"` is the plan-05
+ * addition: `RouteClass::Capability` (same file, L80) is produced by
+ * `capability_decision` (`onprem-rag-server/src/agents/routes.rs` L585-597) and by
+ * the `/chat` capability arm (`onprem-rag-server/src/rag/routes.rs` L335).
+ */
 export type RouteLabel =
   | "conversational"
+  | "capability"
   | "conversation_meta"
   | "structured"
   | "semantic"
@@ -1205,14 +1219,17 @@ export interface AgentSourceScope {
  *
  * This is NOT the raw `GET /agents` body. The server answers with
  * `{service_lines: [...], source_usable_lines: {...}}`
- * (`onprem-rag-server/src/ontology/routes.rs` `AgentsResponse`, VERIFIED); the Rust
- * bridge folds that — plus `GET /sources/<id>/binding` for table scopes — into this
- * flat shape. See `AgentInfo` in `src-tauri/src/commands.rs` for the per-field
- * provenance table.
+ * (`onprem-rag-server/src/agents/registry.rs` `AgentsResponse` L54-59, VERIFIED — the
+ * route moved out of `ontology/routes.rs` in plan 05 §8); the Rust bridge folds that —
+ * plus `GET /sources/<id>/binding` for table scopes — into this flat shape. See
+ * `AgentInfo` in `src-tauri/src/commands.rs` for the per-field provenance table.
  *
- * `modes` is the one **spec-derived** field: the server reports no per-line modes and
- * `POST /agents/<kind>` ignores the `mode` body field, so the bridge defaults it to
- * `["ask"]` and the Trends/Handover toggle stays hidden until a server emits it.
+ * `modes` and `example_questions` are REAL server fields, not synthesised:
+ * `ServiceLineInfo.modes` (`agents/registry.rs` L44, filled from `AgentMode::ALL` at
+ * L83) and `ServiceLineInfo.example_questions` (same file L41, the answerable-only
+ * list from `persona::bound_examples`). The bridge only falls back to `["ask"]` /
+ * the unfiltered `examples` when a server omits the field entirely — never over a
+ * value the server actually sent, including an explicitly empty one.
  */
 export interface AgentInfo {
   kind: AgentKind;

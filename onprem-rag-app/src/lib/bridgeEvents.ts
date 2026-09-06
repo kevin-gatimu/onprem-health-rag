@@ -148,10 +148,11 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
-  // The `/chat` route emits the FULL routed decision object (verified:
-  // `RouteDecision::to_sse_json()` in onprem-rag-server/src/rag/routes.rs), which is
-  // what carries `service_line` and `deterministic`. The agent route, by contrast,
-  // still emits a bare kind string — see the agent://routed listener below.
+  // BOTH the `/chat` route (onprem-rag-server/src/rag/routes.rs L332) and the
+  // `/agents/<kind>` route (onprem-rag-server/src/agents/routes.rs L408) emit the FULL
+  // routed decision object — `RouteDecision::to_sse_json()`, which is what carries
+  // `service_line` and `deterministic`. The agent://routed listener below still accepts
+  // the pre-plan-05 bare kind string as a compatibility floor.
   unlisteners.push(
     await listen<ChatEvent>("chat://routed", (ev) => {
       const { run_id, data } = ev.payload;
@@ -269,10 +270,11 @@ export async function initBridgeEvents(): Promise<void> {
       try {
         const parsed = JSON.parse(data);
         if (typeof parsed === "string") {
-          // Legacy: server emits a bare kind string.
+          // Pre-plan-05 compatibility floor: server emitted a bare kind string.
           useAgents.getState().setRouted(run_id, parsed as AgentKind);
         } else if (parsed && typeof parsed === "object" && "route" in parsed) {
-          // Plan 07: full RoutedEvent object with backend, deterministic, focus_used, etc.
+          // CURRENT (plan 05): `RouteDecision::to_sse_json()` — a full RoutedEvent
+          // object with route/backend/service_line/deterministic/scope_size.
           useAgents.getState().setRoutedFull(run_id, parsed as RoutedEvent);
         } else {
           // Unexpected shape — extract kind best-effort.

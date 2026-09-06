@@ -2723,7 +2723,16 @@ pub async fn list_agent_conversations(
 }
 
 /// `POST /agents/<kind>` — AI Agents SSE endpoint. The server emits a `routed` event
-/// first (payload: the resolved agent kind as a JSON string), then path-specific events.
+/// first, then path-specific events.
+///
+/// VERIFIED (plan 05): the `routed` payload is a JSON **object** —
+/// `RouteDecision::to_sse_json()` (`onprem-rag-server/src/router/mod.rs` L179-235),
+/// assigned at `onprem-rag-server/src/agents/routes.rs` L408 and yielded as the first
+/// event. It carries `route` / `intent` / `backend` / `tier` / `cached` /
+/// `tier2_attempted`, plus `service_line` / `deterministic` / `scope_size` /
+/// `source_id` on the v3 paths, plus `question` / `slot` for a clarify route. It is
+/// NOT the bare JSON-encoded agent-kind string the pre-plan-05 server sent.
+/// The relay below is deliberately verbatim, so the shape stays the server's.
 ///
 /// New optional parameters (plan 05 / 06 / 07):
 ///   `mode`           — "ask" | "trends" | "handover" (plan 07 mode toggle).
@@ -2792,7 +2801,11 @@ pub async fn agent(
             while let Some(event) = events.next().await {
                 let event = event.map_err(|e| format!("stream error: {e}"))?;
                 match event.event.as_str() {
-                    // First event: the server's resolved agent kind (JSON-encoded string).
+                    // First event: the full `RouteDecision` object (see this command's
+                    // doc comment). Relayed VERBATIM — do not `decode_token` it and do
+                    // not re-encode it; the frontend parses the object in
+                    // `bridge.ts::parseRoutedPayload`. Treating it as a JSON string here
+                    // is the pre-plan-05 behaviour and would mangle the payload.
                     "routed" => {
                         let _ = app.emit(
                             "agent://routed",
@@ -3018,7 +3031,7 @@ pub async fn list_agents(bridge: State<'_, Bridge>) -> Result<Vec<AgentInfo>, St
 }
 
 /// `GET /sources/<id>/binding` — full schema binding for a source: coverage per service
-/// line, orphan tables, confidence scores, and history diff. Admin only.
+/// line, orphan tables, confidence scores, and history diff. Any authenticated user.
 #[tauri::command]
 pub async fn get_source_binding(
     source_id: String,
