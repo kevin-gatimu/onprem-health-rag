@@ -4,11 +4,11 @@ The optional `dev-postgres` service is a stand-in for a hospital's operational
 database, so ingestion, text-to-SQL and the agent tabs can be exercised end to end
 without a real EMR.
 
-| File | Purpose |
-| --- | --- |
+| File                                        | Purpose                                                                                                                                      |
+| ------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`init/01_schema.sql`](init/01_schema.sql) | 64-table hospital schema (organisation, staffing, scheduling, clinical, maternity, pharmacy stock, blood bank, safety, operations, revenue). |
-| [`init/02_seed.sql`](init/02_seed.sql) | Generated data. **Do not edit by hand.** |
-| [`generate_seed.py`](generate_seed.py) | Deterministic generator that writes `02_seed.sql`. Standard library only. |
+| [`init/02_seed.sql`](init/02_seed.sql)     | Generated data.**Do not edit by hand.**                                                                                                |
+| [`generate_seed.py`](generate_seed.py)     | Deterministic generator that writes`02_seed.sql`. Standard library only.                                                                   |
 
 ## Regenerating the data
 
