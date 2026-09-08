@@ -3,13 +3,13 @@
 {"id":"identity","question":"What can you do?","route_expected":"capability","intent_expected":null}
 {"id":"count","question":"How many patients have diabetes?","route_expected":"structured","intent_expected":"aggregation"}
 {"id":"trend","question":"Show the trend of malaria cases per month","route_expected":"structured","intent_expected":"trend"}
-{"id":"tier2-semantic","question":"Review recent clinical notes for patient SYN-P0001","route_expected":"semantic","intent_expected":null,"tier_expected":2}
+{"id":"tier2-semantic","question":"Review recent clinical notes for patient PT-00006","route_expected":"semantic","intent_expected":null,"tier_expected":2}
 {"id":"enumeration","question":"List all patients","route_expected":"structured","intent_expected":"enumeration"}
 {"id":"distribution","question":"Show the distribution of patients by blood type","route_expected":"structured","intent_expected":"aggregation"}
 {"id":"ranking","question":"Show the top diagnoses by count","route_expected":"structured","intent_expected":"aggregation"}
-{"id":"lookup","question":"Find patient SYN-P0001","route_expected":"semantic","intent_expected":null}
+{"id":"lookup","question":"Find patient PT-00006","route_expected":"semantic","intent_expected":null}
 {"id":"narrative","question":"Explain what hypertension means","route_expected":"semantic","intent_expected":null}
-{"id":"patient-history","question":"Show the patient history for SYN-P0002","route_expected":"semantic","intent_expected":null}
+{"id":"patient-history","question":"Show the patient history for PT-00002","route_expected":"semantic","intent_expected":null}
 {"id":"clinical-greeting-guard","question":"Hey how many patients have diabetes?","route_expected":"structured","intent_expected":"aggregation"}
 {"id":"ward-bed-count","question":"How many beds are free in ICU?","route_expected":"structured","intent_expected":"aggregation","service_line_expected":"ward_board"}
 {"id":"ward-admitted-now","question":"Who is admitted right now?","route_expected":"structured","intent_expected":"enumeration","service_line_expected":"ward_board"}

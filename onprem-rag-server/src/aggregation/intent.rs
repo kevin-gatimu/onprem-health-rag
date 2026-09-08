@@ -658,7 +658,7 @@ mod tests {
     #[test]
     fn lookup_not_stolen_by_which_marker() {
         assert_eq!(
-            classify_lexical("Find patient SYN-P0001"),
+            classify_lexical("Find patient PT-00006"),
             Some(QueryIntent::Lookup)
         );
         assert_eq!(

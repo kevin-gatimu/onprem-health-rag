@@ -1,7 +1,7 @@
-{"id":"metformin","query":"Metformin Glucophage antidiabetic 500mg tablet","expected_id_contains":":medication_catalog:1:","top_k":6}
-{"id":"amlodipine","query":"Amlodipine Norvasc antihypertensive 5mg tablet","expected_id_contains":":medication_catalog:2:","top_k":6}
-{"id":"coartem","query":"Artemether Lumefantrine Coartem antimalarial 20/120mg","expected_id_contains":":medication_catalog:4:","top_k":6}
-{"id":"ventolin","query":"Salbutamol Ventolin bronchodilator inhaler 100mcg","expected_id_contains":":medication_catalog:7:","top_k":6}
-{"id":"ferrous-sulphate","query":"Ferrous Sulphate FeSO4 iron supplement 200mg","expected_id_contains":":medication_catalog:11:","top_k":6}
-{"id":"penicillin-allergy","query":"Penicillin allergy Cephalosporins cross-reactive","expected_id_contains":":allergen_catalog:1:","top_k":6}
-{"id":"shellfish-allergy","query":"Shellfish allergy crustaceans molluscs","expected_id_contains":":allergen_catalog:6:","top_k":6}
+{"id": "metformin", "query": "Metformin Glucophage antidiabetic 500mg tablet", "expected_id_contains": ":medication_catalog:17:", "top_k": 6}
+{"id": "amlodipine", "query": "Amlodipine Norvasc antihypertensive 5mg tablet", "expected_id_contains": ":medication_catalog:19:", "top_k": 6}
+{"id": "coartem", "query": "Artemether Lumefantrine Coartem antimalarial 20/120mg", "expected_id_contains": ":medication_catalog:13:", "top_k": 6}
+{"id": "ventolin", "query": "Salbutamol Ventolin bronchodilator inhaler 100mcg", "expected_id_contains": ":medication_catalog:27:", "top_k": 6}
+{"id": "ferrous-sulphate", "query": "Ferrous Sulphate FeSO4 iron supplement 200mg", "expected_id_contains": ":medication_catalog:35:", "top_k": 6}
+{"id": "penicillin-allergy", "query": "Penicillin allergy Cephalosporins cross-reactive", "expected_id_contains": ":allergen_catalog:1:", "top_k": 6}
+{"id": "shellfish-allergy", "query": "Shellfish allergy crustaceans molluscs", "expected_id_contains": ":allergen_catalog:9:", "top_k": 6}
