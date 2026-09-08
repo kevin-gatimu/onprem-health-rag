@@ -9,7 +9,7 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, parseRoutedPayload, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow, type ModelEvent, type Provenance, type RoutedEvent, type StageEvent, type Suggestion, type VerifyReport, type ClarifyPayload } from "./bridge";
+import { startLogStream, parseRoutedPayload, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AgentPage, type AggRow, type ModelEvent, type Provenance, type RoutedEvent, type StageEvent, type Suggestion, type VerifyReport, type ClarifyPayload } from "./bridge";
 import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
 import { notifyBackground } from "./notify";
@@ -325,11 +325,26 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // Enumeration answers arrive as `page` then `rows`. Ordered that way by the server so
+  // this listener knows, before the rows land, that they are whole records rather than
+  // chart pairs — see the `rows` handler below.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://page", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setPage(run_id, JSON.parse(data) as AgentPage);
+      } catch {
+        /* ignore malformed page payload */
+      }
+    }),
+  );
+
   // `rows` is the one ambiguous agent event: the structured path sends chart rows
-  // (`[{label, value}]`) while a SQL result would send positional rows
-  // (`[[...], ...]`). They are told apart STRUCTURALLY — an array-of-arrays is a
-  // SQL result — not by guessing which one the server meant. Today only the chart
-  // shape is ever emitted (`onprem-rag-server/src/agents/routes.rs`).
+  // (`[{label, value}]`), an enumeration sends whole records, and a SQL result would
+  // send positional rows (`[[...], ...]`). They are told apart STRUCTURALLY — an
+  // array-of-arrays is a SQL result — never by guessing which the server meant.
+  // A preceding `page` marks the enumeration case; without it, charting a record row
+  // renders a bar per column with no label.
   unlisteners.push(
     await listen<ChatEvent>("agent://rows", (ev) => {
       const { run_id, data } = ev.payload;
@@ -338,6 +353,8 @@ export async function initBridgeEvents(): Promise<void> {
         if (!Array.isArray(parsed)) return;
         if (parsed.length > 0 && Array.isArray(parsed[0])) {
           useAgents.getState().setSqlRows(run_id, parsed as unknown[][]);
+        } else if (useAgents.getState().runs[run_id]?.page) {
+          useAgents.getState().setListRows(run_id, parsed as Record<string, unknown>[]);
         } else {
           useAgents.getState().setRows(run_id, parsed as AggRow[]);
         }

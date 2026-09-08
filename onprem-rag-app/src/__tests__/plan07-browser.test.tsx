@@ -350,6 +350,8 @@ describe("MessageBubble — clarify block", () => {
       user: "What is the admission rate?",
       answer: "",
       citations: [],
+      listRows: null,
+      page: null,
       rows: null,
       spec: null,
       pipeline: null,
