@@ -211,7 +211,7 @@ pub async fn agent(
             agent_kind,
             &req.question,
             binding.as_deref(),
-            None,
+            crate::agents::kind::scope_widening_key(&req.question).as_deref(),
         ) {
             let message = redirect.message.clone();
             (
