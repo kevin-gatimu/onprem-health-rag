@@ -17,6 +17,14 @@ pub struct AdmissionControl {
     ingestion_by_source: Mutex<HashMap<String, Weak<Semaphore>>>,
     per_source_ingestion: usize,
     wait: Duration,
+    /// How long a chat request waits for its turn to generate.
+    ///
+    /// Much longer than `wait`, because generation is deliberately capped at one at a
+    /// time: ONNX Runtime's WebGPU execution provider corrupts its own device state when
+    /// two generations overlap, which kills whichever process is hosting the model. So a
+    /// second asker is not overload to shed — it is a normal caller that must queue.
+    /// Rejecting it after 2 s would turn "wait your turn" into "your question failed".
+    generation_wait: Duration,
 }
 
 pub struct IngestPermit {
@@ -33,6 +41,7 @@ impl AdmissionControl {
             ingestion_by_source: Mutex::new(HashMap::new()),
             per_source_ingestion: config.max_ingestions_per_source.max(1),
             wait: Duration::from_millis(config.admission_timeout_ms.max(1)),
+            generation_wait: Duration::from_millis(config.generation_queue_timeout_ms.max(1)),
         }
     }
 
@@ -45,8 +54,12 @@ impl AdmissionControl {
     }
 
     pub async fn generation(&self) -> AppResult<OwnedSemaphorePermit> {
-        self.acquire(self.generation.clone(), "generation capacity is busy")
-            .await
+        self.acquire_within(
+            self.generation.clone(),
+            "generation capacity is busy",
+            self.generation_wait,
+        )
+        .await
     }
 
     pub async fn retrieval(&self) -> AppResult<OwnedSemaphorePermit> {
@@ -88,12 +101,21 @@ impl AdmissionControl {
         semaphore: Arc<Semaphore>,
         message: &'static str,
     ) -> AppResult<OwnedSemaphorePermit> {
-        timeout(self.wait, semaphore.acquire_owned())
+        self.acquire_within(semaphore, message, self.wait).await
+    }
+
+    async fn acquire_within(
+        &self,
+        semaphore: Arc<Semaphore>,
+        message: &'static str,
+        wait: Duration,
+    ) -> AppResult<OwnedSemaphorePermit> {
+        timeout(wait, semaphore.acquire_owned())
             .await
             .map_err(|_| {
                 AppError::TooManyRequests(format!(
                     "{message}; retry after {} ms",
-                    self.wait.as_millis()
+                    wait.as_millis()
                 ))
             })?
             .map_err(|_| AppError::Unavailable("admission control is shutting down".into()))
@@ -112,6 +134,7 @@ mod tests {
             ingestion_by_source: Mutex::new(HashMap::new()),
             per_source_ingestion: 1,
             wait: Duration::from_millis(wait_ms),
+            generation_wait: Duration::from_millis(wait_ms),
         }
     }
 

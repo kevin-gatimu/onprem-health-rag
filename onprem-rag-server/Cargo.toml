@@ -52,6 +52,14 @@ sqlparser = { version = "0.53", default-features = false, features = ["std", "vi
 # LRU cache for repeated embed_query calls (same query text -> cached vector).
 lru = "0.12"
 sysinfo = "0.39.6"
+# Chat generation talks to the Foundry Local daemon over its OpenAI-compatible HTTP API rather
+# than the SDK's in-process core, which fail-fasts this process on concurrent requests
+# (plans/docs/foundry-local-webgpu-concurrency-crash.md). `stream` is what makes SSE token
+# streaming possible without buffering the whole completion.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# Reassembling SSE records from a byte stream reads far better as a generator than as an
+# `unfold` over a hand-rolled state machine. Already in the tree via Rocket; made direct.
+async-stream = "0.3"
 
 # Windows uses the WinML-backed native engine loader for Foundry Local.
 [target.'cfg(windows)'.dependencies]

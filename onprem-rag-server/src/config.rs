@@ -5,6 +5,17 @@
 
 use std::env;
 
+/// Where chat generation executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundryBackend {
+    /// The standalone `foundry` daemon, over its OpenAI-compatible HTTP API. A native
+    /// fault kills the daemon, not this server, and concurrent callers queue.
+    Service,
+    /// The SDK's native core, loaded into this process. Concurrent chat requests
+    /// fail-fast the server here; kept only for hosts without the daemon.
+    InProcess,
+}
+
 /// Retrieval mode for the RAG pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalMode {
@@ -201,6 +212,30 @@ pub struct Config {
     /// even after the real cache moved. `None` = let the SDK choose.
     pub foundry_cache_dir: Option<String>,
 
+    /// Where chat generation runs. `service` (default) calls the standalone `foundry`
+    /// daemon over HTTP; `in_process` uses the SDK's native core in this process.
+    ///
+    /// `in_process` is retained for hosts with no daemon installed, but it is the mode
+    /// that dies on a second concurrent chat request — see
+    /// `plans/docs/foundry-local-webgpu-concurrency-crash.md`.
+    /// Largest prompt (system + user, bytes) sent to a chat model.
+    ///
+    /// Above ~20 KB the WebGPU execution provider crashes the process hosting the model
+    /// instead of erroring — measured, with the context window nowhere near full. Kept
+    /// well under that; raise only if the execution provider is fixed or changed.
+    pub prompt_max_bytes: usize,
+    /// Collections shown to the aggregation planner, most relevant first.
+    ///
+    /// The whole catalog is 63 tables here and renders to ~24 KB of prompt — over the
+    /// size that kills the model host. Narrowing by whole collections keeps the schema
+    /// coherent where a byte-level cut would not.
+    pub planner_max_collections: usize,
+    pub foundry_backend: FoundryBackend,
+    /// Base URL of the `foundry` daemon. `None` = discover it from
+    /// `~/.foundry/daemon.json`, which the daemon rewrites on every start (the port is
+    /// assigned per start, so it must never be hardcoded).
+    pub foundry_service_url: Option<String>,
+
     // Embeddings (fastembed / ONNX Runtime, local — shares the reranker's stack)
     pub embedding_model: String,
     pub embedding_dims: usize,
@@ -230,6 +265,13 @@ pub struct Config {
     pub max_active_ingestions: usize,
     pub max_ingestions_per_source: usize,
     pub admission_timeout_ms: u64,
+    /// How long a chat request queues for its turn to generate, in ms.
+    ///
+    /// Separate from `admission_timeout_ms` because generation is capped at one at a
+    /// time on purpose (see `max_active_generations`), so a waiting caller is queued,
+    /// not overloaded. Shedding it after the usual 2 s would fail ordinary questions
+    /// whenever two people ask at once.
+    pub generation_queue_timeout_ms: u64,
 
     // Query expansion
     pub multi_query_enabled: bool,
@@ -305,6 +347,25 @@ pub struct Config {
 impl Config {
     /// Load configuration from the environment, applying sensible development defaults.
     pub fn from_env() -> Self {
+        let config = Config::read_env();
+        // Raising the cap is a footgun on either backend, but on the in-process core it
+        // takes the whole API down rather than just the model host, so that one is not
+        // left to the operator.
+        if config.foundry_backend == FoundryBackend::InProcess && config.max_active_generations > 1
+        {
+            tracing::warn!(
+                requested = config.max_active_generations,
+                "ONPREM_FOUNDRY_BACKEND=in_process cannot serve concurrent chat requests;                  clamping ONPREM_MAX_ACTIVE_GENERATIONS to 1"
+            );
+            return Config {
+                max_active_generations: 1,
+                ..config
+            };
+        }
+        config
+    }
+
+    fn read_env() -> Self {
         Config {
             bind_address: env_or("ONPREM_BIND_ADDRESS", "0.0.0.0"),
             port: env_parse("ONPREM_PORT", 8000),
@@ -343,6 +404,29 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .or_else(foundry_cli_cache_dir),
+            prompt_max_bytes: env_parse("ONPREM_PROMPT_MAX_BYTES", 16_000_usize),
+            planner_max_collections: env_parse("ONPREM_PLANNER_MAX_COLLECTIONS", 12_usize),
+            foundry_backend: match env_or("ONPREM_FOUNDRY_BACKEND", "service")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "in_process" | "in-process" | "inprocess" | "native" => {
+                    FoundryBackend::InProcess
+                }
+                "service" | "daemon" | "http" => FoundryBackend::Service,
+                other => {
+                    tracing::warn!(
+                        backend = other,
+                        "unknown ONPREM_FOUNDRY_BACKEND; using the service daemon"
+                    );
+                    FoundryBackend::Service
+                }
+            },
+            foundry_service_url: env::var("ONPREM_FOUNDRY_SERVICE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().trim_end_matches('/').to_string()),
             // fastembed EmbeddingModel variant name (ORT path). BGE-M3 is 1024-dim,
             // multilingual, prefix-free, and GPU/DirectML-capable on this host.
             embedding_model: env_or("ONPREM_EMBEDDING_MODEL", "bge-m3"),
@@ -364,11 +448,22 @@ impl Config {
                 .or(Some(0.30)),
             warmup_enabled: env_parse("ONPREM_WARMUP_ENABLED", true),
 
-            max_active_generations: env_parse("ONPREM_MAX_ACTIVE_GENERATIONS", 2_usize),
+            // 1, deliberately. ONNX Runtime's WebGPU execution provider corrupts its own
+            // device state when two generations overlap ("[CommandEncoder] is already
+            // finished", "[Invalid CommandBuffer]"), taking down whichever process hosts
+            // the model. Running chat in the daemon means that kills the daemon rather
+            // than this server, but it is still an outage — so overlap is prevented here
+            // and the second caller queues. See
+            // `plans/docs/foundry-local-webgpu-concurrency-crash.md`.
+            max_active_generations: env_parse("ONPREM_MAX_ACTIVE_GENERATIONS", 1_usize),
             max_active_retrievals: env_parse("ONPREM_MAX_ACTIVE_RETRIEVALS", 4_usize),
             max_active_ingestions: env_parse("ONPREM_MAX_ACTIVE_INGESTIONS", 1_usize),
             max_ingestions_per_source: env_parse("ONPREM_MAX_INGESTIONS_PER_SOURCE", 1_usize),
             admission_timeout_ms: env_parse("ONPREM_ADMISSION_TIMEOUT_MS", 2_000_u64),
+            generation_queue_timeout_ms: env_parse(
+                "ONPREM_GENERATION_QUEUE_TIMEOUT_MS",
+                300_000_u64,
+            ),
 
             multi_query_enabled: env_parse("ONPREM_MULTI_QUERY_ENABLED", true),
             multi_query_count: env_parse("ONPREM_MULTI_QUERY_COUNT", 3),
