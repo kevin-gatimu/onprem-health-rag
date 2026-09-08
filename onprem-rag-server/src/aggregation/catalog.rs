@@ -195,6 +195,65 @@ impl Catalog {
     }
 
     /// Build a compact schema summary string for the planner system prompt.
+    /// The `max` collections most relevant to `question`, as a new catalog.
+    ///
+    /// The planner prompt renders every collection with every field, which for an
+    /// unscoped Ask question is all 63 tables — about 24 KB, past the size at which the
+    /// WebGPU execution provider kills the model host
+    /// (`plans/docs/foundry-local-webgpu-concurrency-crash.md`). The blunt byte cap that
+    /// guards that limit would slice a table in half and leave the planner with a
+    /// malformed schema, so the catalog is narrowed here instead: whole collections, kept
+    /// or dropped intact, so whatever survives is still coherent.
+    ///
+    /// This narrows only what the *planner is shown*. Validation still runs against the
+    /// full scoped catalog, so this can never widen what a spec is allowed to touch.
+    pub fn most_relevant(&self, question: &str, max: usize) -> Catalog {
+        if self.collections.len() <= max {
+            // `Catalog` is not `Clone`; rebuild the same shape rather than deriving it
+            // just for this path.
+            return Catalog {
+                collections: self.collections.clone(),
+                code_vocab: self.code_vocab.clone(),
+                synonyms: self.synonyms.clone(),
+            };
+        }
+        let terms = self.question_terms(question);
+        let mut scored: Vec<(i32, &String)> = self
+            .collections
+            .iter()
+            .map(|(name, meta)| (relevance(name, meta, &terms), name))
+            .collect();
+        // Score descending, then name ascending so the choice is deterministic when a
+        // question matches nothing in particular.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        // Drop collections the question does not touch at all rather than padding up to
+        // `max` with them. Filling the remaining slots alphabetically put `admissions`,
+        // `appointments` and `beds` in front of the planner for "list the medicines we
+        // have?", which is noise it has to reason past. When nothing matches there is no
+        // signal to go on, so fall back to a deterministic slice.
+        let matched = scored.iter().filter(|(score, _)| *score > 0).count();
+        let keep: HashMap<String, CollectionMeta> = scored
+            .into_iter()
+            .take(if matched > 0 { matched.min(max) } else { max })
+            .map(|(_, name)| (name.clone(), self.collections[name].clone()))
+            .collect();
+        // Which collections the planner was shown is the first thing you need when it
+        // picks the wrong one, and it is invisible from the resulting spec alone.
+        let mut shown: Vec<&str> = keep.keys().map(String::as_str).collect();
+        shown.sort_unstable();
+        tracing::debug!(
+            from = self.collections.len(),
+            kept = shown.len(),
+            collections = ?shown,
+            "narrowed the planner catalog to the question"
+        );
+        Catalog {
+            collections: keep,
+            code_vocab: self.code_vocab.clone(),
+            synonyms: self.synonyms.clone(),
+        }
+    }
+
     pub fn planner_context(&self) -> String {
         let mut out = String::from("## Available collections and fields\n");
         let mut coll_names: Vec<&String> = self.collections.keys().collect();
@@ -234,6 +293,78 @@ impl Catalog {
         }
         out
     }
+}
+
+impl Catalog {
+    /// The question's own words, plus what the code vocabulary implies about them.
+    ///
+    /// Matching on the question's words alone is blind to *values*: "How many patients
+    /// have diabetes?" never reaches `diagnoses`, because "diabetes" and "diagnoses"
+    /// share no prefix. The planner was then left holding `patients` and invented
+    /// `icd10_code` on it, which validation rejected — and the question fell through to
+    /// semantic retrieval and a refusal, despite the records existing.
+    ///
+    /// `code_vocab` is exactly the missing link: it maps lay condition words onto ICD-10
+    /// prefixes, so a question that uses one is a question about coded diagnoses. Saying
+    /// so out loud lets the ordinary name matching find the tables that carry them.
+    fn question_terms(&self, question: &str) -> Vec<String> {
+        let mut terms = tokenize(question);
+        let asks_about_a_coded_condition = self
+            .code_vocab
+            .keys()
+            .any(|term| terms.iter().any(|t| related(t, term)));
+        if asks_about_a_coded_condition {
+            for implied in ["diagnoses", "diagnosis", "icd10", "condition"] {
+                terms.push(implied.to_string());
+            }
+        }
+        terms
+    }
+}
+
+/// Split text into lowercase alphanumeric words of 3+ characters.
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.len() >= 3)
+        .map(|w| w.to_ascii_lowercase())
+        .collect()
+}
+
+/// How well a collection answers `terms`.
+///
+/// The collection's own name and label count for much more than its field names: a
+/// question about medicines wants `medication_catalog`, not every table that happens to
+/// carry a `medication_id`.
+fn relevance(name: &str, meta: &CollectionMeta, terms: &[String]) -> i32 {
+    let mut score = 0;
+    let identity = tokenize(&format!("{name} {}", meta.label));
+    for term in terms {
+        if identity.iter().any(|w| related(w, term)) {
+            score += 8;
+        }
+    }
+    for field in &meta.fields {
+        let words = tokenize(&field.name);
+        for term in terms {
+            if words.iter().any(|w| related(w, term)) {
+                score += 1;
+                break;
+            }
+        }
+    }
+    score
+}
+
+/// Whether two words plausibly refer to the same thing.
+///
+/// Equality plus a shared 5-character prefix, which is what connects the question's
+/// "medicines" to the schema's "medication" without dragging in a stemmer.
+fn related(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    const PREFIX: usize = 5;
+    a.len() >= PREFIX && b.len() >= PREFIX && a[..PREFIX] == b[..PREFIX]
 }
 
 // ---------------------------------------------------------------------------
@@ -653,5 +784,103 @@ pub(crate) fn build_hardcoded() -> Catalog {
         collections,
         code_vocab,
         synonyms,
+    }
+}
+
+#[cfg(test)]
+mod relevance_tests {
+    use super::*;
+
+    fn coll(label: &str, fields: &[&str]) -> CollectionMeta {
+        CollectionMeta {
+            label: label.to_string(),
+            fields: fields
+                .iter()
+                .map(|f| FieldMeta::new(*f, FieldType::String))
+                .collect(),
+            concept: None,
+            service_lines: Vec::new(),
+        }
+    }
+
+    /// The 63-table shape that made an unscoped Ask question overflow the prompt.
+    fn wide_catalog() -> Catalog {
+        let mut collections = HashMap::new();
+        collections.insert(
+            "medication_catalog".to_string(),
+            coll("medication catalog", &["generic_name", "brand_name", "drug_class"]),
+        );
+        collections.insert(
+            "prescription_items".to_string(),
+            coll("prescription items", &["medication_id", "dose"]),
+        );
+        for i in 0..60 {
+            collections.insert(format!("unrelated_{i:02}"), coll("unrelated", &["id"]));
+        }
+        Catalog {
+            collections,
+            code_vocab: HashMap::new(),
+            synonyms: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn drops_collections_the_question_does_not_touch() {
+        // 60 `unrelated_*` tables score nothing; none of them should reach the planner
+        // just because there were slots left over.
+        let narrowed = wide_catalog().most_relevant("list the medicines we have?", 12);
+        assert!(narrowed.has_collection("medication_catalog"));
+        assert!(!narrowed.collections.keys().any(|k| k.starts_with("unrelated_")));
+    }
+
+    #[test]
+    fn keeps_the_collection_the_question_is_about() {
+        // "medicines" has to reach "medication_catalog"; this exact question is the one
+        // that used to lose the catalog to a mid-table byte cut and answer "the data
+        // provided does not include a list of medicines".
+        let narrowed = wide_catalog().most_relevant("list the medicines we have?", 12);
+        assert!(narrowed.has_collection("medication_catalog"));
+    }
+
+    #[test]
+    fn ranks_the_named_entity_above_one_that_merely_references_it() {
+        let narrowed = wide_catalog().most_relevant("list the medicines we have?", 1);
+        assert!(narrowed.has_collection("medication_catalog"));
+        assert!(!narrowed.has_collection("prescription_items"));
+    }
+
+    #[test]
+    fn narrowing_keeps_the_prompt_under_the_safe_size() {
+        let narrowed = wide_catalog().most_relevant("list the medicines we have?", 12);
+        assert!(narrowed.planner_context().len() < 16_000);
+    }
+
+    #[test]
+    fn a_condition_word_reaches_the_table_that_codes_it() {
+        // "diabetes" shares no prefix with "diagnoses", so lexical matching alone drops
+        // the one table that can answer "How many patients have diabetes?". The code
+        // vocabulary is what connects them.
+        let mut catalog = wide_catalog();
+        catalog
+            .collections
+            .insert("diagnoses".to_string(), coll("diagnoses", &["icd10_code", "patient_id"]));
+        catalog
+            .collections
+            .insert("patients".to_string(), coll("patients", &["id", "name"]));
+        catalog.code_vocab.insert("diabetes".into(), "E11".into());
+
+        let narrowed = catalog.most_relevant("How many patients have diabetes?", 12);
+        assert!(
+            narrowed.has_collection("diagnoses"),
+            "diagnoses must survive: {:?}",
+            narrowed.collections.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_catalog_already_small_enough_is_left_alone() {
+        let catalog = wide_catalog();
+        let total = catalog.collections.len();
+        assert_eq!(catalog.most_relevant("anything", total + 5).collections.len(), total);
     }
 }

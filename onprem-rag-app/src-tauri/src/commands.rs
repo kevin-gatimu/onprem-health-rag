@@ -2755,6 +2755,10 @@ pub async fn agent(
     mode: Option<String>,
     source_id: Option<String>,
     suggestion_spec: Option<serde_json::Value>,
+    // Enumeration paging. Sent through untouched so a "next page" control can ask for
+    // rows 50-99 without the server re-planning the list to change one integer.
+    limit: Option<u32>,
+    offset: Option<u32>,
     app: tauri::AppHandle,
     bridge: State<'_, Bridge>,
 ) -> Result<(), String> {
@@ -2788,6 +2792,8 @@ pub async fn agent(
                     "mode": mode,
                     "source_id": source_id,
                     "suggestion_spec": suggestion_spec,
+                    "limit": limit,
+                    "offset": offset,
                 }))
                 .send()
                 .await
@@ -2839,6 +2845,17 @@ pub async fn agent(
                     "pipeline" => {
                         let _ = app.emit(
                             "agent://pipeline",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Enumeration path: {collection, total, offset, limit, returned,
+                    // has_more} — everything a pager needs, without re-counting.
+                    "page" => {
+                        let _ = app.emit(
+                            "agent://page",
                             ChatEvent {
                                 run_id: run_id.clone(),
                                 data: event.data,

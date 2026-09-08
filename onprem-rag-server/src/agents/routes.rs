@@ -83,6 +83,15 @@ pub struct AgentRequest {
     /// Optional source pin when several sources are bound.
     #[serde(default)]
     pub source_id: Option<String>,
+    /// Page size for an enumeration answer. Overrides whatever the planner chose;
+    /// clamped to `MAX_LIST` (200) by `validate_list`. Default 50.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Row offset for an enumeration answer (0-based). Paired with `limit` this lets a
+    /// "next page" control page deterministically, without spending a model call to
+    /// re-plan a list that only changed by one integer.
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +105,15 @@ enum AgentData {
     /// A complete, model-free answer (capability, redirect, clarify,
     /// deterministic record narration).
     Direct { answer: String },
+    /// Enumeration answer: one page of records, plus the envelope a client needs to
+    /// ask for the next one.
+    List {
+        spec_json: String,
+        rows_json: String,
+        page_json: String,
+        citations_json: String,
+        narration_stream: GuardedChatStream,
+    },
     /// Deterministic live-SQL result rendered in the structured shape.
     StructuredDirect {
         spec_json: String,
@@ -330,18 +348,38 @@ pub async fn agent(
                         // buy a guaranteed validation error instead of an answer.
                         None
                     } else {
-                        match run_docdb_aggregation(
-                            state.inner(),
-                            &user,
-                            *intent,
-                            mode,
-                            &decision.resolved_question,
-                            &scoped,
-                            &system_prompt,
-                            &trace,
-                            &mut generation_permit,
-                        )
-                        .await
+                        // An enumeration wants records, not a number. The aggregation
+                        // planner can only return a count, which is why "list the
+                        // medicines we have" used to answer with one.
+                        let planned = if *intent == QueryIntent::Enumeration
+                            && mode != AgentMode::Trends
+                        {
+                            run_docdb_list(
+                                state.inner(),
+                                &user,
+                                &decision.resolved_question,
+                                &scoped,
+                                (req.limit, req.offset),
+                                &system_prompt,
+                                &trace,
+                                &mut generation_permit,
+                            )
+                            .await
+                        } else {
+                            run_docdb_aggregation(
+                                state.inner(),
+                                &user,
+                                *intent,
+                                mode,
+                                &decision.resolved_question,
+                                &scoped,
+                                &system_prompt,
+                                &trace,
+                                &mut generation_permit,
+                            )
+                            .await
+                        };
+                        match planned
                         {
                             Ok((data, structured_json)) => {
                                 persist_structured_json = Some(structured_json);
@@ -440,6 +478,51 @@ pub async fn agent(
                 trace.record_output(&answer);
                 full_answer.push_str(&answer);
                 yield token_event(&answer);
+            }
+
+            AgentData::List {
+                spec_json,
+                rows_json,
+                page_json,
+                citations_json,
+                mut narration_stream,
+            } => {
+                yield Event::data(spec_json).event("spec");
+                // `page` *before* `rows`: these rows are whole records, not the
+                // `{label, value}` pairs the aggregation path sends, and a client that
+                // has not been told which it is coming will chart them.
+                yield Event::data(page_json).event("page");
+                yield Event::data(rows_json).event("rows");
+                yield Event::data(citations_json).event("citations");
+
+                let mut think = crate::foundry::think_filter::ThinkFilter::new();
+                while let Some(chunk) = narration_stream.next().await {
+                    match chunk {
+                        Ok(resp) => {
+                            if let Some(token) =
+                                resp.choices.first().and_then(|c| c.delta.content.clone())
+                            {
+                                let visible = think.push(&token);
+                                if !visible.is_empty() {
+                                    trace.record_output(&visible);
+                                    full_answer.push_str(&visible);
+                                    yield token_event(&visible);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            had_error = true;
+                            yield Event::data(format!("Foundry Local: {e}")).event("error");
+                            break;
+                        }
+                    }
+                }
+                let tail = think.finish();
+                if !tail.is_empty() {
+                    trace.record_output(&tail);
+                    full_answer.push_str(&tail);
+                    yield token_event(&tail);
+                }
             }
 
             AgentData::Structured { spec_json, rows_json, pipeline_json, mut narration_stream } => {
@@ -634,6 +717,118 @@ fn redirect_decision(
 /// catalog handed to `validate` — narrowing what the planner may name and what
 /// the validator will accept in one move, through the existing guard.
 #[allow(clippy::too_many_arguments)]
+/// Answer an enumeration ("list all X", "who is admitted right now") as one page of
+/// records rather than a count.
+///
+/// The aggregation planner can only ever return a number, so sending enumerations to it
+/// is why "list the medicines we have" answered "103". The list planner emits a
+/// `RunList` with `limit`/`offset`, and `list::run` returns the page alongside the total
+/// so a client can page without re-counting.
+///
+/// `page` (limit, offset) overrides whatever the planner chose. A button asking for rows
+/// 50-99 is not a question, and making the model re-plan the same list to change one
+/// integer costs a whole generation round trip.
+async fn run_docdb_list(
+    state: &AppState,
+    user: &AuthUser,
+    question: &str,
+    catalog: &crate::aggregation::catalog::Catalog,
+    page: (Option<u32>, Option<u32>),
+    system_prompt: &str,
+    trace: &RequestTrace,
+    generation_permit: &mut Option<tokio::sync::OwnedSemaphorePermit>,
+) -> AppResult<(AgentData, String)> {
+    use crate::aggregation::list;
+
+    let foundry = state.foundry()?;
+    *generation_permit = Some(state.admission.generation().await?);
+
+    // Same narrowing as the aggregation planner: the whole catalog overflows the prompt.
+    let planner_catalog = catalog.most_relevant(question, state.config.planner_max_collections);
+    let planner_system = crate::answer::build_list_planner_system(&planner_catalog);
+    let planner_spec = state.spec_for(ModelRole::PlanSpec);
+
+    // 1. Plan: the model emits a RunList tool call.
+    let mut planned = trace
+        .time(
+            Stage::Plan,
+            foundry.plan_list(&planner_spec, &planner_system, question),
+        )
+        .await?;
+
+    // 2. Caller-supplied paging wins over the planner's guess.
+    let (limit, offset) = page;
+    if let Some(limit) = limit {
+        planned.limit = Some(limit);
+    }
+    if let Some(offset) = offset {
+        planned.offset = offset;
+    }
+
+    // 3. Validate against the full scoped catalog (never the narrowed one).
+    let validated = trace.time_sync(Stage::Validate, || list::validate_list(&planned, catalog))?;
+
+    // 4. Execute the page and its total together.
+    let (rows, total, pipeline_docs) = trace
+        .time(Stage::Execute, list::run(&state.db, user, &validated))
+        .await?;
+    let limit = validated.limit.unwrap_or(list::DEFAULT_LIST_LIMIT);
+    let offset = validated.offset;
+    let returned = rows.len() as u64;
+    trace.stage_detail(
+        Stage::Execute,
+        format!("rows {}-{} of {total}", offset as u64 + 1, offset as u64 + returned),
+    );
+
+    let spec_json = serde_json::to_string(&validated).unwrap_or_else(|_| "{}".to_string());
+    let rows_json = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string());
+    let citations_json = list::rows_to_citations_json(&rows, &validated.collection);
+    let page_json = serde_json::json!({
+        "collection": validated.collection,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        // Computed here rather than left to each client to derive: getting it wrong on
+        // the last page is what produces an empty "next" that looks like a failure.
+        "has_more": (offset as u64) + returned < total,
+    })
+    .to_string();
+    let pipeline_json = serde_json::to_string(
+        &pipeline_docs
+            .iter()
+            .map(|d| mongodb::bson::Bson::Document(d.clone()).into_relaxed_extjson())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    let structured_json = format!(
+        "{{\"spec\":{spec_json},\"rows\":{rows_json},\"page\":{page_json},\"pipeline\":{pipeline_json}}}"
+    );
+
+    // 5. Narrate the page, telling the model exactly which slice it is looking at.
+    let narration_user =
+        crate::answer::build_list_narration_user(question, &rows, total, offset, limit);
+    let mut narration_spec = state.spec_for(ModelRole::Narrate);
+    narration_spec.tools = false;
+    let narration_stream = trace
+        .time(
+            Stage::Narrate,
+            foundry.generate_stream_with(&narration_spec, system_prompt, &narration_user),
+        )
+        .await?;
+
+    Ok((
+        AgentData::List {
+            spec_json,
+            rows_json,
+            page_json,
+            citations_json,
+            narration_stream,
+        },
+        structured_json,
+    ))
+}
+
 async fn run_docdb_aggregation(
     state: &AppState,
     user: &AuthUser,
@@ -654,7 +849,12 @@ async fn run_docdb_aggregation(
     } else {
         intent
     };
-    let planner_system = build_agg_planner_system(catalog, intent);
+    // Show the planner only the collections the question plausibly needs. Rendering all
+    // 63 for an unscoped Ask produces a ~24 KB prompt, which the byte cap would then slice
+    // through the middle of a table; narrowing by whole collections keeps the schema the
+    // planner sees coherent. Validation below still uses the full scoped catalog.
+    let planner_catalog = catalog.most_relevant(question, state.config.planner_max_collections);
+    let planner_system = build_agg_planner_system(&planner_catalog, intent);
     let planner_spec = state.spec_for(ModelRole::PlanSpec);
 
     // 1. Plan: model emits a RunAggregation tool call.

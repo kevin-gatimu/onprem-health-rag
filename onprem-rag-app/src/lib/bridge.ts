@@ -1335,6 +1335,25 @@ export interface Provenance {
 export type RoutedEvent = RoutedPayload;
 
 /** One row from a structured aggregation result (chart-ready). */
+/** `agent://page` — where one page of an enumeration answer sits in the result set.
+ *
+ * Mirrors the `page` SSE event from `onprem-rag-server/src/agents/routes.rs`
+ * (`run_docdb_list`). `has_more` is computed server-side: deriving it per client is how
+ * a last page ends up offering a "next" that returns nothing.
+ */
+export interface AgentPage {
+  collection: string;
+  /** Total matching records, not just this page. */
+  total: number;
+  /** 0-based offset of the first row on this page. */
+  offset: number;
+  /** Page size actually applied (server default 50, capped at 200). */
+  limit: number;
+  /** Rows on this page — smaller than `limit` on the last one. */
+  returned: number;
+  has_more: boolean;
+}
+
 export interface AggRow {
   label: string;
   value: number;
@@ -1383,7 +1402,15 @@ export function agent(
   question: string,
   conversationId: string | null,
   runId: string,
-  opts?: { mode?: AgentMode; sourceId?: string; suggestionSpec?: unknown },
+  opts?: {
+    mode?: AgentMode;
+    sourceId?: string;
+    suggestionSpec?: unknown;
+    /** Enumeration page size (server default 50, capped at 200). */
+    limit?: number;
+    /** Enumeration row offset, 0-based. Pass with `limit` to page without re-planning. */
+    offset?: number;
+  },
 ): Promise<void> {
   return authedInvoke<void>("agent", {
     kind,
@@ -1393,6 +1420,8 @@ export function agent(
     mode: opts?.mode ?? null,
     sourceId: opts?.sourceId ?? null,
     suggestionSpec: opts?.suggestionSpec ?? null,
+    limit: opts?.limit ?? null,
+    offset: opts?.offset ?? null,
   });
 }
 

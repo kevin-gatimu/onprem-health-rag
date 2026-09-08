@@ -1,6 +1,6 @@
 // Agent store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { AgentKind, AgentMode, AggRow, ClarifyPayload, Passage, Provenance, RoutedEvent, StageEvent, Suggestion } from '../lib/bridge';
+import type { AgentKind, AgentMode, AgentPage, AggRow, ClarifyPayload, Passage, Provenance, RoutedEvent, StageEvent, Suggestion } from '../lib/bridge';
 import { applyStageEvent, type StageStep } from './stages';
 import { ASK_KIND } from './agentRegistry';
 
@@ -39,6 +39,10 @@ export interface AgentPending {
   answer: string;
   citations: Passage[];
   rows: AggRow[] | null;
+  /** Enumeration answers only: one page of whole records, not `{label, value}` pairs. */
+  listRows: Record<string, unknown>[] | null;
+  /** Enumeration answers only: where this page sits in the result set. */
+  page: AgentPage | null;
   spec: unknown | null;
   pipeline: unknown[] | null;
   /** Live SQL result accumulated from sql/columns/rows events (agents can return SQL). */
@@ -117,6 +121,8 @@ interface AgentsState {
   setRoutedFull(runId: string, payload: RoutedEvent): void;
   setSpec(runId: string, spec: unknown): void;
   setRows(runId: string, rows: AggRow[]): void;
+  setListRows(runId: string, rows: Record<string, unknown>[]): void;
+  setPage(runId: string, page: AgentPage): void;
   setPipeline(runId: string, pipeline: unknown[]): void;
   setSqlMetadata(runId: string, sourceId: string, sql: string): void;
   setSqlColumns(runId: string, columns: string[]): void;
@@ -185,6 +191,8 @@ export const useAgents = create<AgentsState>((set, get) => ({
           user,
           answer: '',
           citations: [],
+          listRows: null,
+          page: null,
           rows: null,
           spec: null,
           pipeline: null,
@@ -252,6 +260,18 @@ export const useAgents = create<AgentsState>((set, get) => ({
     set((state) => ({
       runs: { ...state.runs, [runId]: { ...state.runs[runId], rows, phase: 'running' } },
     }));
+  },
+
+  setListRows(runId, listRows) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], listRows, phase: 'running' } },
+    }));
+  },
+
+  setPage(runId, page) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], page } } }));
   },
 
   setPipeline(runId, pipeline) {
