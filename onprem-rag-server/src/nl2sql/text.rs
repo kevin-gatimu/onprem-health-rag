@@ -13,14 +13,37 @@ pub(crate) fn contains_likely_person_name(question: &str) -> bool {
     PERSON.is_match(question)
 }
 
-/// Extract a record-number-style identifier (e.g. "SYN-2024-0001") verbatim from
-/// raw text. Uppercased to match the seeded patient_no format; the character class
-/// (alphanumerics and hyphens only) keeps the value safe to inline in SQL.
+/// Extract a record-number-style identifier (e.g. "PT-00001", "SYN-2024-0001")
+/// verbatim from raw text. Uppercased to match the seeded `patient_no` format;
+/// the character class (alphanumerics and hyphens only) keeps the value safe to
+/// inline in SQL.
+///
+/// The trailing group is optional and the digit run is `{4,8}`, not the former
+/// `\d{2,4}-\d{2,6}` (mandatory second group): the actual seeded format is a
+/// *single* hyphen with a 5-digit run (`patients.patient_no` is `PT-00001`,
+/// `docker/dev-postgres/init/02_seed.sql:942`, on a `VARCHAR(20)` column,
+/// `01_schema.sql:236`) — the old two-hyphen requirement never matched it, or
+/// any other seeded business code, at all. The `{4,8}` floor is deliberate, not
+/// just "wide enough for 5 digits": it's what keeps `"COVID-19"` (2 digits)
+/// correctly unmatched (see the test below), which a plain `+` would not.
 pub(crate) fn extract_record_identifier(text: &str) -> Option<String> {
     static ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"\b[A-Za-z]{2,6}-\d{2,4}-\d{2,6}\b").expect("valid identifier regex")
+        regex::Regex::new(r"\b[A-Za-z]{2,6}-\d{4,8}(?:-\d{2,6})?\b")
+            .expect("valid identifier regex")
     });
-    ID.find(text)
+    static UUID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("valid uuid regex")
+    });
+    // A raw UUID's hyphen-separated hex groups can themselves satisfy the ID
+    // pattern above (e.g. `...-ebda-4216-8201-...` reads as letters-digits-digits),
+    // handing back a meaningless fragment instead of the record it actually names.
+    // Skip any ID match that falls entirely inside a UUID rather than return one.
+    let uuid_span = UUID.find(text).map(|m| (m.start(), m.end()));
+    ID.find_iter(text)
+        .find(|m| uuid_span.is_none_or(|(s, e)| m.end() <= s || m.start() >= e))
         .map(|found| found.as_str().to_ascii_uppercase())
 }
 

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::nl2sql::ir::spec::TimeRange;
 use crate::ontology::{
     binding::SchemaBinding,
-    concepts::{EntityConcept, DESCRIPTORS, SHARED_CONCEPTS},
+    concepts::{descriptor, EntityConcept, DESCRIPTORS, SHARED_CONCEPTS},
     service_line::ServiceLine,
 };
 use crate::router::{focus::ConversationFocus, time::parse_time};
@@ -124,6 +124,23 @@ pub fn extract_entities(
     // 5 — enum filters from binding (skip PII columns)
     let mut enum_filters: Vec<(String, String)> = Vec::new();
     if let Some(b) = binding {
+        // A shared concept's own vocabulary ("patient", "provider", ...) can also
+        // turn up as a literal enum value on some unrelated table's column
+        // (`consents.granted_by` includes `'patient'`, meaning the patient rather
+        // than a guardian gave consent) without being evidence of any cohort the
+        // question actually named. Same false-positive shape fixed in
+        // `agents::kind::out_of_scope_redirect` for the redirect gate; excluded
+        // here for the same reason so it can't misfire `cohort_stated`.
+        let shared_vocab: std::collections::HashSet<String> = SHARED_CONCEPTS
+            .iter()
+            .flat_map(|&c| {
+                let d = descriptor(c);
+                std::iter::once(d.singular)
+                    .chain(std::iter::once(d.plural))
+                    .chain(d.synonyms.iter().copied())
+            })
+            .map(str::to_ascii_lowercase)
+            .collect();
         for table in &b.tables {
             for col in &table.columns {
                 if col.is_pii {
@@ -131,6 +148,9 @@ pub fn extract_entities(
                 }
                 for val in &col.enum_values {
                     let val_lower = val.to_ascii_lowercase();
+                    if shared_vocab.contains(val_lower.as_str()) {
+                        continue;
+                    }
                     if q.contains(val_lower.as_str()) {
                         enum_filters.push((col.column_name.clone(), val.clone()));
                     }
@@ -491,6 +511,63 @@ mod tests {
         assert!(e.enum_filters.iter().any(|(col, val)| col == "status" && val == "active"));
         // "secret" is PII → must NOT appear
         assert!(!e.enum_filters.iter().any(|(_, val)| val == "secret"));
+    }
+
+    /// The real `consents.granted_by` column (`docker/dev-postgres/init/01_schema.sql:974`)
+    /// has `'patient'` as a literal enum value alongside `'guardian'` etc. Any
+    /// question mentioning "patient" — nearly all of them — must not surface that
+    /// as a cohort filter; `patient` is `EntityConcept::Patient`'s own
+    /// shared-concept vocabulary, not evidence about who gave consent.
+    #[test]
+    fn shared_concept_vocabulary_is_not_an_enum_filter() {
+        use crate::ontology::{binding::{ColumnBinding, SchemaBinding, TableBinding}, roles::ColumnRole};
+        use chrono::Utc;
+        let binding = SchemaBinding {
+            source_id: "x".into(),
+            bound_at: Utc::now(),
+            tables: vec![TableBinding {
+                table_name: "consents".into(),
+                concept: EntityConcept::Consent,
+                confidence: 0.9,
+                service_lines: vec![],
+                columns: vec![ColumnBinding {
+                    column_name: "granted_by".into(),
+                    role: ColumnRole::Status,
+                    is_pii: false,
+                    enum_values: vec![
+                        "patient".into(),
+                        "guardian".into(),
+                        "next_of_kin".into(),
+                        "court_order".into(),
+                    ],
+                }],
+                patient_path: None,
+                event_time_col: None,
+                degraded: false,
+            }],
+            degraded: false,
+            override_version: 0,
+        };
+        let (e, _) = extract_entities("how is the patient", None, Some(&binding), now());
+        assert!(
+            !e.enum_filters.iter().any(|(_, val)| val == "patient"),
+            "got: {:?}",
+            e.enum_filters
+        );
+        // A real, non-shared enum value on the same column must still surface.
+        let (e2, _) = extract_entities(
+            "which consents were granted by the guardian",
+            None,
+            Some(&binding),
+            now(),
+        );
+        assert!(
+            e2.enum_filters
+                .iter()
+                .any(|(col, val)| col == "granted_by" && val == "guardian"),
+            "got: {:?}",
+            e2.enum_filters
+        );
     }
 
     #[test]

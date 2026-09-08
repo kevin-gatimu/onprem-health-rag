@@ -2084,6 +2084,31 @@ mod tests {
         );
     }
 
+    /// The actual seeded format (`docker/dev-postgres/init/02_seed.sql:942`) is a
+    /// single hyphen and a 5-digit run, which the old two-hyphen-mandatory regex
+    /// never matched — this extractor had never recognised a real patient number.
+    #[test]
+    fn extracts_the_actual_seeded_patient_no_format() {
+        assert_eq!(
+            extract_record_identifier("what is PT-00042 allergic to").as_deref(),
+            Some("PT-00042")
+        );
+    }
+
+    /// A raw UUID's hyphen-separated hex groups can themselves read as
+    /// letters-digits-digits (`...-ebda-4216-8201-...`, a real fragment of a
+    /// seeded prescription-item UUID, `02_seed.sql:14363`) and must not be
+    /// handed back as if it were a meaningful record code.
+    #[test]
+    fn does_not_extract_a_fragment_of_a_raw_uuid() {
+        assert!(
+            extract_record_identifier(
+                "what medication has patient with id 53f1015a-ebda-4216-8201-c892dda9b2ab been prescribed?"
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn resolves_followup_identifier_edge_cases() {
         let turns = [

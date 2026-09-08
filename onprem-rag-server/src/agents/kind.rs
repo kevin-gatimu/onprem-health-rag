@@ -284,6 +284,31 @@ pub fn out_of_scope_redirect(
     let q_words = question.to_ascii_lowercase();
     let q_squashed = normalize(question);
 
+    // A shared concept's own vocabulary ("patient", "provider", "encounter", ...)
+    // shows up both as a table-name segment across many *unrelated* concepts
+    // (`patient_documents`, `patient_allergies`, `patient_medical_history`, ...)
+    // and, just as easily, as a literal enum value on some unrelated table's own
+    // column (`consents.granted_by` includes `'patient'`, meaning the patient —
+    // rather than a guardian — gave consent). Neither use is vocabulary that
+    // distinguishes one concept from another. Shared concepts already can't be
+    // redirect evidence in their own right (`owners_for_redirect` returns no
+    // owner for them, since a shared concept belongs to every line); this keeps
+    // their vocabulary from leaking in as false evidence for some *other*
+    // concept via the raw-table-name-segment and enum-value fallbacks below —
+    // previously any question merely containing the word "patient" (nearly all
+    // of them) could misfire a redirect to whichever line happened to own an
+    // unrelated table carrying that word in either form.
+    let shared_vocab: std::collections::HashSet<String> = SHARED_CONCEPTS
+        .iter()
+        .flat_map(|&c| {
+            let d = descriptor(c);
+            std::iter::once(d.singular)
+                .chain(std::iter::once(d.plural))
+                .chain(d.synonyms.iter().copied())
+        })
+        .map(normalize)
+        .collect();
+
     let mut best: Option<ScopeRedirect> = None;
 
     for table in &binding.tables {
@@ -303,19 +328,20 @@ pub fn out_of_scope_redirect(
             .chain(std::iter::once(d.plural))
             .chain(d.synonyms.iter().copied())
             .any(|term| term.len() >= 4 && q_words.contains(term))
-            || table
-                .table_name
-                .split('_')
-                .any(|part| part.len() >= 4 && q_words.contains(part));
+            || table.table_name.split('_').any(|part| {
+                part.len() >= 4 && !shared_vocab.contains(part) && q_words.contains(part)
+            });
 
         // Enum labels are literal values from the hospital's own data
         // ("mpesa"); PII columns never contribute one.
         let enum_hit = table.columns.iter().any(|col| {
             !col.is_pii
-                && col
-                    .enum_values
-                    .iter()
-                    .any(|v| v.len() >= 4 && q_squashed.contains(&normalize(v)))
+                && col.enum_values.iter().any(|v| {
+                    let v_norm = normalize(v);
+                    v_norm.len() >= 4
+                        && !shared_vocab.contains(&v_norm)
+                        && q_squashed.contains(&v_norm)
+                })
         });
 
         if !named && !enum_hit {
@@ -354,6 +380,31 @@ pub fn out_of_scope_redirect(
     }
 
     best
+}
+
+/// A record identifier in `question`, for the sole purpose of deciding whether
+/// [`AgentKind::scope`]'s Patient Chart widening should apply before the
+/// out-of-scope redirect check runs. `scope` only asks whether this is `Some`
+/// — the value itself is never read downstream — so this only has to recognise
+/// *that* a specific record is named, not agree with any particular format.
+///
+/// Deliberately separate from `nl2sql::text::extract_record_identifier`: that
+/// extractor's narrower business-code format (`PT-00042`) drives hardcoded SQL
+/// templates elsewhere in the compiler, and widening it to also accept raw
+/// UUID primary keys — which this deployment's data actually uses — would
+/// change which of those templates a UUID-bearing question matches. Recognising
+/// the same UUIDs here, for this narrower purpose, carries none of that risk.
+pub fn scope_widening_key(question: &str) -> Option<String> {
+    if let Some(id) = crate::nl2sql::text::extract_record_identifier(question) {
+        return Some(id);
+    }
+    static UUID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("valid uuid regex")
+    });
+    UUID.find(question).map(|m| m.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -536,6 +587,81 @@ mod tests {
         for t in &narrow {
             assert!(wide.contains(t), "widening must not drop {t}");
         }
+    }
+
+    /// The regression from production logs: a question that merely contains the
+    /// word "patient" (true of nearly every clinical question) must not be
+    /// redirected anywhere. "patient" is `Patient`'s own shared-concept
+    /// vocabulary and, before this fix, also matched as a raw table-name
+    /// segment on every `patient_*`-prefixed table (`patient_documents`,
+    /// `patient_allergies`, ...) regardless of which concept actually owned it.
+    #[test]
+    fn a_bare_mention_of_patient_is_not_evidence_for_an_unrelated_table() {
+        let binding = dev_binding();
+        for line in ServiceLine::ALL {
+            let agent = AgentKind::Line(*line);
+            assert_eq!(
+                out_of_scope_redirect(agent, "how is the patient", Some(&binding), None),
+                None,
+                "{:?}: \"patient\" alone must not trigger a redirect",
+                line
+            );
+        }
+    }
+
+    /// Bug fixed alongside the above: the redirect check used to hardcode
+    /// `patient_key: None`, so Patient Chart's own widening (a couple of tests
+    /// up) never got a chance to keep a patient-scoped question from being
+    /// redirected away in the first place. Finds whatever table widening adds
+    /// (rather than hardcoding one) and confirms passing the same patient key
+    /// into `out_of_scope_redirect` suppresses a redirect that fires without it.
+    #[test]
+    fn a_patient_key_passed_into_the_redirect_check_uses_the_widened_scope() {
+        let binding = dev_binding();
+        let chart = AgentKind::Line(ServiceLine::PatientChart);
+        let narrow = chart.scope(Some(&binding), None);
+        let key = "PT-00042";
+        let wide = chart.scope(Some(&binding), Some(key));
+        let widened_table = binding
+            .tables
+            .iter()
+            .find(|t| wide.contains(&t.table_name) && !narrow.contains(&t.table_name))
+            .expect("widening must add at least one table (asserted elsewhere)");
+        let vocab = crate::ontology::concepts::descriptor(widened_table.concept);
+        let term = [vocab.plural, vocab.singular]
+            .into_iter()
+            .chain(vocab.synonyms.iter().copied())
+            .find(|t| t.len() >= 4)
+            .expect("descriptor must have at least one term >= 4 chars long");
+        let question = format!("what {term} does this {key} have");
+
+        assert!(
+            out_of_scope_redirect(chart, &question, Some(&binding), None).is_some(),
+            "without a patient key, {} is still genuinely out of Patient Chart's narrow scope",
+            widened_table.table_name
+        );
+        assert_eq!(
+            out_of_scope_redirect(chart, &question, Some(&binding), Some(key)),
+            None,
+            "with the patient key threaded through, {} is in the widened scope and must not redirect",
+            widened_table.table_name
+        );
+    }
+
+    #[test]
+    fn scope_widening_key_recognizes_business_ids_and_uuids() {
+        assert_eq!(
+            scope_widening_key("what is PT-2024-0042 allergic to").as_deref(),
+            Some("PT-2024-0042")
+        );
+        assert_eq!(
+            scope_widening_key(
+                "what medication has patient with id 8c580c2d-1ed1-4fc3-a0dc-fbca698da15f been prescribed?"
+            )
+            .as_deref(),
+            Some("8c580c2d-1ed1-4fc3-a0dc-fbca698da15f")
+        );
+        assert_eq!(scope_widening_key("how many patients do we have"), None);
     }
 
     #[test]
