@@ -36,6 +36,8 @@ dist-ssr/
 #     LAN HTTP, package id, icons). Its own nested .gitignore files exclude the
 #     regenerable parts (build/, .gradle/, local.properties, *.properties keys).
 onprem-rag-app/src-tauri/gen/schemas/
+# IDE/Kotlin build output copied next to the tracked scaffold — regenerable.
+onprem-rag-app/src-tauri/gen/android/app/bin/
 
 # Android signing secrets — NEVER commit (belt-and-suspenders over the scaffold's
 # own nested ignores). A leaked keystore lets anyone ship updates as this app.
