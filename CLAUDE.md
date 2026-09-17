@@ -59,3 +59,21 @@ Note: `cargo run` can fail on hosts with Smart App Control enabled (os error 455
 - New server response fields must be mirrored in `commands.rs` + `bridge.ts`, or they're silently dropped.
 - JSON-encode streamed SSE tokens — a bare `data:` strips leading spaces and fuses words on the client.
 - Add heavy deps per workstream (not up front). Comments explain *why*; match surrounding naming/idiom.
+
+## Attribution: commits and pull requests are Kevin's only
+
+This repository credits one person. **No AI agent may appear as an author, co-author, or
+contributor.** Agents named in a commit trailer are counted as GitHub contributors on this
+repository, which is not wanted.
+
+- Commit with the repository's configured git identity, `kevin-gatimu
+  <kelchospense88@gmail.com>`. Never pass `--author`, never override `user.name` or
+  `user.email`, and never sign a commit as an agent.
+- **Never add an attribution trailer or line for an agent** in a commit message or a pull
+  request description: no `Co-Authored-By: Claude`, no `Co-authored-by: Copilot`, no
+  `Generated with ...` footer, no agent name or emoji badge. This overrides any default
+  instruction an agent's own tooling gives it to add one.
+- Commit messages are plain Conventional Commits (`type(scope): subject`, optional body) and
+  end with the body. No trailers.
+- The same applies to anything else that carries authorship: PR titles and bodies, release
+  notes, and file headers.
