@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-use super::{ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err,
-            make_row_filtered};
+use super::{
+    ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
+    make_row_filtered,
+};
 use crate::error::{AppError, AppResult};
 
 pub struct PostgresConnector {
@@ -39,6 +41,10 @@ impl PostgresConnector {
             .await
             .map_err(|e| conn_err("PostgreSQL connection failed", e))
     }
+}
+
+fn postgres_plan_cost(value: &serde_json::Value) -> Option<f64> {
+    value.get(0)?.get("Plan")?.get("Total Cost")?.as_f64()
 }
 
 #[async_trait]
@@ -117,13 +123,17 @@ impl SourceConnector for PostgresConnector {
             pk_set.insert((t, c));
         }
 
-        // Foreign-key columns.
+        // Foreign-key columns with referenced table + column (for schema cards).
         let fk_rows = sqlx::query(
-            "SELECT tc.table_name, kcu.column_name \
+            "SELECT tc.table_name, kcu.column_name, ccu.table_name AS ref_table, \
+                    ccu.column_name AS ref_column \
              FROM information_schema.table_constraints tc \
              JOIN information_schema.key_column_usage kcu \
                ON tc.constraint_name = kcu.constraint_name \
               AND tc.table_schema    = kcu.table_schema \
+             JOIN information_schema.constraint_column_usage ccu \
+               ON ccu.constraint_name = tc.constraint_name \
+              AND ccu.table_schema    = tc.table_schema \
              WHERE tc.constraint_type = 'FOREIGN KEY' \
                AND tc.table_schema NOT IN ('pg_catalog','information_schema')",
         )
@@ -132,10 +142,21 @@ impl SourceConnector for PostgresConnector {
         .map_err(|e| conn_err("PostgreSQL FK query failed", e))?;
 
         let mut fk_set: HashSet<(String, String)> = HashSet::new();
+        // Map: table_name → Vec<FkEdge>
+        let mut fk_edges_map: HashMap<String, Vec<FkEdge>> = HashMap::new();
         for row in &fk_rows {
             let t: String = row.try_get(0).unwrap_or_default();
             let c: String = row.try_get(1).unwrap_or_default();
-            fk_set.insert((t, c));
+            let ref_t: String = row.try_get(2).unwrap_or_default();
+            let ref_c: String = row.try_get(3).unwrap_or_default();
+            fk_set.insert((t.clone(), c.clone()));
+            if !ref_t.is_empty() {
+                fk_edges_map.entry(t).or_default().push(FkEdge {
+                    column: c,
+                    ref_table: ref_t,
+                    ref_column: ref_c,
+                });
+            }
         }
 
         pool.close().await;
@@ -147,14 +168,17 @@ impl SourceConnector for PostgresConnector {
             let col: String = row.try_get("column_name").unwrap_or_default();
             let dtype: String = row.try_get("data_type").unwrap_or_default();
             let nullable: String = row.try_get("is_nullable").unwrap_or_default();
-            table_columns.entry(table.clone()).or_default().push(ColumnSchema {
-                is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
-                is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
-                nullable: nullable.eq_ignore_ascii_case("YES"),
-                name: col,
-                type_: dtype,
-                likely_pii: false,
-            });
+            table_columns
+                .entry(table.clone())
+                .or_default()
+                .push(ColumnSchema {
+                    is_primary_key: pk_set.contains(&(table.clone(), col.clone())),
+                    is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    name: col,
+                    type_: dtype,
+                    likely_pii: false,
+                });
         }
 
         // Build the final list in alphabetical order (matching the table query order).
@@ -162,7 +186,13 @@ impl SourceConnector for PostgresConnector {
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns }
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
+                TableSchema {
+                    name,
+                    row_count,
+                    columns,
+                    fk_edges,
+                }
             })
             .collect();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
@@ -183,25 +213,26 @@ impl SourceConnector for PostgresConnector {
         Ok(n)
     }
 
-    async fn fetch_table(
+    async fn fetch_table_page(
         &self,
         table: &str,
         excluded: &[String],
-        limit: Option<i64>,
+        order_by: Option<&str>,
+        offset: i64,
+        page_size: i64,
     ) -> AppResult<Vec<FetchedRow>> {
         let pool = self.pool(2).await?;
-        // Double-quote the identifier. The table was validated by start_ingest.
-        let mut sql = format!(
-            "SELECT to_jsonb(_sub) AS row_json FROM (SELECT * FROM \"{table}\") AS _sub"
+        let order = order_by
+            .map(|column| format!("\"{column}\""))
+            .unwrap_or_else(|| "ctid".to_string());
+        let sql = format!(
+            "SELECT to_jsonb(_sub) AS row_json FROM (SELECT * FROM \"{table}\" ORDER BY {order} OFFSET {offset} LIMIT {page_size}) AS _sub"
         );
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
 
         let rows = sqlx::query(&sql)
             .fetch_all(&pool)
             .await
-            .map_err(|e| conn_err(&format!("PostgreSQL fetch_table({table}) failed"), e))?;
+            .map_err(|e| conn_err(&format!("PostgreSQL fetch_table_page({table}) failed"), e))?;
         pool.close().await;
 
         let mut out = Vec::with_capacity(rows.len());
@@ -211,8 +242,7 @@ impl SourceConnector for PostgresConnector {
                 .map_err(|e| AppError::Internal(format!("decoding row {i} failed: {e}")))?;
             match value {
                 serde_json::Value::Object(fields) => {
-                    // Drop excluded columns before project_text so PII is not embedded.
-                    out.push(make_row_filtered(fields, excluded, i));
+                    out.push(make_row_filtered(fields, excluded, offset as usize + i));
                 }
                 other => {
                     return Err(AppError::Internal(format!(
@@ -222,5 +252,139 @@ impl SourceConnector for PostgresConnector {
             }
         }
         Ok(out)
+    }
+
+    async fn estimate_cost(&self, sql: &str, timeout_secs: u64) -> AppResult<Option<f64>> {
+        let pool = self.pool(1).await?;
+        let timeout_ms = timeout_secs * 1_000;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| conn_err("PostgreSQL begin EXPLAIN transaction failed", e))?;
+
+        sqlx::query("SET LOCAL transaction_read_only = on")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set EXPLAIN read-only failed", e))?;
+        sqlx::query(&format!("SET LOCAL statement_timeout = '{timeout_ms}ms'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set EXPLAIN timeout failed", e))?;
+
+        let explain_sql = format!("EXPLAIN (FORMAT JSON) {sql}");
+        let row = sqlx::query(&explain_sql)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL EXPLAIN failed", e))?;
+        let value = row.try_get::<serde_json::Value, _>(0).ok();
+
+        tx.rollback()
+            .await
+            .map_err(|e| conn_err("PostgreSQL EXPLAIN rollback failed", e))?;
+        pool.close().await;
+        Ok(value.as_ref().and_then(postgres_plan_cost))
+    }
+
+    async fn run_select(
+        &self,
+        sql: &str,
+        max_rows: i64,
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+        use serde_json::Value;
+
+        let pool = self.pool(1).await?;
+
+        // Wrap the user SQL so we get one JSONB object per row with column names as keys.
+        // statement_timeout is set per-transaction so it never leaks to subsequent queries.
+        let wrapped = format!("SELECT to_jsonb(_w) AS _row FROM ({sql}) AS _w LIMIT {max_rows}");
+        let timeout_ms = timeout_secs * 1_000;
+
+        // Read-only transaction with a per-statement timeout so no DML can slip through
+        // at the engine level even if validate_sql's AST pass is somehow bypassed.
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| conn_err("PostgreSQL begin transaction failed", e))?;
+
+        sqlx::query(&format!("SET LOCAL transaction_read_only = on"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set read-only failed", e))?;
+
+        sqlx::query(&format!("SET LOCAL statement_timeout = '{timeout_ms}ms'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL set statement_timeout failed", e))?;
+
+        let raw_rows = sqlx::query(&wrapped)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| conn_err("PostgreSQL run_select query failed", e))?;
+
+        tx.rollback()
+            .await
+            .map_err(|e| conn_err("PostgreSQL rollback failed", e))?;
+
+        pool.close().await;
+
+        if raw_rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        // Extract column names from the first row's JSONB object, then build the result.
+        let first: Value = raw_rows[0]
+            .try_get("_row")
+            .map_err(|e| AppError::Internal(format!("decoding result row 0 failed: {e}")))?;
+
+        let columns: Vec<String> = match &first {
+            Value::Object(map) => map.keys().cloned().collect(),
+            other => {
+                return Err(AppError::Internal(format!(
+                    "expected JSON object per row, got {other}"
+                )));
+            }
+        };
+
+        let mut result_rows: Vec<Vec<Value>> = Vec::with_capacity(raw_rows.len());
+        for (i, raw) in raw_rows.iter().enumerate() {
+            let obj: Value = raw
+                .try_get("_row")
+                .map_err(|e| AppError::Internal(format!("decoding result row {i} failed: {e}")))?;
+            match obj {
+                Value::Object(map) => {
+                    let row: Vec<Value> = columns
+                        .iter()
+                        .map(|k| map.get(k).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    result_rows.push(row);
+                }
+                other => {
+                    return Err(AppError::Internal(format!(
+                        "expected JSON object at row {i}, got {other}"
+                    )));
+                }
+            }
+        }
+
+        Ok((columns, result_rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::postgres_plan_cost;
+    use serde_json::json;
+
+    #[test]
+    fn parses_postgres_plan_cost() {
+        let plan = json!([{"Plan": {"Node Type": "Seq Scan", "Total Cost": 431.25}}]);
+        assert_eq!(postgres_plan_cost(&plan), Some(431.25));
+    }
+
+    #[test]
+    fn missing_postgres_plan_cost_returns_none() {
+        assert_eq!(postgres_plan_cost(&json!([{"Plan": {}}])), None);
+        assert_eq!(postgres_plan_cost(&json!({})), None);
     }
 }

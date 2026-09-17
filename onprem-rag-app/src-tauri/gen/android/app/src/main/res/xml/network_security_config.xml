@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android network security posture for the on-prem RAG client.
+
+  WHY cleartext is permitted by default: the server is reached at http://<lan-ip>:8000
+  on a trusted, segmented on-prem LAN, and the server URL is chosen by the user at
+  runtime (any LAN IP) — Android's network-security-config cannot scope cleartext to an
+  IP range (it keys on concrete domains only), so a runtime-configurable IP means the
+  base config must allow cleartext. This is the same posture as the manifest's
+  usesCleartextTraffic="true", made explicit here so the production lockdown below is a
+  one-file edit.
+
+  ── PRODUCTION LOCKDOWN (do this once you terminate TLS at a reverse proxy) ──
+  When the server sits behind a reverse proxy with a real hostname + certificate:
+    1. Flip base-config cleartextTrafficPermitted to "false".
+    2. Uncomment the <domain-config> and set <domain> to the proxy's hostname.
+    3. (Optional, strongest) pin the proxy's certificate via <pin-set> so a compromised
+       or rogue CA cannot MITM the connection — replace the sample digests below.
+  That confines the app to HTTPS-to-a-known-host and closes LAN sniffing entirely.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">rag.your-clinic.example</domain>
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+        <pin-set>
+            <pin digest="SHA-256">REPLACE_WITH_BASE64_SPKI_PIN_OF_LEAF_OR_INTERMEDIATE=</pin>
+            <pin digest="SHA-256">REPLACE_WITH_BACKUP_PIN=</pin>
+        </pin-set>
+    </domain-config>
+    -->
+</network-security-config>

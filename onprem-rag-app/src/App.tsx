@@ -16,6 +16,7 @@
 import { useEffect } from 'react';
 import { AppShell } from './components/layout/AppShell';
 import { useSession } from './stores/session';
+import { useAgentRegistry } from './stores/agentRegistry';
 import { getServerUrl, isAuthenticated, me, health } from './lib/bridge';
 import { Connect, Login } from './features/auth';
 
@@ -69,8 +70,25 @@ function useBootstrap() {
   }, [setServerUrl, setHealth, setUser]);
 }
 
+/**
+ * Load the hospital-agent roster once the session is authenticated (plan 07 §3).
+ *
+ * The registry is a cross-feature dependency — the agents tab bar, the chat
+ * department badge and the Settings Data Binding table all read labels out of it —
+ * so it is loaded here rather than by whichever screen happens to mount first.
+ * `load()` is idempotent; it only refetches when something calls `load(true)`.
+ */
+function useAgentRoster() {
+  const authStatus = useSession((s) => s.authStatus);
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return;
+    void useAgentRegistry.getState().load();
+  }, [authStatus]);
+}
+
 export default function App() {
   useBootstrap();
+  useAgentRoster();
 
   const authStatus = useSession((s) => s.authStatus);
   const connected  = useSession((s) => s.connected);

@@ -3,9 +3,9 @@
 // targets ≥ 44 px. Dark theme only.
 //
 // One `GET /setup-status` call (polled every 8 s) powers the whole page: hardware,
-// per-service health, Foundry readiness, the active/loaded/cached model lists, and
-// execution providers. The page is degraded-safe — when Foundry's native core is
-// down the model lists come back empty and the Foundry service reads "error".
+// per-service health, Foundry readiness, and execution providers. Model selection
+// and residency management live on the Models page. The page is degraded-safe —
+// when Foundry's native core is down the Foundry service reads "error".
 //
 // Governing reshape (see plans/11): our Foundry is an in-process native core, so
 // there is NO start/stop/restart lifecycle and NO Docker lifecycle. The only admin
@@ -15,21 +15,21 @@
 // (`useSession` → 'admin'), never the admin "Preview as" role — previewing as a
 // non-admin must not expose a real admin the ability to actually mutate, and
 // (conversely) preview state must not hide controls the real admin should keep.
-import { useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
+import { getVersion } from '@tauri-apps/api/app';
 import {
-  Cpu, Zap, RefreshCw, Server, HardDrive, Boxes, ExternalLink,
+  Cpu, Zap, RefreshCw, Server, HardDrive, Boxes,
 } from 'lucide-react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import {
-  getSetupStatus, registerEps, selectModel, unloadModel,
-} from '../../lib/bridge';
+import { getSetupStatus, registerEps } from '../../lib/bridge';
 import type { ServiceStatus } from '../../lib/bridge';
-import { toast, useUi } from '../../stores/ui';
+import { toast } from '../../stores/ui';
 import { useSession } from '../../stores/session';
-import { Button, Select, Badge, Card, EmptyState, cn } from '../../components/ui';
+import { Button, Badge, Card, cn } from '../../components/ui';
 import { PageContainer } from '../../components/layout/PageContainer';
 import ServiceConsole from '../../components/ServiceConsole';
+import DataBindingSection from './DataBindingSection';
 
 // ── Helpers ─────────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,16 @@ function statusTone(status: string): { dot: string; badge: 'success' | 'error' |
     case 'error': return { dot: 'bg-danger',  badge: 'error' };
     default:      return { dot: 'bg-fg-subtle', badge: 'neutral' }; // "unknown"
   }
+}
+
+/** Human-readable byte size (binary units), e.g. 34359738368 → "32 GB". */
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1).replace(/\.0$/, '')} ${units[i]}`;
 }
 
 // A compact labelled value row used inside the Hardware card. Kept local (not a new
@@ -79,7 +89,6 @@ function ServiceCard({ service }: { service: ServiceStatus }) {
 
 export default function Settings() {
   const queryClient = useQueryClient();
-  const navigate = useUi((s) => s.navigate);
 
   // Gate mutating controls on the REAL role, not the previewRole (see header note).
   const isAdmin = useSession((s) => s.user?.role) === 'admin';
@@ -87,8 +96,12 @@ export default function Settings() {
   // Per-action loading flags. Kept as local state (not useMutation) because these
   // touch several controls and read cleaner as plain async handlers here.
   const [reregistering, setReregistering] = useState(false);
-  const [switching, setSwitching]         = useState(false);
-  const [unloading, setUnloading]         = useState(false);
+
+  // App (client) version from the Tauri config — static, fetched once.
+  const [appVersion, setAppVersion] = useState('');
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => {});
+  }, []);
 
   const { data: status, isLoading, isFetching } = useQuery({
     queryKey: ['setup-status'],
@@ -100,21 +113,6 @@ export default function Settings() {
   function refreshStatus() {
     queryClient.invalidateQueries({ queryKey: ['setup-status'] });
   }
-
-  // Deduped union of cached + loaded model ids for the switch dropdown, with a flag
-  // marking which are already resident (so the label can hint "(loaded)").
-  const modelOptions = useMemo(() => {
-    if (!status) return [] as { id: string; loaded: boolean }[];
-    const loaded = new Set(status.loaded_models);
-    const seen = new Set<string>();
-    const out: { id: string; loaded: boolean }[] = [];
-    for (const id of [...status.cached_models, ...status.loaded_models]) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-      out.push({ id, loaded: loaded.has(id) });
-    }
-    return out;
-  }, [status]);
 
   // ── Actions (admin only) ────────────────────────────────────────────────────
 
@@ -136,36 +134,6 @@ export default function Settings() {
     }
   }
 
-  async function handleSwitchModel(id: string) {
-    if (!id) return;
-    setSwitching(true);
-    try {
-      // select_model downloads-if-needed → loads → sets current, so it can take a while.
-      const resolved = await selectModel(id);
-      toast.success(`Active chat model set to ${resolved}.`);
-      refreshStatus();
-    } catch (err) {
-      toast.error(String(err));
-    } finally {
-      setSwitching(false);
-    }
-  }
-
-  async function handleUnloadAll() {
-    if (!status || status.loaded_models.length === 0) return;
-    setUnloading(true);
-    try {
-      // Server-side unload is per-variant; "Unload all" is a client fan-out (idempotent).
-      await Promise.all(status.loaded_models.map((id) => unloadModel(id)));
-      toast.success('All models unloaded.');
-      refreshStatus();
-    } catch (err) {
-      toast.error(String(err));
-    } finally {
-      setUnloading(false);
-    }
-  }
-
   // ── Derived display values ────────────────────────────────────────────────────
 
   const gpuLabel = status
@@ -173,7 +141,7 @@ export default function Settings() {
       ? (status.gpu.gpu_name ?? 'GPU detected')
       : 'CPU-only mode'
     : '—';
-  const activeModel = status && status.active_chat_model ? status.active_chat_model : 'none loaded';
+  const specs = status?.server_specs;
   // DocumentDB guidance appears only when its service line reports an error.
   const docDbErrored = status?.services.some((s) => s.name === 'DocumentDB' && s.status === 'error');
 
@@ -186,7 +154,7 @@ export default function Settings() {
         <div>
           <h1 className="text-xl font-bold text-fg">System Setup</h1>
           <p className="text-sm text-fg-muted mt-0.5">
-            Hardware, local AI services, and the active chat model — all on-premises.
+            Hardware, local AI services, and system health — all on-premises.
           </p>
         </div>
         <div className="sm:shrink-0">
@@ -213,14 +181,50 @@ export default function Settings() {
                 label="Accelerator"
                 value={gpuLabel}
               />
-              <InfoRow
-                icon={<Boxes size={18} />}
-                label="Active chat model"
-                value={activeModel}
-              />
             </div>
           </Card>
-
+          {/* ── Server specs ─────────────────────────────────────────────── */}
+          {/* The machine the SERVER runs on (not this device) — from /setup-status. */}
+          {specs && (
+            <Card title="Server specs" actions={<Badge variant="neutral">v{specs.server_version}</Badge>}>
+              <div className="grid gap-4 md:grid-cols-2">
+                <InfoRow icon={<Server size={18} />} label="Machine" value={specs.hostname} />
+                <InfoRow icon={<Server size={18} />} label="Operating system" value={`${specs.os} (${specs.arch})`} />
+                <InfoRow
+                  icon={<Cpu size={18} />}
+                  label="CPU"
+                  value={`${specs.cpu_model} — ${specs.physical_cores ?? '?'}C / ${specs.logical_cores}T`}
+                />
+                <InfoRow icon={<Boxes size={18} />} label="Memory" value={formatBytes(specs.total_memory_bytes)} />
+                <InfoRow
+                  icon={<Zap size={18} />}
+                  label="Accelerators"
+                  value={
+                    specs.accelerators.length > 0 ? (
+                      <span className="flex flex-col gap-0.5">
+                        {specs.accelerators.map((a) => <span key={a}>{a}</span>)}
+                      </span>
+                    ) : 'none detected'
+                  }
+                />
+                <InfoRow
+                  icon={<HardDrive size={18} />}
+                  label="Storage"
+                  value={
+                    specs.disks.length > 0 ? (
+                      <span className="flex flex-col gap-0.5">
+                        {specs.disks.map((d) => (
+                          <span key={d.mount}>
+                            {d.mount} — {formatBytes(d.available_bytes)} free of {formatBytes(d.total_bytes)}
+                          </span>
+                        ))}
+                      </span>
+                    ) : '—'
+                  }
+                />
+              </div>
+            </Card>
+          )}
           {/* ── Service Health ─────────────────────────────────────────────────── */}
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
@@ -282,89 +286,18 @@ export default function Settings() {
             </div>
           </Card>
 
-          {/* ── Active Chat Model ──────────────────────────────────────────────── */}
-          <Card
-            title="Active Chat Model"
-            actions={
-              <Button
-                size="sm"
-                variant="ghost"
-                leftIcon={<ExternalLink size={14} />}
-                onClick={() => navigate('/models')}
-                className="min-h-[44px]"
-              >
-                Manage Models
-              </Button>
-            }
-          >
-            <div className="flex flex-col gap-3">
-              <InfoRow icon={<Server size={18} />} label="Current" value={activeModel} />
-
-              {isAdmin ? (
-                modelOptions.length > 0 ? (
-                  <Select
-                    label="Switch model"
-                    hint={switching ? 'Applying — this can take a while while the model loads…' : 'Downloads if needed, loads, and sets as current.'}
-                    value={status?.active_chat_model ?? ''}
-                    disabled={switching}
-                    onChange={(e) => handleSwitchModel(e.target.value)}
-                  >
-                    {/* Placeholder shown when nothing is currently active. */}
-                    {!status?.active_chat_model && <option value="">— select a model —</option>}
-                    {modelOptions.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.id}{m.loaded ? ' (loaded)' : ''}
-                      </option>
-                    ))}
-                  </Select>
-                ) : (
-                  <p className="text-xs text-fg-subtle">
-                    No cached models to switch to. Download one from Manage Models.
-                  </p>
-                )
-              ) : (
-                // Non-admins: read-only. The current value above is all they see.
-                <p className="text-xs text-fg-subtle">Model selection is restricted to administrators.</p>
-              )}
-            </div>
-          </Card>
-
-          {/* ── Loaded Models ──────────────────────────────────────────────────── */}
-          <Card
-            title="Loaded Models"
-            actions={
-              isAdmin && status && status.loaded_models.length > 0 ? (
-                <Button
-                  size="sm"
-                  variant="danger"
-                  leftIcon={<HardDrive size={14} />}
-                  loading={unloading}
-                  onClick={handleUnloadAll}
-                  className="min-h-[44px]"
-                >
-                  Unload all
-                </Button>
-              ) : undefined
-            }
-          >
-            {status && status.loaded_models.length > 0 ? (
-              <div className="flex flex-wrap gap-2">
-                {status.loaded_models.map((id) => (
-                  <Badge key={id} variant="info">{id}</Badge>
-                ))}
-              </div>
-            ) : (
-              <EmptyState
-                icon={<Boxes size={28} />}
-                title="No models loaded"
-                description="Loaded models are held in memory for fast inference. Switch to a model above to load one."
-              />
-            )}
-          </Card>
+          {/* ── Data Binding (plan 07 §4) ──────────────────────────────────────── */}
+          {/* Admin-only: gated on the REAL role, like every other mutating control
+              on this page — a "Preview as" role must not unlock a real rebuild. */}
+          {isAdmin && <DataBindingSection />}
 
           {/* ── Activity ───────────────────────────────────────────────────────── */}
           <ServiceConsole />
-        </>
+          {/* ── About ────────────────────────────────────────────────────── */}
+          <p className="text-xs text-fg-subtle text-center">
+            OnPrem RAG{appVersion ? ` v${appVersion}` : ''}
+            {specs ? ` · Server v${specs.server_version}` : ''}
+          </p>        </>
       )}
     </div>
     </PageContainer>

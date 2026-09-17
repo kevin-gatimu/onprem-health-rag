@@ -1,8 +1,8 @@
 [package]
 name = "onprem-rag"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "On-premises RAG client for health records — chat with local data, no cloud calls"
+authors = ["Kevin"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -13,6 +13,13 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "onprem_rag_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# This crate is a thin bridge (commands + managed state + SSE relay), so full
+# DWARF buys little: it inflated the Android .so from 40 MB to 188 MB — 96% of
+# the debug APK, big enough that `adb install` fell over. Stripping debuginfo
+# keeps symbol names, so panic backtraces still name functions.
+[profile.dev]
+strip = "debuginfo"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -28,4 +35,12 @@ tokio = { version = "1.53.1", features = ["sync"] }
 # SSE: consume the server's `text/event-stream` and re-emit as Tauri events.
 futures-util = "0.3.34"
 eventsource-stream = "0.2.3"
+# OS notifications for long-running jobs finishing while the window is hidden.
+tauri-plugin-notification = "2"
+
+# Desktop-only niceties (Android is the only mobile target): one app instance,
+# remembered window geometry.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"
 

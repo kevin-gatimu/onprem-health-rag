@@ -14,6 +14,20 @@ pub const JOBS: &str = "jobs";
 pub const SETTINGS: &str = "settings";
 /// Append-only security audit log (login, logout, admin actions, etc.).
 pub const AUDIT_LOG: &str = "audit_log";
+/// nl2sql: versioned table cards with embedded schema text + cardVector.
+pub const SCHEMA_CATALOG: &str = "schema_catalog";
+/// One active schema-catalog version and refresh status per source.
+pub const SCHEMA_CATALOG_STATE: &str = "schema_catalog_state";
+/// Bounded operational history of metadata checks and refreshes.
+pub const SCHEMA_CATALOG_HISTORY: &str = "schema_catalog_history";
+/// Admin-curated aliases and undeclared relationships, independent of generations.
+pub const SCHEMA_METADATA_OVERRIDES: &str = "schema_metadata_overrides";
+/// Per-source schema bindings (service-line ontology). One doc per source_id,
+/// keyed by `source_id`. Written by `build_binding`.
+pub const SCHEMA_BINDINGS: &str = "schema_bindings";
+/// History of past schema bindings for audit / diff. One doc per binding run,
+/// keyed by `{source_id}:{bound_at}`.
+pub const SCHEMA_BINDING_HISTORY: &str = "schema_binding_history";
 /// Per-table ingestion state: one doc per `{source_id}:{table}`, tracking status,
 /// row/vector counts, and timestamps. Read by `GET /ingest/history`.
 pub const INDEXED_TABLES: &str = "indexed_tables";
@@ -40,7 +54,9 @@ impl DocumentDb {
 
     /// Best-effort round-trip to verify the server is reachable.
     pub async fn ping(&self) -> AppResult<()> {
-        self.db.run_command(mongodb::bson::doc! { "ping": 1 }).await?;
+        self.db
+            .run_command(mongodb::bson::doc! { "ping": 1 })
+            .await?;
         Ok(())
     }
 
@@ -80,6 +96,106 @@ impl DocumentDb {
     pub fn chat_messages(&self) -> Collection<Document> {
         self.collection(CHAT_MESSAGES)
     }
+
+    pub fn schema_catalog(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG)
+    }
+
+    pub fn schema_catalog_state(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG_STATE)
+    }
+
+    pub fn schema_catalog_history(&self) -> Collection<Document> {
+        self.collection(SCHEMA_CATALOG_HISTORY)
+    }
+
+    pub fn schema_metadata_overrides(&self) -> Collection<Document> {
+        self.collection(SCHEMA_METADATA_OVERRIDES)
+    }
+
+    pub fn schema_bindings(&self) -> Collection<Document> {
+        self.collection(SCHEMA_BINDINGS)
+    }
+
+    pub fn schema_binding_history(&self) -> Collection<Document> {
+        self.collection(SCHEMA_BINDING_HISTORY)
+    }
+}
+
+/// Backfill generation markers for records created before versioned ingestion.
+/// Idempotent and safe to run at every startup.
+pub async fn ensure_records_indexes(db: &DocumentDb) -> AppResult<()> {
+    db.db
+        .run_command(mongodb::bson::doc! {
+            "createIndexes": RECORDS,
+            "indexes": [
+                {
+                    "name": "records_source_table_active_row",
+                    "key": {
+                        "source_id": 1,
+                        "table": 1,
+                        "active": 1,
+                        "row_pk": 1,
+                        "chunk_index": 1
+                    }
+                },
+                {
+                    "name": "records_source_table_active_generation",
+                    "key": {
+                        "source_id": 1,
+                        "table": 1,
+                        "active": 1,
+                        "ingest_generation": 1
+                    }
+                }
+            ]
+        })
+        .await?;
+    Ok(())
+}
+
+pub async fn ensure_ingest_generations(db: &DocumentDb) -> AppResult<()> {
+    db.records()
+        .update_many(
+            mongodb::bson::doc! { "active": { "$exists": false } },
+            mongodb::bson::doc! { "$set": { "active": true, "ingest_generation": "legacy" } },
+        )
+        .await?;
+    db.indexed_tables()
+        .update_many(
+            mongodb::bson::doc! { "active_generation": { "$exists": false }, "status": "indexed" },
+            mongodb::bson::doc! { "$set": { "active_generation": "legacy", "refresh_status": "idle" } },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Mark work interrupted by a previous process exit as resumable failure.
+/// Active and staged generations are retained; retry cleanup remains generation-safe.
+pub async fn recover_abandoned_ingestions(db: &DocumentDb) -> AppResult<()> {
+    let now = mongodb::bson::DateTime::now();
+
+    db.indexed_tables()
+        .update_many(
+            mongodb::bson::doc! { "refresh_status": "indexing" },
+            mongodb::bson::doc! { "$set": {
+                "refresh_status": "idle",
+                "recovered_at": now,
+            } },
+        )
+        .await?;
+    db.jobs()
+        .update_many(
+            mongodb::bson::doc! { "status": "running" },
+            mongodb::bson::doc! { "$set": {
+                "status": "failed",
+                "finished_at": now,
+                "recovery_error": "server restarted before ingestion completed",
+            }, "$inc": { "errors": 1i64 } },
+        )
+        .await?;
+
+    Ok(())
 }
 
 /// Ensure the chat collections have the indexes they need. Call once at boot
@@ -120,6 +236,9 @@ pub async fn ensure_user_indexes(db: &DocumentDb) -> AppResult<()> {
         }]
     };
     db.db.run_command(command).await?;
-    tracing::info!(index = "users_email_unique", "ensured unique email index on users");
+    tracing::info!(
+        index = "users_email_unique",
+        "ensured unique email index on users"
+    );
     Ok(())
 }

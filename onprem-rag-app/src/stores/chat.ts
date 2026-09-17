@@ -1,92 +1,262 @@
-// Chat store — single in-flight RAG run.
-//
-// There is only ever one pending run at a time (the UI locks during streaming).
-// Every setter guards on runId so a stale run's late events are silently dropped.
-// The boot-time listeners in bridgeEvents.ts write here; the Chat screen reads it.
+// Chat store — concurrent runs plus per-conversation prompt queues.
 import { create } from 'zustand';
-import type { Passage } from '../lib/bridge';
+import type { ClarifyPayload, Passage, Provenance, RetrievalOpts, RoutedEvent, SqlResult, StageEvent, Suggestion, VerifyReport } from '../lib/bridge';
+import { applyStageEvent, type StageStep } from './stages';
 
-export type ChatPhase = 'searching' | 'generating' | 'done';
+export type ChatPhase = 'searching' | 'generating' | 'done' | 'stopped';
 
 export interface PendingRun {
   runId: string;
   conversationId: string;
-  /** The user's question text (used for the optimistic user bubble). */
   user: string;
-  /** Accumulated streamed answer text. */
+  opts: RetrievalOpts;
   answer: string;
   citations: Passage[];
+  sqlResult: Partial<SqlResult> | null;
+  /** Faithfulness verdict, or null until the post-stream `verify` event arrives
+   *  (which it may never do — the check is opt-in server-side). */
+  verify: VerifyReport | null;
+  /**
+   * The `routed` decision for this run. VERIFIED: `/chat` emits the full
+   * `RouteDecision::to_sse_json()` object (`onprem-rag-server/src/rag/routes.rs`
+   * ≈L327/L558), which is what carries `service_line` and `deterministic`.
+   */
+  routed: RoutedEvent | null;
+  /** Execution provenance (plan 06). */
+  provenance: Provenance | null;
+  /** Follow-up suggestion chips (plan 06). */
+  suggestions: Suggestion[];
+  /** Active focus entities (plan 06). */
+  focusUsed: string[];
+  /** Clarification request (plan 06). */
+  clarify: ClarifyPayload | null;
   error: string | null;
   phase: ChatPhase;
+  /** Pipeline steps the server reported for this run, oldest first. */
+  stages: StageStep[];
+  startedAt: number;
+}
+
+export interface QueuedChatPrompt {
+  id: string;
+  conversationId: string;
+  user: string;
+  opts: RetrievalOpts;
+  queuedAt: number;
 }
 
 interface ChatState {
-  pending: PendingRun | null;
-  startRun(runId: string, conversationId: string, user: string): void;
-  /** Append a batch of token strings. Ignores stale runId. */
+  activeConversationId: string | null;
+  runs: Record<string, PendingRun>;
+  queues: Record<string, QueuedChatPrompt[]>;
+  drafts: Record<string, string>;
+  setActiveConversation(id: string | null): void;
+  setDraft(conversationKey: string, text: string): void;
+  startRun(runId: string, conversationId: string, user: string, opts: RetrievalOpts): void;
   appendAnswer(runId: string, batch: string[]): void;
-  /** Set the retrieved passages and advance phase to 'generating'. Ignores stale runId. */
-  setCitations(runId: string, c: Passage[]): void;
-  /** Record an error and set phase to 'done'. Ignores stale runId. */
-  setError(runId: string, msg: string): void;
-  /** Mark phase 'done' (stream completed normally). Ignores stale runId. */
+  setCitations(runId: string, citations: Passage[]): void;
+  setSqlMetadata(runId: string, sourceId: string, sql: string): void;
+  setSqlColumns(runId: string, columns: string[]): void;
+  setSqlRows(runId: string, rows: unknown[][]): void;
+  setVerify(runId: string, report: VerifyReport): void;
+  setRouted(runId: string, payload: RoutedEvent): void;
+  setProvenance(runId: string, provenance: Provenance): void;
+  setSuggestions(runId: string, suggestions: Suggestion[]): void;
+  setFocusUsed(runId: string, focusUsed: string[]): void;
+  setClarify(runId: string, clarify: ClarifyPayload): void;
+  pushStage(runId: string, event: StageEvent): void;
+  setError(runId: string, message: string): void;
+  markStopped(runId: string): void;
   finish(runId: string): void;
-  /** Clear the pending run (call only after invalidateQueries resolves). */
-  clear(): void;
+  removeRun(runId: string): void;
+  enqueue(prompt: QueuedChatPrompt): void;
+  removeQueued(conversationId: string, promptId: string): void;
+  reset(): void;
 }
 
 export const useChat = create<ChatState>((set, get) => ({
-  pending: null,
+  activeConversationId: null,
+  runs: {},
+  queues: {},
+  drafts: {},
 
-  startRun(runId, conversationId, user) {
-    set({
-      pending: {
-        runId,
-        conversationId,
-        user,
-        answer: '',
-        citations: [],
-        error: null,
-        phase: 'searching',
+  setActiveConversation(activeConversationId) {
+    set({ activeConversationId });
+  },
+
+  setDraft(conversationKey, text) {
+    set((state) => ({ drafts: { ...state.drafts, [conversationKey]: text } }));
+  },
+
+  startRun(runId, conversationId, user, opts) {
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: {
+          runId,
+          conversationId,
+          user,
+          opts,
+          answer: '',
+          citations: [],
+          sqlResult: null,
+          verify: null,
+          routed: null,
+          provenance: null,
+          suggestions: [],
+          focusUsed: [],
+          clarify: null,
+          error: null,
+          phase: 'searching',
+          stages: [],
+          startedAt: Date.now(),
+        },
       },
-    });
+    }));
   },
 
   appendAnswer(runId, batch) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, answer: s.pending.answer + batch.join('') }
-        : null,
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], answer: state.runs[runId].answer + batch.join('') },
+      },
     }));
   },
 
-  setCitations(runId, c) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, citations: c, phase: 'generating' }
-        : null,
+  setCitations(runId, citations) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], citations, phase: 'generating' } },
     }));
   },
 
-  setError(runId, msg) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending
-        ? { ...s.pending, error: msg, phase: 'done' }
-        : null,
+  setSqlMetadata(runId, source_id, sql) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], sqlResult: { ...state.runs[runId].sqlResult, source_id, sql } },
+      },
+    }));
+  },
+
+  setSqlColumns(runId, columns) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], sqlResult: { ...state.runs[runId].sqlResult, columns } },
+      },
+    }));
+  },
+
+  setSqlRows(runId, rows) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], sqlResult: { ...state.runs[runId].sqlResult, rows } },
+      },
+    }));
+  },
+
+  setVerify(runId, verify) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], verify } },
+    }));
+  },
+
+  setRouted(runId, routed) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], routed } } }));
+  },
+
+  setProvenance(runId, provenance) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], provenance } } }));
+  },
+
+  setSuggestions(runId, suggestions) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], suggestions } } }));
+  },
+
+  setFocusUsed(runId, focusUsed) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], focusUsed } } }));
+  },
+
+  setClarify(runId, clarify) {
+    if (!get().runs[runId]) return;
+    set((state) => ({ runs: { ...state.runs, [runId]: { ...state.runs[runId], clarify } } }));
+  },
+
+  pushStage(runId, event) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: {
+        ...state.runs,
+        [runId]: { ...state.runs[runId], stages: applyStageEvent(state.runs[runId].stages, event) },
+      },
+    }));
+  },
+
+  setError(runId, error) {
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], error, phase: 'done' } },
+    }));
+  },
+
+  markStopped(runId) {
+    if (!get().runs[runId]) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], phase: 'stopped' } },
     }));
   },
 
   finish(runId) {
-    if (get().pending?.runId !== runId) return;
-    set((s) => ({
-      pending: s.pending ? { ...s.pending, phase: 'done' } : null,
+    const run = get().runs[runId];
+    if (!run) return;
+    set((state) => ({
+      runs: { ...state.runs, [runId]: { ...state.runs[runId], phase: 'done' } },
     }));
   },
 
-  clear() {
-    set({ pending: null });
+  removeRun(runId) {
+    set((state) => {
+      const runs = { ...state.runs };
+      delete runs[runId];
+      return { runs };
+    });
+  },
+
+  enqueue(prompt) {
+    set((state) => ({
+      queues: {
+        ...state.queues,
+        [prompt.conversationId]: [...(state.queues[prompt.conversationId] ?? []), prompt],
+      },
+    }));
+  },
+
+  removeQueued(conversationId, promptId) {
+    set((state) => ({
+      queues: {
+        ...state.queues,
+        [conversationId]: (state.queues[conversationId] ?? []).filter((item) => item.id !== promptId),
+      },
+    }));
+  },
+
+  reset() {
+    set({ activeConversationId: null, runs: {}, queues: {}, drafts: {} });
   },
 }));

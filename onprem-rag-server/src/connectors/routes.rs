@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 use mongodb::bson::doc;
 use rocket::serde::json::Json;
-use rocket::serde::json::{json, Value};
+use rocket::serde::json::{Value, json};
 use rocket::{State, delete, get, patch, post};
 use serde::{Deserialize, Serialize};
 
@@ -85,7 +85,11 @@ impl From<SourceDoc> for SourceInfo {
             table: d.table,
             created_at: d.created_at,
             // Empty (legacy / untested) surfaces to the UI as "disconnected".
-            status: if d.status.is_empty() { "disconnected".into() } else { d.status },
+            status: if d.status.is_empty() {
+                "disconnected".into()
+            } else {
+                d.status
+            },
             last_connected: d.last_connected,
             error: d.error,
         }
@@ -132,9 +136,25 @@ pub struct TestResult {
 
 /// Load a saved source by id and decrypt its password into a usable [`SourceSpec`].
 /// Used by ingestion (WS5) to connect to a previously-registered database.
+pub(crate) async fn connected_source_ids(db: &DocumentDb) -> AppResult<Vec<String>> {
+    use futures::TryStreamExt;
+
+    let coll = db.collection::<SourceDoc>(SOURCES);
+    let sources: Vec<SourceDoc> = coll
+        .find(doc! { "status": "connected" })
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?
+        .try_collect()
+        .await?;
+    Ok(sources.into_iter().map(|source| source.id).collect())
+}
+
 pub(crate) async fn load_spec(db: &DocumentDb, config: &Config, id: &str) -> AppResult<SourceSpec> {
     let coll = db.collection::<SourceDoc>(SOURCES);
-    let doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let password = CredentialCipher::from_config(config).decrypt(&doc.password_enc)?;
     Ok(SourceSpec {
         kind: doc.kind,
@@ -154,7 +174,9 @@ fn validate(input: &SourceInput) -> AppResult<()> {
         return Err(AppError::BadRequest("source name is required".into()));
     }
     if input.host.trim().is_empty() || input.database.trim().is_empty() {
-        return Err(AppError::BadRequest("host and database are required".into()));
+        return Err(AppError::BadRequest(
+            "host and database are required".into(),
+        ));
     }
     Ok(())
 }
@@ -198,11 +220,19 @@ pub(crate) fn humanize_conn_error(raw: &str) -> String {
 
 /// `GET /sources` — list saved sources (no secrets). Any authenticated user.
 #[get("/sources")]
-pub async fn list_sources(state: &State<AppState>, _user: AuthUser) -> AppResult<Json<Vec<SourceInfo>>> {
+pub async fn list_sources(
+    state: &State<AppState>,
+    _user: AuthUser,
+) -> AppResult<Json<Vec<SourceInfo>>> {
     use futures::TryStreamExt;
 
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let docs: Vec<SourceDoc> = coll.find(doc! {}).await?.try_collect().await?;
+    let docs: Vec<SourceDoc> = coll
+        .find(doc! {})
+        .sort(doc! { "created_at": -1, "_id": -1 })
+        .await?
+        .try_collect()
+        .await?;
     Ok(Json(docs.into_iter().map(SourceInfo::from).collect()))
 }
 
@@ -232,7 +262,9 @@ pub async fn create_source(
     let name = input.name.trim().to_string();
     let coll = state.db.collection::<SourceDoc>(SOURCES);
     if coll.find_one(doc! { "name": &name }).await?.is_some() {
-        return Err(AppError::BadRequest(format!("a source named '{name}' already exists")));
+        return Err(AppError::BadRequest(format!(
+            "a source named '{name}' already exists"
+        )));
     }
 
     let spec = input.into_spec();
@@ -242,6 +274,7 @@ pub async fn create_source(
     }
 
     let password_enc = CredentialCipher::from_config(&state.config).encrypt(&spec.password)?;
+    let catalog_spec = spec.clone();
     let now = Utc::now();
     let source = SourceDoc {
         id: uuid::Uuid::now_v7().to_string(),
@@ -262,12 +295,31 @@ pub async fn create_source(
         error: None,
     };
     coll.insert_one(&source).await?;
+    if state.config.router.text2sql_enabled {
+        if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
+            &state.db,
+            &state.config,
+            &catalog_spec,
+            &source.id,
+            "source_created",
+            &state.binding_cache(),
+        )
+        .await
+        {
+            tracing::warn!(source_id = %source.id, %error, "failed to build SQL schema catalog");
+        }
+    }
     // user.id was moved into source.created_by when building the struct; use the
     // stored copy rather than contorting the handler to clone it earlier.
     audit::write_audit(
-        &state.db, &source.created_by, &user.username, "source_created", &source.id,
+        &state.db,
+        &source.created_by,
+        &user.username,
+        "source_created",
+        &source.id,
         Some(json!({ "name": source.name, "kind": format!("{:?}", source.kind) })),
-    ).await;
+    )
+    .await;
     Ok(Json(SourceInfo::from(source)))
 }
 
@@ -300,7 +352,10 @@ pub async fn update_source(
 ) -> AppResult<Json<SourceInfo>> {
     user.require_admin()?;
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let mut doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let mut doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let upd = body.into_inner();
 
     if let Some(n) = upd.name {
@@ -311,7 +366,9 @@ pub async fn update_source(
         // Guard against colliding with a different source's name.
         if let Some(other) = coll.find_one(doc! { "name": &n }).await? {
             if other.id != doc.id {
-                return Err(AppError::BadRequest(format!("a source named '{n}' already exists")));
+                return Err(AppError::BadRequest(format!(
+                    "a source named '{n}' already exists"
+                )));
             }
         }
         doc.name = n;
@@ -347,7 +404,36 @@ pub async fn update_source(
     doc.error = None;
 
     coll.replace_one(doc! { "_id": id }, &doc).await?;
-    audit::write_audit(&state.db, &user.id, &user.username, "source_updated", id, None).await;
+    state
+        .db
+        .schema_catalog()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_state()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_history()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_metadata_overrides()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    crate::nl2sql::linker::invalidate_source(id);
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "source_updated",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(SourceInfo::from(doc)))
 }
 
@@ -362,7 +448,10 @@ pub async fn test_saved_source(
 ) -> AppResult<Json<SourceInfo>> {
     user.require_admin()?;
     let coll = state.db.collection::<SourceDoc>(SOURCES);
-    let mut doc = coll.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let mut doc = coll
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let spec = load_spec(&state.db, &state.config, id).await?;
 
     match connector(&spec).test().await {
@@ -370,6 +459,20 @@ pub async fn test_saved_source(
             doc.status = "connected".into();
             doc.last_connected = Some(Utc::now());
             doc.error = None;
+            if state.config.router.text2sql_enabled {
+                if let Err(error) = crate::nl2sql::catalog::refresh_catalog_with_trigger(
+                    &state.db,
+                    &state.config,
+                    &spec,
+                    id,
+                    "connection_test",
+                    &state.binding_cache(),
+                )
+                .await
+                {
+                    tracing::warn!(source_id = %id, %error, "failed to refresh SQL schema catalog");
+                }
+            }
         }
         Err(e) => {
             doc.status = "error".into();
@@ -401,13 +504,42 @@ pub async fn delete_source(
         .collection::<mongodb::bson::Document>(crate::documentdb::RECORDS)
         .delete_many(doc! { "source_id": id })
         .await?;
-    // Also clear indexed_tables entries for this source.
+    // Also clear indexed tables and NL-to-SQL schema cards for this source.
     state
         .db
         .collection::<mongodb::bson::Document>(INDEXED_TABLES)
         .delete_many(doc! { "source_id": id })
         .await?;
-    audit::write_audit(&state.db, &user.id, &user.username, "source_deleted", id, None).await;
+    state
+        .db
+        .schema_catalog()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_state()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    state
+        .db
+        .schema_catalog_history()
+        .delete_many(doc! { "source_id": id })
+        .await?;
+    state
+        .db
+        .schema_metadata_overrides()
+        .delete_one(doc! { "_id": id })
+        .await?;
+    crate::nl2sql::linker::invalidate_source(id);
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "source_deleted",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -451,8 +583,24 @@ pub struct SchemaAnalysis {
 
 /// Column-name substrings that indicate PII in health records. Matched
 /// case-insensitively against each column name.
+///
+/// NOTE: the bare `"name"` token was deliberately removed (see the parallel fix
+/// to `ColumnRole::PersonFullName` in `ontology/roles.rs`). A bare "name"
+/// substring matches dozens of non-person columns (generic_name, brand_name,
+/// condition_name, panel_name, care_programs.name, equipment.name, …) and was
+/// suppressing their `enum_values` — starving Stage B value-domain evidence in
+/// the disambiguation cascade. Genuine person-name columns are covered by the
+/// explicit tokens below: `"first_name"`, `"last_name"`, `"middle_name"`,
+/// `"full_name"`, and `"fullname"` (matching the token set in `ROLE_TOKENS`
+/// for the three person-name roles, so there is ONE coherent definition rather
+/// than two independently-tuned ones). `"guarantor"`, `"next_of_kin"`, and
+/// `"contact"` already catch compound patterns like `guarantor_name` and
+/// `contact_name`, so no bare "name" fallback is needed for those either.
 const PII_KEYWORDS: &[&str] = &[
-    "name",
+    // Person-name: explicit qualifiers only — no bare "name" (see note above)
+    "full_name",
+    "fullname",
+    "middle_name",
     "first_name",
     "last_name",
     "dob",
@@ -571,7 +719,14 @@ pub async fn analyze_schema(
              for ingestion, and data quality issues:\n\n{table_desc}"
         );
 
-        if let Ok(raw) = foundry.complete(system, &user).await {
+        if let Ok(raw) = foundry
+            .complete_with(
+                &state.spec_for(crate::foundry::router::ModelRole::Extract),
+                system,
+                &user,
+            )
+            .await
+        {
             // Parse the LLM JSON response; fall back to deterministic on any failure.
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw) {
                 if let Some(s) = parsed.get("summary").and_then(|v| v.as_str()) {
@@ -580,9 +735,7 @@ pub async fn analyze_schema(
                     }
                 }
                 // Merge LLM-detected PII columns on top of the deterministic pass.
-                if let Some(pii_map) =
-                    parsed.get("pii_columns").and_then(|v| v.as_object())
-                {
+                if let Some(pii_map) = parsed.get("pii_columns").and_then(|v| v.as_object()) {
                     for (table, cols) in pii_map {
                         if let Some(col_arr) = cols.as_array() {
                             let llm_cols: Vec<String> = col_arr
@@ -597,9 +750,7 @@ pub async fn analyze_schema(
                     }
                 }
                 // LLM-suggested tables (may differ from the keyword pass).
-                if let Some(sug_arr) =
-                    parsed.get("suggested_tables").and_then(|v| v.as_array())
-                {
+                if let Some(sug_arr) = parsed.get("suggested_tables").and_then(|v| v.as_array()) {
                     let llm_suggested: Vec<String> = sug_arr
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
@@ -611,9 +762,7 @@ pub async fn analyze_schema(
                         }
                     }
                 }
-                if let Some(notes) =
-                    parsed.get("data_quality_notes").and_then(|v| v.as_array())
-                {
+                if let Some(notes) = parsed.get("data_quality_notes").and_then(|v| v.as_array()) {
                     data_quality_notes = notes
                         .iter()
                         .filter_map(|v| v.as_str().map(str::to_string))
@@ -630,5 +779,78 @@ pub async fn analyze_schema(
         cols.dedup();
     }
 
-    Ok(Json(SchemaAnalysis { summary, suggested_tables, pii_columns, data_quality_notes }))
+    Ok(Json(SchemaAnalysis {
+        summary,
+        suggested_tables,
+        pii_columns,
+        data_quality_notes,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::is_likely_pii;
+
+    /// Verifies that the PII_KEYWORDS list covers every genuine person-name
+    /// column pattern from both schemas (dev and alt) and does NOT flag
+    /// non-person `*_name` columns that were wrongly marked as PII by the old
+    /// bare `"name"` token.
+    ///
+    /// (a) All person-name columns must be flagged PII.
+    /// (b) Non-person `*_name` columns (drug, lab, entity names) must NOT be
+    ///     flagged PII — previously they were, which suppressed their
+    ///     `enum_values` and starved Stage B value-domain evidence in the
+    ///     disambiguation cascade.
+    #[test]
+    fn pii_name_columns_both_directions() {
+        // (a) Genuine person-name columns — dev schema (patients + providers)
+        for col in [
+            "first_name",   // patients.first_name, providers.first_name
+            "last_name",    // patients.last_name,  providers.last_name
+            "middle_name",  // patients.middle_name
+            "full_name",    // forward-compat / real-schema full_name
+            "fullname",     // alternate spelling
+        ] {
+            assert!(
+                is_likely_pii(col),
+                "person-name column '{col}' must be is_likely_pii (person PII)"
+            );
+        }
+        // Also via compound columns where the OTHER keyword already fires
+        assert!(is_likely_pii("patient_first_name"),  "patient_first_name must be PII");
+        assert!(is_likely_pii("guarantor_name"),      "guarantor_name → 'guarantor' fires");
+        assert!(is_likely_pii("next_of_kin_name"),    "next_of_kin_name → 'next_of_kin' fires");
+
+        // (b) Non-person *_name columns from the real dev + alt schemas
+        for col in [
+            // dev — medication_catalog
+            "generic_name",
+            "brand_name",
+            // dev — lab
+            "panel_name",
+            "test_name",
+            // dev — clinical
+            "condition_name",
+            "procedure_name",
+            // dev — entity / administrative
+            "clinic_name",
+            "disease_name",
+            "short_name",
+            "file_name",
+            // dev — bare entity names (departments, wards, allergen_catalog,
+            //        vaccine_catalog, insurance_providers, care_programs, equipment)
+            "name",
+            // alt — DrugMaster
+            // generic_name / brand_name already above
+        ] {
+            assert!(
+                !is_likely_pii(col),
+                "non-person column '{col}' must NOT be is_likely_pii"
+            );
+        }
+    }
 }

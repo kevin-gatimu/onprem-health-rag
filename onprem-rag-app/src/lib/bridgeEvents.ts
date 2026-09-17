@@ -9,15 +9,28 @@
 // Per-stage listeners (chat://, ingest://, model://, agent://) are added to this
 // file as those screens land, so there is always exactly one subscription each.
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { startLogStream, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AggRow } from "./bridge";
-import { useStream, createRafBuffer } from "../stores/stream";
+import { startLogStream, parseRoutedPayload, type LogLine, type IngestProgress, type ChatEvent, type Passage, type AgentKind, type AgentPage, type AggRow, type ModelEvent, type Provenance, type RoutedEvent, type StageEvent, type Suggestion, type VerifyReport, type ClarifyPayload } from "./bridge";
+import { useStream, createKeyedRafBuffer, createRafBuffer } from "../stores/stream";
 import { useIngestion } from "../stores/ingestion";
+import { notifyBackground } from "./notify";
 import { toast } from "../stores/ui";
 import { useChat } from "../stores/chat";
 import { useAgents } from "../stores/agents";
+import { useModels } from "../stores/models";
 
 let started = false;
 const unlisteners: UnlistenFn[] = [];
+
+// HMR: without this, editing any module in this import chain re-runs the file and
+// re-registers every listener on top of the old ones — each chat token then lands
+// twice and streamed answers read "HelloHello!! I I'm'm…" until the DB refetch.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    for (const un of unlisteners) un();
+    unlisteners.length = 0;
+    started = false;
+  });
+}
 
 /**
  * Register all bridge listeners and start the always-on server log relay.
@@ -58,8 +71,9 @@ export async function initBridgeEvents(): Promise<void> {
   );
 
   // Kick off the relay. Idempotent server-side (at most one stream per session).
+  // Fails with "not logged in" before auth — AppShell retries on mount (post-login).
   startLogStream().catch(() => {
-    /* server may not be reachable yet; the Connect flow retries */
+    /* retried from AppShell once authenticated */
   });
 
   // Ingest progress events — arrive at ~2/sec, no rAF buffering needed (log array
@@ -82,6 +96,7 @@ export async function initBridgeEvents(): Promise<void> {
         // doesn't stay stuck on "ingesting" forever.
         useIngestion.getState().markComplete();
       }
+      void notifyBackground("Ingestion finished", "The ingestion job has completed.");
     }),
   );
 
@@ -96,6 +111,24 @@ export async function initBridgeEvents(): Promise<void> {
         toast.error(typeof p === "string" ? p : "Ingestion failed");
         useIngestion.getState().markComplete();
       }
+      void notifyBackground("Ingestion failed", "The ingestion job reported an error.");
+    }),
+  );
+
+  // ── Model download listeners (Stage 8) ───────────────────────────────────────
+  // Fan `model://progress|status` into the models store keyed by variant_id so the
+  // progress bar survives navigation. Terminal events (done/error) are handled by
+  // the store's startDownload via the invoke promise — no listeners needed here.
+  unlisteners.push(
+    await listen<ModelEvent>("model://progress", (ev) => {
+      const pct = parseFloat(ev.payload.data);
+      if (!Number.isNaN(pct)) useModels.getState().applyProgress(ev.payload.variant_id, pct);
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ModelEvent>("model://status", (ev) => {
+      useModels.getState().applyStatus(ev.payload.variant_id, ev.payload.data);
     }),
   );
 
@@ -103,18 +136,28 @@ export async function initBridgeEvents(): Promise<void> {
   // Registered once at boot; each event carries a run_id so stale-run events are
   // dropped (double-filtered: the push guard + the store's setter guard).
 
-  // Token buffer: coalesces per-token pushes to one store update per rAF frame.
-  const tokenBuffer = createRafBuffer<string>((batch) => {
-    const p = useChat.getState().pending;
-    if (p) useChat.getState().appendAnswer(p.runId, batch);
+  // Each run gets its own frame batch so simultaneous streams cannot mix tokens.
+  const tokenBuffer = createKeyedRafBuffer<string>((runId, batch) => {
+    useChat.getState().appendAnswer(runId, batch);
   });
 
   unlisteners.push(
     await listen<ChatEvent>("chat://token", (ev) => {
       const { run_id, data } = ev.payload;
-      if (run_id === useChat.getState().pending?.runId) {
-        tokenBuffer.push(data);
-      }
+      if (useChat.getState().runs[run_id]) tokenBuffer.push(run_id, data);
+    }),
+  );
+
+  // BOTH the `/chat` route (onprem-rag-server/src/rag/routes.rs L332) and the
+  // `/agents/<kind>` route (onprem-rag-server/src/agents/routes.rs L408) emit the FULL
+  // routed decision object — `RouteDecision::to_sse_json()`, which is what carries
+  // `service_line` and `deterministic`. The agent://routed listener below still accepts
+  // the pre-plan-05 bare kind string as a compatibility floor.
+  unlisteners.push(
+    await listen<ChatEvent>("chat://routed", (ev) => {
+      const { run_id, data } = ev.payload;
+      const parsed = parseRoutedPayload(data);
+      if (parsed) useChat.getState().setRouted(run_id, parsed);
     }),
   );
 
@@ -131,8 +174,68 @@ export async function initBridgeEvents(): Promise<void> {
   );
 
   unlisteners.push(
+    await listen<ChatEvent>("chat://sql", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const metadata = JSON.parse(data) as { source_id: string; sql: string };
+        useChat.getState().setSqlMetadata(run_id, metadata.source_id, metadata.sql);
+      } catch {
+        /* ignore malformed SQL metadata */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://columns", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSqlColumns(run_id, JSON.parse(data) as string[]);
+      } catch {
+        /* ignore malformed SQL columns */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://rows", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSqlRows(run_id, JSON.parse(data) as unknown[][]);
+      } catch {
+        /* ignore malformed SQL rows */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://verify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setVerify(run_id, JSON.parse(data) as VerifyReport);
+      } catch {
+        /* ignore malformed verify payload — the answer stands unannotated */
+      }
+    }),
+  );
+
+  // Live pipeline steps, relayed from the server's per-run progress stream. These
+  // arrive *while* the server is still working — before any citations or tokens —
+  // which is the whole point: the strip shows the actual step instead of a spinner.
+  unlisteners.push(
+    await listen<ChatEvent>("chat://stage", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().pushStage(run_id, JSON.parse(data) as StageEvent);
+      } catch {
+        /* ignore malformed stage payload — the answer is unaffected */
+      }
+    }),
+  );
+
+  unlisteners.push(
     await listen<ChatEvent>("chat://error", (ev) => {
       const { run_id, data } = ev.payload;
+      tokenBuffer.flushNow(run_id);
       useChat.getState().setError(run_id, data);
     }),
   );
@@ -140,7 +243,7 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("chat://done", (ev) => {
       const { run_id } = ev.payload;
-      tokenBuffer.flushNow();
+      tokenBuffer.flushNow(run_id);
       useChat.getState().finish(run_id);
     }),
   );
@@ -149,18 +252,15 @@ export async function initBridgeEvents(): Promise<void> {
   // Registered once at boot; each event carries a run_id so stale-run events are
   // dropped (double-filtered: the push guard + the store's setter guard).
 
-  // Token buffer: coalesces per-token pushes to one store update per rAF frame.
-  const agentTokenBuffer = createRafBuffer<string>((batch) => {
-    const p = useAgents.getState().pending;
-    if (p) useAgents.getState().appendAnswer(p.runId, batch);
+  // Keep independent agent streams in separate frame batches.
+  const agentTokenBuffer = createKeyedRafBuffer<string>((runId, batch) => {
+    useAgents.getState().appendAnswer(runId, batch);
   });
 
   unlisteners.push(
     await listen<ChatEvent>("agent://token", (ev) => {
       const { run_id, data } = ev.payload;
-      if (run_id === useAgents.getState().pending?.runId) {
-        agentTokenBuffer.push(data);
-      }
+      if (useAgents.getState().runs[run_id]) agentTokenBuffer.push(run_id, data);
     }),
   );
 
@@ -168,8 +268,19 @@ export async function initBridgeEvents(): Promise<void> {
     await listen<ChatEvent>("agent://routed", (ev) => {
       const { run_id, data } = ev.payload;
       try {
-        const kind = JSON.parse(data) as AgentKind;
-        useAgents.getState().setRouted(run_id, kind);
+        const parsed = JSON.parse(data);
+        if (typeof parsed === "string") {
+          // Pre-plan-05 compatibility floor: server emitted a bare kind string.
+          useAgents.getState().setRouted(run_id, parsed as AgentKind);
+        } else if (parsed && typeof parsed === "object" && "route" in parsed) {
+          // CURRENT (plan 05): `RouteDecision::to_sse_json()` — a full RoutedEvent
+          // object with route/backend/service_line/deterministic/scope_size.
+          useAgents.getState().setRoutedFull(run_id, parsed as RoutedEvent);
+        } else {
+          // Unexpected shape — extract kind best-effort.
+          const kind = (parsed as Record<string, unknown>).route ?? parsed;
+          useAgents.getState().setRouted(run_id, String(kind) as AgentKind);
+        }
       } catch {
         /* ignore malformed routed payload */
       }
@@ -187,11 +298,66 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // Plan 07 §3: an agent run can carry a live SQL result. SPEC-DERIVED — today's
+  // agents route emits neither `sql` nor `columns`, so these two never fire; they
+  // exist so the accumulator is complete when the source_sql backend reaches the
+  // agents route.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://sql", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const metadata = JSON.parse(data) as { source_id: string; sql: string };
+        useAgents.getState().setSqlMetadata(run_id, metadata.source_id, metadata.sql);
+      } catch {
+        /* ignore malformed SQL metadata */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://columns", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setSqlColumns(run_id, JSON.parse(data) as string[]);
+      } catch {
+        /* ignore malformed SQL columns */
+      }
+    }),
+  );
+
+  // Enumeration answers arrive as `page` then `rows`. Ordered that way by the server so
+  // this listener knows, before the rows land, that they are whole records rather than
+  // chart pairs — see the `rows` handler below.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://page", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setPage(run_id, JSON.parse(data) as AgentPage);
+      } catch {
+        /* ignore malformed page payload */
+      }
+    }),
+  );
+
+  // `rows` is the one ambiguous agent event: the structured path sends chart rows
+  // (`[{label, value}]`), an enumeration sends whole records, and a SQL result would
+  // send positional rows (`[[...], ...]`). They are told apart STRUCTURALLY — an
+  // array-of-arrays is a SQL result — never by guessing which the server meant.
+  // A preceding `page` marks the enumeration case; without it, charting a record row
+  // renders a bar per column with no label.
   unlisteners.push(
     await listen<ChatEvent>("agent://rows", (ev) => {
       const { run_id, data } = ev.payload;
       try {
-        useAgents.getState().setRows(run_id, JSON.parse(data) as AggRow[]);
+        const parsed = JSON.parse(data) as unknown;
+        if (!Array.isArray(parsed)) return;
+        if (parsed.length > 0 && Array.isArray(parsed[0])) {
+          useAgents.getState().setSqlRows(run_id, parsed as unknown[][]);
+        } else if (useAgents.getState().runs[run_id]?.page) {
+          useAgents.getState().setListRows(run_id, parsed as Record<string, unknown>[]);
+        } else {
+          useAgents.getState().setRows(run_id, parsed as AggRow[]);
+        }
       } catch {
         /* ignore malformed rows payload */
       }
@@ -220,9 +386,22 @@ export async function initBridgeEvents(): Promise<void> {
     }),
   );
 
+  // Live pipeline steps for agent runs; see the chat://stage listener above.
+  unlisteners.push(
+    await listen<ChatEvent>("agent://stage", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().pushStage(run_id, JSON.parse(data) as StageEvent);
+      } catch {
+        /* ignore malformed stage payload */
+      }
+    }),
+  );
+
   unlisteners.push(
     await listen<ChatEvent>("agent://error", (ev) => {
       const { run_id, data } = ev.payload;
+      agentTokenBuffer.flushNow(run_id);
       useAgents.getState().setError(run_id, data);
     }),
   );
@@ -230,8 +409,84 @@ export async function initBridgeEvents(): Promise<void> {
   unlisteners.push(
     await listen<ChatEvent>("agent://done", (ev) => {
       const { run_id } = ev.payload;
-      agentTokenBuffer.flushNow();
+      agentTokenBuffer.flushNow(run_id);
       useAgents.getState().finish(run_id);
+    }),
+  );
+
+  // ── Plan 06 / 07: provenance, suggestions, clarify (agent stream) ─────────────
+  // These events only arrive when the server implements plan 06; until then they
+  // are simply never emitted, and the listeners are no-ops.
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://provenance", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setProvenance(run_id, JSON.parse(data) as Provenance);
+      } catch {
+        /* ignore malformed provenance payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://suggestions", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useAgents.getState().setSuggestions(run_id, JSON.parse(data) as Suggestion[]);
+      } catch {
+        /* ignore malformed suggestions payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("agent://clarify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const payload = JSON.parse(data) as ClarifyPayload;
+        useAgents.getState().setClarify(run_id, payload);
+      } catch {
+        /* ignore malformed clarify payload */
+      }
+    }),
+  );
+
+  // ── Plan 06 / 07: provenance, suggestions, clarify (chat stream) ─────────────
+  // The Ask tab on /chat uses the same server executor and emits the same events
+  // on the chat:// channel.
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://provenance", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setProvenance(run_id, JSON.parse(data) as Provenance);
+      } catch {
+        /* ignore malformed provenance payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://suggestions", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        useChat.getState().setSuggestions(run_id, JSON.parse(data) as Suggestion[]);
+      } catch {
+        /* ignore malformed suggestions payload */
+      }
+    }),
+  );
+
+  unlisteners.push(
+    await listen<ChatEvent>("chat://clarify", (ev) => {
+      const { run_id, data } = ev.payload;
+      try {
+        const payload = JSON.parse(data) as ClarifyPayload;
+        useChat.getState().setClarify(run_id, payload);
+      } catch {
+        /* ignore malformed clarify payload */
+      }
     }),
   );
 }

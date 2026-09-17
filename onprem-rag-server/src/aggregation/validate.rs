@@ -48,12 +48,19 @@ pub fn validate(spec: &RunAggregation, catalog: &Catalog) -> AppResult<RunAggreg
         return Err(AppError::BadRequest(format!(
             "unknown collection '{}'; allowed: {}",
             spec.collection,
-            if avail.is_empty() { "(none — ingest data first)".to_string() } else { avail.join(", ") }
+            if avail.is_empty() {
+                "(none — ingest data first)".to_string()
+            } else {
+                avail.join(", ")
+            }
         )));
     }
 
     // Helper: resolve synonym then check allow-list for this collection.
     let check_field = |field: &str| -> AppResult<String> {
+        if catalog.has_field(&spec.collection, field) {
+            return Ok(field.to_string());
+        }
         let canonical = catalog.resolve_synonym_owned(field);
         if !catalog.has_field(&spec.collection, &canonical) {
             return Err(AppError::BadRequest(format!(
@@ -74,8 +81,8 @@ pub fn validate(spec: &RunAggregation, catalog: &Catalog) -> AppResult<RunAggreg
     let filter = &spec.filter;
     if let Some(obj) = filter.as_object() {
         for (key, value) in obj {
-            check_field(key)?;
             check_filter_value(value)?;
+            check_field(key)?;
         }
     }
 
@@ -88,7 +95,10 @@ pub fn validate(spec: &RunAggregation, catalog: &Catalog) -> AppResult<RunAggreg
     // --- time_bucket field --------------------------------------------------
     let time_bucket = if let Some(ref tb) = spec.time_bucket {
         let canonical = check_field(&tb.field)?;
-        Some(super::spec::TimeBucket { field: canonical, unit: tb.unit.clone() })
+        Some(super::spec::TimeBucket {
+            field: canonical,
+            unit: tb.unit.clone(),
+        })
     } else {
         None
     };
@@ -100,7 +110,10 @@ pub fn validate(spec: &RunAggregation, catalog: &Catalog) -> AppResult<RunAggreg
         if s.by != "value" {
             check_field(&s.by)?;
         }
-        Some(super::spec::Sort { by: s.by.clone(), dir: s.dir.clone() })
+        Some(super::spec::Sort {
+            by: s.by.clone(),
+            dir: s.dir.clone(),
+        })
     } else {
         None
     };
@@ -160,7 +173,10 @@ mod tests {
             collection: collection.to_string(),
             filter: serde_json::json!({}),
             group_by: vec![field.to_string()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: None,
             top_n: None,
@@ -196,7 +212,10 @@ mod tests {
             collection: "encounters".to_string(),
             filter: serde_json::json!({ "diagnosis_code": { "$where": "this.x > 0" } }),
             group_by: vec!["diagnosis_display".to_string()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: None,
             top_n: None,
@@ -215,7 +234,10 @@ mod tests {
             collection: "encounters".to_string(),
             filter: serde_json::json!({}),
             group_by: vec!["diagnosis_display".to_string()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: None,
             top_n: Some(1000),
@@ -231,7 +253,10 @@ mod tests {
             collection: "encounters".to_string(),
             filter: serde_json::json!({ "diagnosis_code": { "$prefix": "E11" } }),
             group_by: vec!["diagnosis_display".to_string()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: Some(super::super::spec::Sort {
                 by: "value".to_string(),
@@ -252,7 +277,10 @@ mod tests {
             collection: "patients".to_string(),
             filter: serde_json::json!({}),
             group_by: vec!["date_of_birth".to_string()],
-            metric: Metric { op: MetricOp::Count, field: None },
+            metric: Metric {
+                op: MetricOp::Count,
+                field: None,
+            },
             time_bucket: None,
             sort: None,
             top_n: None,

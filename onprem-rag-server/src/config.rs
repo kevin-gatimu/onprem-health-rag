@@ -5,6 +5,17 @@
 
 use std::env;
 
+/// Where chat generation executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoundryBackend {
+    /// The standalone `foundry` daemon, over its OpenAI-compatible HTTP API. A native
+    /// fault kills the daemon, not this server, and concurrent callers queue.
+    Service,
+    /// The SDK's native core, loaded into this process. Concurrent chat requests
+    /// fail-fast the server here; kept only for hosts without the daemon.
+    InProcess,
+}
+
 /// Retrieval mode for the RAG pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetrievalMode {
@@ -26,77 +37,149 @@ impl RetrievalMode {
 /// hardware profile (NPU for small single-record roles, GPU for everything else).
 #[derive(Debug, Clone)]
 pub struct RouterConfig {
-    pub chat: String,           // ONPREM_MODEL_CHAT
-    pub health_query: String,   // ONPREM_MODEL_HEALTH_QUERY
-    pub trends: String,         // ONPREM_MODEL_TRENDS
-    pub summarize: String,      // ONPREM_MODEL_SUMMARIZE
-    pub lookup: String,         // ONPREM_MODEL_LOOKUP
-    pub fast: String,           // ONPREM_MODEL_FAST  (QueryRewrite)
-    pub classify: String,       // ONPREM_MODEL_CLASSIFY  (intent router Tier 2)
-    pub extractor: String,      // ONPREM_MODEL_EXTRACTOR
-    pub verifier: String,       // ONPREM_MODEL_VERIFIER
+    pub chat: String,         // ONPREM_MODEL_CHAT
+    pub health_query: String, // ONPREM_MODEL_HEALTH_QUERY
+    pub trends: String,       // ONPREM_MODEL_TRENDS
+    pub summarize: String,    // ONPREM_MODEL_SUMMARIZE
+    pub lookup: String,       // ONPREM_MODEL_LOOKUP
+    pub fast: String,         // ONPREM_MODEL_FAST  (QueryRewrite)
+    pub classify: String,     // ONPREM_MODEL_CLASSIFY  (intent router Tier 2)
+    pub extractor: String,    // ONPREM_MODEL_EXTRACTOR
+    pub verifier: String,     // ONPREM_MODEL_VERIFIER
+    /// Aggregation/QuerySpec planner role. Defaults to the text-to-SQL model because
+    /// planning a spec is the same deterministic, schema-bound task as emitting SQL.
+    pub plan_spec: String,    // ONPREM_MODEL_PLAN_SPEC (default: ONPREM_MODEL_TEXT2SQL)
     /// Maximum number of GPU-class models resident in memory simultaneously.
     /// NPU/CPU models are exempt — they live on separate silicon and keeping
-    /// phi-4-mini hot on the NPU is the whole point of the device-placement design.
+    /// Defaults are consolidated onto one Qwen GPU model to bound resident memory.
     pub max_resident_models: usize, // ONPREM_MAX_RESIDENT_MODELS
-    /// Whether to attempt NPU placement for eligible roles (Extract, Verify, Classify).
-    /// Set false to force CPU for those roles even when an NPU is detected.
-    pub npu_enabled: bool,          // ONPREM_NPU_ENABLED
+    /// Whether NPU placement may be used by an explicitly NPU-routed role.
+    /// Default false because the standard role map is GPU-first.
+    pub npu_enabled: bool, // ONPREM_NPU_ENABLED
     /// NPU context-length cap in tokens. Variants whose `context_length()` exceeds this
     /// are skipped during NPU selection — prevents OOM on the NPU's constrained VRAM.
-    pub npu_ctx_cap: u64,           // ONPREM_NPU_CTX_CAP
+    pub npu_ctx_cap: u64, // ONPREM_NPU_CTX_CAP
     /// Whether the intent router may escalate ambiguous questions to the Tier-2
     /// model classifier. When false the router uses Tiers 0/1 only and falls open
     /// to semantic — no model call, useful when phi-4-mini isn't available.
     pub model_router_enabled: bool, // ONPREM_ROUTER_MODEL_ENABLED
     /// Capacity of the per-process Tier-2 route-decision LRU cache (entries).
-    pub router_cache_size: usize,   // ONPREM_ROUTER_CACHE_SIZE
+    pub router_cache_size: usize, // ONPREM_ROUTER_CACHE_SIZE
 
-    // --- NL-to-SQL (plan 18) ---
-    /// Master switch: when false the router never selects `SourceSql` and the
-    /// `/nl2sql/<id>` endpoints still work but are direct-call only (no routing).
-    pub text2sql_enabled: bool,      // ONPREM_TEXT2SQL_ENABLED
-    /// Model alias for SQL generation (phi-4-mini-instruct works well).
-    pub sql_model: String,           // ONPREM_MODEL_TEXT2SQL
-    /// Maximum schema cards (table cards) injected into the generation prompt.
-    pub nl2sql_tables_max: usize,    // ONPREM_NL2SQL_TABLES_MAX
-    /// Few-shot examples per prompt (retrieved by question-vector similarity).
-    pub nl2sql_fewshots: usize,      // ONPREM_NL2SQL_FEWSHOTS
-    /// Hard cap on rows returned by a SQL query (injected as LIMIT/TOP).
-    pub nl2sql_max_rows: i64,        // ONPREM_NL2SQL_MAX_ROWS
-    /// Query-level timeout in seconds; queries that exceed it are killed.
-    pub nl2sql_timeout_secs: u64,    // ONPREM_NL2SQL_TIMEOUT_SECS
-    /// Per-column sample-value count for schema cards (0 disables sampling).
-    pub nl2sql_sample_values: usize, // ONPREM_NL2SQL_SAMPLE_VALUES
+    // --- Intent router v3 (plan 02) ---
+    /// Master switch for router v3. When false (default), v2 `route()` decides
+    /// every request; v3 `route_v3()` is never called.  Plan 08 §4 step 3 flips
+    /// this to true after accuracy gates are met on staging.
+    pub router_v3_enabled: bool, // ONPREM_ROUTER_V3
+    /// Try the Tier-1.5 deterministic `QuerySpec` parse before escalating to
+    /// Tier-2 model.  True by default — this is the primary latency saving.
+    pub router_deterministic_first: bool, // ONPREM_ROUTER_DETERMINISTIC_FIRST
+    /// Emit `Clarify` SSE events when a required slot cannot be filled from the
+    /// question.  True by default; set false to fall through to Semantic instead.
+    pub router_clarify_enabled: bool, // ONPREM_ROUTER_CLARIFY_ENABLED
+    /// Minimum Tier-2 model confidence before the answer is accepted.  Queries
+    /// below this threshold with no focus context trigger a `Clarify(Subject)`.
+    pub router_model_min_confidence: f64, // ONPREM_ROUTER_MODEL_MIN_CONFIDENCE
+
+    pub text2sql_enabled: bool,
+    pub sql_model: String,
+    pub nl2sql_tables_max: usize,
+    pub nl2sql_fewshots: usize,
+    pub nl2sql_max_rows: i64,
+    pub nl2sql_max_plan_cost: f64,
+    pub nl2sql_timeout_secs: u64,
+    pub nl2sql_plan_timeout_secs: u64,
+    pub nl2sql_sample_values: usize,
+    /// Conservative token ceiling on the assembled schema+examples+question prompt.
+    /// Keeps SQL planning latency bounded and protects smaller role overrides.
+    pub nl2sql_prompt_token_budget: usize,
+
+    // --- structured executor ladder (plan 04) -------------------------------
+    /// Wall-clock ceiling on the whole `answer::executor` ladder. When it is
+    /// exhausted the executor skips straight to retrieval with
+    /// `Rung::*(Skipped("budget"))` so the downgrade is visible (plan 04a §6).
+    pub exec_total_timeout_secs: u64,
+    /// Maximum cohort keys carried from a Hybrid cohort query into the retrieval
+    /// filter. Beyond this the narrator is told "first N of M".
+    pub hybrid_cohort_max: usize,
+    /// Allow one unfiltered retry when an *inferred* (not user-stated) retrieval
+    /// filter empties the result set.
+    pub retrieval_filter_relax: bool,
+
+    pub extract_enabled: bool,
+    pub extract_min_words: usize,
+    pub extract_concurrency: usize,
+    pub extract_timeout_secs: u64,
+    pub extract_max_chars: usize,
+
+    pub verify_enabled: bool,
+    pub verify_timeout_secs: u64,
+    pub verify_passage_chars: usize,
+    pub verify_max_passages: usize,
 }
 
 impl RouterConfig {
     fn from_env() -> Self {
+        // PlanSpec defaults to whatever serves text-to-SQL, so a deployment that pins a
+        // SQL-tuned model automatically gets it for spec planning too.
+        let sql_model = env_or("ONPREM_MODEL_TEXT2SQL", "qwen3-8b");
         RouterConfig {
             chat: env_or("ONPREM_MODEL_CHAT", "qwen3-8b"),
             health_query: env_or("ONPREM_MODEL_HEALTH_QUERY", "qwen3-8b"),
             trends: env_or("ONPREM_MODEL_TRENDS", "qwen3-8b"),
-            summarize: env_or("ONPREM_MODEL_SUMMARIZE", "mistral-nemo-12b-instruct"),
-            lookup: env_or("ONPREM_MODEL_LOOKUP", "qwen3-4b"),
-            fast: env_or("ONPREM_MODEL_FAST", "qwen3-4b"),
-            classify: env_or("ONPREM_MODEL_CLASSIFY", "phi-4-mini-instruct"),
-            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "phi-4-mini-instruct"),
-            verifier: env_or("ONPREM_MODEL_VERIFIER", "phi-4-mini-reasoning"),
-            max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 2_usize),
-            npu_enabled: env_parse("ONPREM_NPU_ENABLED", true),
+            summarize: env_or("ONPREM_MODEL_SUMMARIZE", "qwen3-8b"),
+            lookup: env_or("ONPREM_MODEL_LOOKUP", "qwen3-8b"),
+            fast: env_or("ONPREM_MODEL_FAST", "qwen3-8b"),
+            classify: env_or("ONPREM_MODEL_CLASSIFY", "qwen3-8b"),
+            extractor: env_or("ONPREM_MODEL_EXTRACTOR", "qwen3-8b"),
+            verifier: env_or("ONPREM_MODEL_VERIFIER", "qwen3-8b"),
+            plan_spec: env_or("ONPREM_MODEL_PLAN_SPEC", &sql_model),
+            max_resident_models: env_parse("ONPREM_MAX_RESIDENT_MODELS", 1_usize),
+            npu_enabled: env_parse("ONPREM_NPU_ENABLED", false),
             npu_ctx_cap: env_parse("ONPREM_NPU_CTX_CAP", 4224_u64),
             model_router_enabled: env_parse("ONPREM_ROUTER_MODEL_ENABLED", true),
             router_cache_size: env_parse("ONPREM_ROUTER_CACHE_SIZE", 512_usize),
-            text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", false),
-            sql_model: env_or("ONPREM_MODEL_TEXT2SQL", "phi-4-mini-instruct"),
+            router_v3_enabled: env_parse("ONPREM_ROUTER_V3", false),
+            router_deterministic_first: env_parse("ONPREM_ROUTER_DETERMINISTIC_FIRST", true),
+            router_clarify_enabled: env_parse("ONPREM_ROUTER_CLARIFY_ENABLED", true),
+            router_model_min_confidence: env_parse("ONPREM_ROUTER_MODEL_MIN_CONFIDENCE", 0.5_f64),
+
+            text2sql_enabled: env_parse("ONPREM_TEXT2SQL_ENABLED", true),
+            sql_model,
             nl2sql_tables_max: env_parse("ONPREM_NL2SQL_TABLES_MAX", 4_usize),
             nl2sql_fewshots: env_parse("ONPREM_NL2SQL_FEWSHOTS", 3_usize),
             nl2sql_max_rows: env_parse("ONPREM_NL2SQL_MAX_ROWS", 500_i64),
+            nl2sql_max_plan_cost: env_parse("ONPREM_NL2SQL_MAX_PLAN_COST", 1_000_000.0_f64),
             nl2sql_timeout_secs: env_parse("ONPREM_NL2SQL_TIMEOUT_SECS", 30_u64),
+            nl2sql_plan_timeout_secs: env_parse("ONPREM_NL2SQL_PLAN_TIMEOUT_SECS", 30_u64),
             nl2sql_sample_values: env_parse("ONPREM_NL2SQL_SAMPLE_VALUES", 10_usize),
+            // Keep planning latency bounded even when the selected GPU model has a
+            // larger context window; role overrides may also have smaller windows.
+            nl2sql_prompt_token_budget: env_parse("ONPREM_NL2SQL_PROMPT_TOKEN_BUDGET", 3200_usize),
+
+            exec_total_timeout_secs: env_parse("ONPREM_EXEC_TOTAL_TIMEOUT_SECS", 120_u64),
+            hybrid_cohort_max: env_parse("ONPREM_HYBRID_COHORT_MAX", 200_usize),
+            retrieval_filter_relax: env_parse("ONPREM_RETRIEVAL_FILTER_RELAX", true),
+
+            extract_enabled: env_parse("ONPREM_EXTRACT_ENABLED", false),
+            extract_min_words: env_parse("ONPREM_EXTRACT_MIN_WORDS", 40_usize),
+            extract_concurrency: env_parse("ONPREM_EXTRACT_CONCURRENCY", 2_usize),
+            extract_timeout_secs: env_parse("ONPREM_EXTRACT_TIMEOUT_SECS", 30_u64),
+            extract_max_chars: env_parse("ONPREM_EXTRACT_MAX_CHARS", 6000_usize),
+
+            verify_enabled: env_parse("ONPREM_VERIFY_ENABLED", false),
+            verify_timeout_secs: env_parse("ONPREM_VERIFY_TIMEOUT_SECS", 45_u64),
+            verify_passage_chars: env_parse("ONPREM_VERIFY_PASSAGE_CHARS", 1200_usize),
+            verify_max_passages: env_parse("ONPREM_VERIFY_MAX_PASSAGES", 6_usize),
         }
     }
 }
+
+/// Default minimum concept-binding confidence (`ONPREM_BINDING_MIN_CONFIDENCE`).
+///
+/// Named so callers that only need the default -- persona and capability
+/// answers, which have no `Config` in hand -- cannot drift from the env default.
+pub const DEFAULT_BINDING_MIN_CONFIDENCE: f32 = 0.55;
 
 /// Fully-resolved server configuration.
 #[derive(Debug, Clone)]
@@ -129,6 +212,30 @@ pub struct Config {
     /// even after the real cache moved. `None` = let the SDK choose.
     pub foundry_cache_dir: Option<String>,
 
+    /// Where chat generation runs. `service` (default) calls the standalone `foundry`
+    /// daemon over HTTP; `in_process` uses the SDK's native core in this process.
+    ///
+    /// `in_process` is retained for hosts with no daemon installed, but it is the mode
+    /// that dies on a second concurrent chat request — see
+    /// `plans/docs/foundry-local-webgpu-concurrency-crash.md`.
+    /// Largest prompt (system + user, bytes) sent to a chat model.
+    ///
+    /// Above ~20 KB the WebGPU execution provider crashes the process hosting the model
+    /// instead of erroring — measured, with the context window nowhere near full. Kept
+    /// well under that; raise only if the execution provider is fixed or changed.
+    pub prompt_max_bytes: usize,
+    /// Collections shown to the aggregation planner, most relevant first.
+    ///
+    /// The whole catalog is 63 tables here and renders to ~24 KB of prompt — over the
+    /// size that kills the model host. Narrowing by whole collections keeps the schema
+    /// coherent where a byte-level cut would not.
+    pub planner_max_collections: usize,
+    pub foundry_backend: FoundryBackend,
+    /// Base URL of the `foundry` daemon. `None` = discover it from
+    /// `~/.foundry/daemon.json`, which the daemon rewrites on every start (the port is
+    /// assigned per start, so it must never be hardcoded).
+    pub foundry_service_url: Option<String>,
+
     // Embeddings (fastembed / ONNX Runtime, local — shares the reranker's stack)
     pub embedding_model: String,
     pub embedding_dims: usize,
@@ -141,6 +248,8 @@ pub struct Config {
     pub retrieve_per_side: i64,
     pub rerank_top_n: usize,
     pub context_top_k: usize,
+    pub context_total_tokens: usize,
+    pub context_per_row_tokens: usize,
     /// Rerank-score floor (anti-hallucination gate): if the top passage scores below
     /// this after sigmoid normalisation (plan 19.1), `/chat` refuses to generate.
     /// Scores are in (0, 1) after sigmoid; 0.30 is the production default.
@@ -150,22 +259,113 @@ pub struct Config {
     /// does not pay the ONNX model-load latency.
     pub warmup_enabled: bool,
 
+    // Admission control
+    pub max_active_generations: usize,
+    pub max_active_retrievals: usize,
+    pub max_active_ingestions: usize,
+    pub max_ingestions_per_source: usize,
+    pub admission_timeout_ms: u64,
+    /// How long a chat request queues for its turn to generate, in ms.
+    ///
+    /// Separate from `admission_timeout_ms` because generation is capped at one at a
+    /// time on purpose (see `max_active_generations`), so a waiting caller is queued,
+    /// not overloaded. Shedding it after the usual 2 s would fail ordinary questions
+    /// whenever two people ask at once.
+    pub generation_queue_timeout_ms: u64,
+
     // Query expansion
     pub multi_query_enabled: bool,
     pub multi_query_count: usize,
 
-    // Chunking (per-passage embedding of long free-text fields)
+    // Chunking and bounded ingestion
     pub chunk_enabled: bool,
     pub chunk_size_tokens: usize,
     pub chunk_overlap_tokens: usize,
+    pub ingest_page_size: usize,
+    pub ingest_embed_batch_size: usize,
 
     // Model router (task-aware model selection + device placement)
     pub router: RouterConfig,
+
+    // Chat memory: working-memory assembly, compaction, hygiene (plan 22)
+    /// Ceiling on tail turns loaded per request, before the token budget below
+    /// trims further.
+    pub history_tail_max_turns: i64,
+    /// Word-approximate budget for the assembled tail (same convention as chunking).
+    pub history_tail_max_tokens: usize,
+    /// Word cap applied to an assistant message's content when it enters the tail —
+    /// old full answers add tokens, not signal.
+    pub history_msg_clip: usize,
+    /// Un-summarized turn count that triggers write-behind compaction.
+    pub compact_after_turns: i64,
+    /// Delete conversations (and their messages) whose `updated_at` is older than
+    /// this many days. `0` = keep forever (default).
+    pub conversation_retention_days: i64,
+    /// Byte cap on a stored message's content; longer content is clipped with a marker.
+    pub message_max_bytes: usize,
+
+    // Conversation focus and suggestions (plan 06 §7)
+    /// Master switch for `ConversationFocus`. When false, `focus::apply` returns
+    /// `Default` every turn, so no focus is ever accumulated, persisted, or used
+    /// to resolve a follow-up — the pre-focus behaviour, exactly.
+    pub focus_enabled: bool,
+    /// Hard cap on suggested follow-ups emitted with an answer.
+    pub suggestions_max: usize,
+    /// Turns a focus patient survives without being mentioned again.
+    /// `0` (default) = keep until a different patient replaces it.
+    pub focus_patient_ttl_turns: u32,
+    /// Cap on `ResultDigest::top_labels` retained from a grouped result.
+    pub focus_top_labels: usize,
+
+    // Schema metadata maintenance
+    /// Seconds between structural drift checks. Zero disables background polling.
+    pub schema_poll_interval_secs: u64,
+    /// Maximum sources inspected concurrently by the drift poller.
+    pub schema_poll_concurrency: usize,
+    /// Rows sampled per table for bounded aggregate column profiles.
+    pub schema_profile_sample_rows: usize,
+
+    // Schema binding (service-line ontology)
+    /// Minimum concept-binding confidence score (0–1). Tables below this
+    /// threshold are stored as `EntityConcept::Unknown`.
+    pub binding_min_confidence: f32,
+    /// Maximum enum values probed per categorical column.
+    pub binding_enum_max: usize,
+    /// Maximum FK-hop depth for patient-path BFS.
+    pub binding_max_hops: usize,
+    /// Enable automatic schema binding on catalog refresh.
+    pub binding_enabled: bool,
+    /// Enable the QuerySpec IR.  `false` (default) = shadow mode only: parse →
+    /// bind → compile → validate but never execute the IR path, log one
+    /// `ir_shadow` line per question.  `true` = IR replaces the template engine.
+    pub sql_ir_enabled: bool,
+    /// SQL Server compatibility level (100=2008, 130=2016, 150=2019 etc.).
+    /// Controls DATEFROMPARTS vs DATEADD date arithmetic in the IR compiler.
+    pub mssql_compat_level: u16,
 }
 
 impl Config {
     /// Load configuration from the environment, applying sensible development defaults.
     pub fn from_env() -> Self {
+        let config = Config::read_env();
+        // Raising the cap is a footgun on either backend, but on the in-process core it
+        // takes the whole API down rather than just the model host, so that one is not
+        // left to the operator.
+        if config.foundry_backend == FoundryBackend::InProcess && config.max_active_generations > 1
+        {
+            tracing::warn!(
+                requested = config.max_active_generations,
+                "ONPREM_FOUNDRY_BACKEND=in_process cannot serve concurrent chat requests;                  clamping ONPREM_MAX_ACTIVE_GENERATIONS to 1"
+            );
+            return Config {
+                max_active_generations: 1,
+                ..config
+            };
+        }
+        config
+    }
+
+    fn read_env() -> Self {
         Config {
             bind_address: env_or("ONPREM_BIND_ADDRESS", "0.0.0.0"),
             port: env_parse("ONPREM_PORT", 8000),
@@ -186,7 +386,9 @@ impl Config {
 
             jwt_secret: env_or("ONPREM_JWT_SECRET", "dev-only-change-me"),
             jwt_ttl_hours: env_parse("ONPREM_JWT_TTL_HOURS", 8),
-            credentials_key: env::var("ONPREM_CREDENTIALS_KEY").ok().filter(|s| !s.is_empty()),
+            credentials_key: env::var("ONPREM_CREDENTIALS_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
             admin_username: env_or("ONPREM_ADMIN_USERNAME", "admin"),
             admin_password: env_or("ONPREM_ADMIN_PASSWORD", "password"),
 
@@ -202,6 +404,29 @@ impl Config {
                 .ok()
                 .filter(|s| !s.is_empty())
                 .or_else(foundry_cli_cache_dir),
+            prompt_max_bytes: env_parse("ONPREM_PROMPT_MAX_BYTES", 16_000_usize),
+            planner_max_collections: env_parse("ONPREM_PLANNER_MAX_COLLECTIONS", 12_usize),
+            foundry_backend: match env_or("ONPREM_FOUNDRY_BACKEND", "service")
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "in_process" | "in-process" | "inprocess" | "native" => {
+                    FoundryBackend::InProcess
+                }
+                "service" | "daemon" | "http" => FoundryBackend::Service,
+                other => {
+                    tracing::warn!(
+                        backend = other,
+                        "unknown ONPREM_FOUNDRY_BACKEND; using the service daemon"
+                    );
+                    FoundryBackend::Service
+                }
+            },
+            foundry_service_url: env::var("ONPREM_FOUNDRY_SERVICE_URL")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().trim_end_matches('/').to_string()),
             // fastembed EmbeddingModel variant name (ORT path). BGE-M3 is 1024-dim,
             // multilingual, prefix-free, and GPU/DirectML-capable on this host.
             embedding_model: env_or("ONPREM_EMBEDDING_MODEL", "bge-m3"),
@@ -214,6 +439,8 @@ impl Config {
             retrieve_per_side: env_parse("ONPREM_RETRIEVE_PER_SIDE", 50),
             rerank_top_n: env_parse("ONPREM_RERANK_TOP_N", 30),
             context_top_k: env_parse("ONPREM_CONTEXT_TOP_K", 6),
+            context_total_tokens: env_parse("ONPREM_CONTEXT_TOTAL_TOKENS", 3_072_usize).max(1),
+            context_per_row_tokens: env_parse("ONPREM_CONTEXT_PER_ROW_TOKENS", 768_usize).max(1),
             // Default gate 0.30 (post-sigmoid scale). Env var overrides; set to 0 to disable.
             score_gate: env::var("ONPREM_SCORE_GATE")
                 .ok()
@@ -221,14 +448,60 @@ impl Config {
                 .or(Some(0.30)),
             warmup_enabled: env_parse("ONPREM_WARMUP_ENABLED", true),
 
+            // 1, deliberately. ONNX Runtime's WebGPU execution provider corrupts its own
+            // device state when two generations overlap ("[CommandEncoder] is already
+            // finished", "[Invalid CommandBuffer]"), taking down whichever process hosts
+            // the model. Running chat in the daemon means that kills the daemon rather
+            // than this server, but it is still an outage — so overlap is prevented here
+            // and the second caller queues. See
+            // `plans/docs/foundry-local-webgpu-concurrency-crash.md`.
+            max_active_generations: env_parse("ONPREM_MAX_ACTIVE_GENERATIONS", 1_usize),
+            max_active_retrievals: env_parse("ONPREM_MAX_ACTIVE_RETRIEVALS", 4_usize),
+            max_active_ingestions: env_parse("ONPREM_MAX_ACTIVE_INGESTIONS", 1_usize),
+            max_ingestions_per_source: env_parse("ONPREM_MAX_INGESTIONS_PER_SOURCE", 1_usize),
+            admission_timeout_ms: env_parse("ONPREM_ADMISSION_TIMEOUT_MS", 2_000_u64),
+            generation_queue_timeout_ms: env_parse(
+                "ONPREM_GENERATION_QUEUE_TIMEOUT_MS",
+                300_000_u64,
+            ),
+
             multi_query_enabled: env_parse("ONPREM_MULTI_QUERY_ENABLED", true),
             multi_query_count: env_parse("ONPREM_MULTI_QUERY_COUNT", 3),
 
             chunk_enabled: env_parse("ONPREM_CHUNK_ENABLED", true),
             chunk_size_tokens: env_parse("ONPREM_CHUNK_SIZE_TOKENS", 384),
             chunk_overlap_tokens: env_parse("ONPREM_CHUNK_OVERLAP_TOKENS", 64),
+            ingest_page_size: env_parse("ONPREM_INGEST_PAGE_SIZE", 256_usize).max(1),
+            ingest_embed_batch_size: env_parse("ONPREM_INGEST_EMBED_BATCH_SIZE", 32_usize).max(1),
 
             router: RouterConfig::from_env(),
+
+            history_tail_max_turns: env_parse("ONPREM_HISTORY_TAIL_MAX_TURNS", 8_i64),
+            history_tail_max_tokens: env_parse("ONPREM_HISTORY_TAIL_MAX_TOKENS", 1200_usize),
+            history_msg_clip: env_parse("ONPREM_HISTORY_MSG_CLIP", 200_usize),
+            compact_after_turns: env_parse("ONPREM_COMPACT_AFTER_TURNS", 12_i64),
+            conversation_retention_days: env_parse("ONPREM_CONVERSATION_RETENTION_DAYS", 0_i64),
+            message_max_bytes: env_parse("ONPREM_MESSAGE_MAX_BYTES", 32768_usize),
+
+            focus_enabled: env_parse("ONPREM_FOCUS_ENABLED", true),
+            suggestions_max: env_parse("ONPREM_SUGGESTIONS_MAX", 4_usize),
+            focus_patient_ttl_turns: env_parse("ONPREM_FOCUS_PATIENT_TTL_TURNS", 0_u32),
+            focus_top_labels: env_parse("ONPREM_FOCUS_TOP_LABELS", 5_usize),
+
+            schema_poll_interval_secs: env_parse("ONPREM_SCHEMA_POLL_INTERVAL_SECS", 300_u64),
+            schema_poll_concurrency: env_parse("ONPREM_SCHEMA_POLL_CONCURRENCY", 2_usize).max(1),
+            schema_profile_sample_rows: env_parse("ONPREM_SCHEMA_PROFILE_SAMPLE_ROWS", 256_usize),
+
+            binding_min_confidence: env_parse(
+                "ONPREM_BINDING_MIN_CONFIDENCE",
+                DEFAULT_BINDING_MIN_CONFIDENCE,
+            ),
+            binding_enum_max: env_parse("ONPREM_BINDING_ENUM_MAX", 25_usize),
+            binding_max_hops: env_parse("ONPREM_BINDING_MAX_HOPS", 3_usize),
+            binding_enabled: env_parse("ONPREM_BINDING_ENABLED", true),
+            // IR defaults to false (shadow mode only).
+            sql_ir_enabled: env_parse("ONPREM_SQL_IR_ENABLED", false),
+            mssql_compat_level: env_parse("ONPREM_MSSQL_COMPAT_LEVEL", 150_u16),
         }
     }
 
@@ -242,9 +515,8 @@ impl Config {
             || self.jwt_secret == "dev-only-change-me-to-a-long-random-string"
             || self.jwt_secret.len() < 32
         {
-            issues.push(
-                "ONPREM_JWT_SECRET is unset, default, or shorter than 32 chars".to_string(),
-            );
+            issues
+                .push("ONPREM_JWT_SECRET is unset, default, or shorter than 32 chars".to_string());
         }
 
         // Default admin password; empty is also rejected even though env_or("password") never yields "".
@@ -258,19 +530,14 @@ impl Config {
         // (two independent secrets, two independent jobs — sharing them halves the security).
         match &self.credentials_key {
             None => {
-                issues.push(
-                    "ONPREM_CREDENTIALS_KEY is unset (required in production)".to_string(),
-                );
+                issues.push("ONPREM_CREDENTIALS_KEY is unset (required in production)".to_string());
             }
             Some(k) if k.len() < 32 => {
-                issues.push(
-                    "ONPREM_CREDENTIALS_KEY is shorter than 32 chars".to_string(),
-                );
+                issues.push("ONPREM_CREDENTIALS_KEY is shorter than 32 chars".to_string());
             }
             Some(k) if k == &self.jwt_secret => {
-                issues.push(
-                    "ONPREM_CREDENTIALS_KEY must differ from ONPREM_JWT_SECRET".to_string(),
-                );
+                issues
+                    .push("ONPREM_CREDENTIALS_KEY must differ from ONPREM_JWT_SECRET".to_string());
             }
             _ => {}
         }
@@ -285,19 +552,31 @@ impl Config {
 /// JSON, or absent key yields `None` and the SDK default applies.
 fn foundry_cli_cache_dir() -> Option<String> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-    let path = std::path::Path::new(&home).join(".foundry").join("foundry.config.json");
+    let path = std::path::Path::new(&home)
+        .join(".foundry")
+        .join("foundry.config.json");
     let raw = std::fs::read_to_string(path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let dir = json.get("serviceSettings")?.get("cacheDirectoryPath")?.as_str()?.trim();
+    let dir = json
+        .get("serviceSettings")?
+        .get("cacheDirectoryPath")?
+        .as_str()?
+        .trim();
     (!dir.is_empty()).then(|| dir.to_string())
 }
 
 /// Read an env var or fall back to a default string.
 fn env_or(key: &str, default: &str) -> String {
-    env::var(key).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+    env::var(key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
 }
 
 /// Read and parse an env var or fall back to a typed default.
 fn env_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }

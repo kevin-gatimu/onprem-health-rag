@@ -1,0 +1,30 @@
+{
+  "_comment": "Expected concept bindings for the plan 08 §1 alternative 25-table hospital schema. Table names use PascalCase, abbreviations, and underscored prefixes to exercise the binder's PascalCase splitting, ABBREV_MAP expansion, and containment scoring. Used by acceptance criterion 2: ≥22/25 exact concepts, usable_lines().len() >= 9.",
+  "expected": [
+    { "table": "PatientMaster",  "concept": "patient" },
+    { "table": "Visit",          "concept": "encounter" },
+    { "table": "Booking",        "concept": "appointment" },
+    { "table": "Staff",          "concept": "provider" },
+    { "table": "Roster",         "concept": "shift" },
+    { "table": "ClinDept",       "concept": "department" },
+    { "table": "IPD_Ward",       "concept": "ward" },
+    { "table": "WardBed",        "concept": "bed" },
+    { "table": "IPD_Admission",  "concept": "admission" },
+    { "table": "ObsChart",       "concept": "vital_sign" },
+    { "table": "Rx",             "concept": "prescription" },
+    { "table": "RxLine",         "concept": "prescription_item" },
+    { "table": "DrugMaster",     "concept": "medication" },
+    { "table": "TestCatalog",    "concept": "lab_test" },
+    { "table": "LabReq",         "concept": "lab_order" },
+    { "table": "LabRes",         "concept": "lab_result" },
+    { "table": "Invoice",        "concept": "bill" },
+    { "table": "ChargeItem",     "concept": "bill_item" },
+    { "table": "Receipt",        "concept": "payment" },
+    { "table": "ImagingReq",     "concept": "imaging_order" },
+    { "table": "Incident",       "concept": "incident" },
+    { "table": "OB_Delivery",    "concept": "delivery" },
+    { "table": "OB_Baby",        "concept": "newborn" },
+    { "table": "DiagCode",       "concept": "diagnosis_code" },
+    { "table": "PatientDx",      "concept": "diagnosis" }
+  ]
+}

@@ -36,11 +36,14 @@ pub async fn login(
     state: &State<AppState>,
     remote: Option<std::net::SocketAddr>,
 ) -> AppResult<Json<LoginResponse>> {
-    let ip_key = remote.map(|s| s.ip().to_string()).unwrap_or_else(|| "unknown".to_string());
+    let ip_key = remote
+        .map(|s| s.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     // Reject early if this client IP is currently locked out for too many failures.
     if let Some(retry) = state.login_throttle.check(&ip_key) {
         return Err(AppError::TooManyRequests(format!(
-            "too many failed login attempts; try again in {}s", retry.as_secs().max(1)
+            "too many failed login attempts; try again in {}s",
+            retry.as_secs().max(1)
         )));
     }
 
@@ -67,15 +70,32 @@ pub async fn login(
     if !password::verify_password(&body.password, &user.password_hash) {
         state.login_throttle.record_failure(&ip_key);
         audit::write_audit(
-            &state.db, &user.id, &user.username, "login_failed", &user.username, None,
-        ).await;
+            &state.db,
+            &user.id,
+            &user.username,
+            "login_failed",
+            &user.username,
+            None,
+        )
+        .await;
         return Err(AppError::Unauthorized);
     }
 
     state.login_throttle.record_success(&ip_key);
     let token = jwt::issue(&state.config, &user)?;
-    audit::write_audit(&state.db, &user.id, &user.username, "login", &user.username, None).await;
-    Ok(Json(LoginResponse { token, user: UserInfo::from(&user) }))
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "login",
+        &user.username,
+        None,
+    )
+    .await;
+    Ok(Json(LoginResponse {
+        token,
+        user: UserInfo::from(&user),
+    }))
 }
 
 /// `GET /auth/me` — the caller's own identity (requires a valid token).
@@ -113,16 +133,27 @@ pub async fn create_user(
 
     let username = body.username.trim();
     if username.is_empty() || body.password.is_empty() {
-        return Err(AppError::BadRequest("username and password are required".into()));
+        return Err(AppError::BadRequest(
+            "username and password are required".into(),
+        ));
     }
 
     let users = state.db.collection::<User>(USERS);
-    if users.find_one(doc! { "username": username }).await?.is_some() {
-        return Err(AppError::BadRequest(format!("user '{username}' already exists")));
+    if users
+        .find_one(doc! { "username": username })
+        .await?
+        .is_some()
+    {
+        return Err(AppError::BadRequest(format!(
+            "user '{username}' already exists"
+        )));
     }
 
     // Default email from username when not provided; default name to empty.
-    let email = body.email.as_deref().filter(|s| !s.is_empty())
+    let email = body
+        .email
+        .as_deref()
+        .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{username}@localhost"));
     let name = body.name.as_deref().unwrap_or("").to_string();
@@ -142,9 +173,14 @@ pub async fn create_user(
     };
     users.insert_one(&user).await?;
     audit::write_audit(
-        &state.db, &admin.id, &admin.username, "user_created", &user.id,
+        &state.db,
+        &admin.id,
+        &admin.username,
+        "user_created",
+        &user.id,
         Some(serde_json::json!({ "username": user.username, "role": user.role })),
-    ).await;
+    )
+    .await;
     Ok(Json(UserInfo::from(&user)))
 }
 
@@ -152,13 +188,16 @@ pub async fn create_user(
 
 /// `GET /auth/users` — list all users sorted by creation time (admin only).
 #[get("/auth/users")]
-pub async fn list_users(admin: AuthUser, state: &State<AppState>) -> AppResult<Json<Vec<UserInfo>>> {
+pub async fn list_users(
+    admin: AuthUser,
+    state: &State<AppState>,
+) -> AppResult<Json<Vec<UserInfo>>> {
     admin.require_admin()?;
 
     let users = state.db.collection::<User>(USERS);
     let all: Vec<User> = users
         .find(doc! {})
-        .sort(doc! { "created_at": 1 })
+        .sort(doc! { "created_at": 1, "_id": 1 })
         .await?
         .try_collect()
         .await?;
@@ -190,7 +229,10 @@ pub async fn update_user(
     let users = state.db.collection::<User>(USERS);
 
     // Load target; 404 if absent.
-    let target = users.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let target = users
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     // Email-conflict check: normalize, then reject if another user has it.
     if let Some(ref email_raw) = body.email {
@@ -250,10 +292,21 @@ pub async fn update_user(
     users.update_one(doc! { "_id": id }, update).await?;
 
     // Re-read to return data that reflects what was actually persisted.
-    let updated = users.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let updated = users
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let info = UserInfo::from(&updated);
 
-    audit::write_audit(&state.db, &admin.id, &admin.username, "user_updated", id, None).await;
+    audit::write_audit(
+        &state.db,
+        &admin.id,
+        &admin.username,
+        "user_updated",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(info))
 }
 
@@ -271,13 +324,18 @@ pub async fn delete_user(
 
     // Self-delete guard: an admin cannot remove their own account.
     if id == admin.id {
-        return Err(AppError::BadRequest("you cannot delete your own account".into()));
+        return Err(AppError::BadRequest(
+            "you cannot delete your own account".into(),
+        ));
     }
 
     let users = state.db.collection::<User>(USERS);
 
     // Load target; 404 if absent.
-    let target = users.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let target = users
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     // Last-admin guard: cannot delete the only admin.
     if target.role == Role::Admin {
@@ -291,9 +349,14 @@ pub async fn delete_user(
 
     // Record who was deleted; helpful for reconstructing the audit trail.
     audit::write_audit(
-        &state.db, &admin.id, &admin.username, "user_deleted", id,
+        &state.db,
+        &admin.id,
+        &admin.username,
+        "user_deleted",
+        id,
         Some(serde_json::json!({ "username": target.username })),
-    ).await;
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -318,7 +381,10 @@ pub async fn set_user_password(
     let users = state.db.collection::<User>(USERS);
 
     // 404 if target absent — confirm the user exists before hashing.
-    let _ = users.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let _ = users
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     if body.new_password.is_empty() {
         return Err(AppError::BadRequest("new_password cannot be empty".into()));
@@ -332,7 +398,15 @@ pub async fn set_user_password(
         )
         .await?;
 
-    audit::write_audit(&state.db, &admin.id, &admin.username, "password_set", id, None).await;
+    audit::write_audit(
+        &state.db,
+        &admin.id,
+        &admin.username,
+        "password_set",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -364,10 +438,21 @@ pub async fn update_me(
         .await?;
 
     // Re-read so the response reflects the persisted state.
-    let updated = users.find_one(doc! { "_id": &user.id }).await?.ok_or(AppError::NotFound)?;
+    let updated = users
+        .find_one(doc! { "_id": &user.id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     let info = UserInfo::from(&updated);
 
-    audit::write_audit(&state.db, &user.id, &user.username, "profile_updated", &user.id, None).await;
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "profile_updated",
+        &user.id,
+        None,
+    )
+    .await;
     Ok(Json(info))
 }
 
@@ -389,7 +474,10 @@ pub async fn change_my_password(
     let users = state.db.collection::<User>(USERS);
 
     // Load self to get the current password hash.
-    let self_user = users.find_one(doc! { "_id": &user.id }).await?.ok_or(AppError::NotFound)?;
+    let self_user = users
+        .find_one(doc! { "_id": &user.id })
+        .await?
+        .ok_or(AppError::NotFound)?;
 
     // Verify current password; 401 so the client can show "Current password is incorrect".
     if !password::verify_password(&body.current_password, &self_user.password_hash) {
@@ -408,7 +496,15 @@ pub async fn change_my_password(
         )
         .await?;
 
-    audit::write_audit(&state.db, &user.id, &user.username, "password_changed", &user.id, None).await;
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "password_changed",
+        &user.id,
+        None,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -419,9 +515,20 @@ pub async fn change_my_password(
 pub async fn logout(user: AuthUser, state: &State<AppState>) -> AppResult<Json<serde_json::Value>> {
     let users = state.db.collection::<User>(USERS);
     users
-        .update_one(doc! { "_id": &user.id }, doc! { "$inc": { "token_version": 1i64 } })
+        .update_one(
+            doc! { "_id": &user.id },
+            doc! { "$inc": { "token_version": 1i64 } },
+        )
         .await?;
-    audit::write_audit(&state.db, &user.id, &user.username, "logout", &user.username, None).await;
+    audit::write_audit(
+        &state.db,
+        &user.id,
+        &user.username,
+        "logout",
+        &user.username,
+        None,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -435,10 +542,24 @@ pub async fn force_logout_user(
 ) -> AppResult<Json<serde_json::Value>> {
     admin.require_admin()?;
     let users = state.db.collection::<User>(USERS);
-    let _ = users.find_one(doc! { "_id": id }).await?.ok_or(AppError::NotFound)?;
+    let _ = users
+        .find_one(doc! { "_id": id })
+        .await?
+        .ok_or(AppError::NotFound)?;
     users
-        .update_one(doc! { "_id": id }, doc! { "$inc": { "token_version": 1i64 } })
+        .update_one(
+            doc! { "_id": id },
+            doc! { "$inc": { "token_version": 1i64 } },
+        )
         .await?;
-    audit::write_audit(&state.db, &admin.id, &admin.username, "force_logout", id, None).await;
+    audit::write_audit(
+        &state.db,
+        &admin.id,
+        &admin.username,
+        "force_logout",
+        id,
+        None,
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

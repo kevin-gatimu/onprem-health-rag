@@ -23,7 +23,7 @@
 pub mod rerank;
 pub mod rrf;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::LazyLock;
@@ -35,6 +35,7 @@ use crate::config::{Config, RetrievalMode};
 use crate::documentdb::{DocumentDb, vector::Hit};
 use crate::embed;
 use crate::error::AppResult;
+use crate::telemetry::{RequestTrace, Stage};
 
 /// A retrieved chunk, ready for citation and prompt-building. `fields` is the source
 /// row flattened to JSON (converted from BSON here so routes/serialization never touch
@@ -44,6 +45,7 @@ use crate::error::AppResult;
 pub struct Passage {
     pub id: String,
     pub source_id: String,
+    pub table: String,
     pub row_pk: String,
     pub chunk_index: i32,
     pub text: String,
@@ -51,34 +53,107 @@ pub struct Passage {
     pub score: f64,
     /// True if a cross-encoder assigned `score`; false if it's the RRF fused score.
     pub reranked: bool,
+    pub vector_rank: Option<usize>,
+    pub text_rank: Option<usize>,
+    pub fused_score: f64,
+    pub rerank_score: Option<f64>,
 }
 
 impl Passage {
-    fn from_hit(hit: Hit, score: f64, reranked: bool) -> Self {
+    fn from_hit(
+        hit: Hit,
+        score: f64,
+        reranked: bool,
+        fused_score: f64,
+        vector_rank: Option<usize>,
+        text_rank: Option<usize>,
+    ) -> Self {
         // Relaxed extended JSON keeps numbers/strings readable for the LLM and UI
         // (canonical would wrap them as {"$numberInt": ...}).
         let fields = hit.fields.into_relaxed_extjson();
         Passage {
             id: hit.id,
             source_id: hit.source_id,
+            table: hit.table,
             row_pk: hit.row_pk,
             chunk_index: hit.chunk_index,
             text: hit.text,
             fields,
             score,
             reranked,
+            vector_rank,
+            text_rank,
+            fused_score,
+            rerank_score: reranked.then_some(score),
         }
     }
 }
 
 // ICD-10 codes (e.g. E11.9) and all-caps drug tokens (e.g. METFORMIN) should be
 // quoted in $text queries so the server matches the exact token rather than stemming it.
-static RE_ICD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap()
-});
-static RE_DRUG: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\b[A-Z]{4,}\b").unwrap()
-});
+static RE_ICD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap());
+static RE_DRUG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b[A-Z]{4,}\b").unwrap());
+static RE_PATIENT_ID: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z]{2,}-\d{4}-\d{2,}\b").unwrap());
+static RE_CODE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b[A-Z]\d{2}(?:\.\d+)?\b").unwrap());
+static RE_NAME_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b[A-Z][a-z]{1,}\s+[A-Z][a-z]{1,}\b").unwrap());
+
+/// Return whether a standalone question asks for a broad overview or enumeration.
+///
+/// This is deliberately conservative: broad-intent language is necessary but any
+/// patient id, clinical code, quoted term, all-caps token, or likely person-name pair
+/// makes the question pointed. Pointed questions retain cross-encoder reranking and
+/// its anti-hallucination score gate.
+pub fn is_broad_question(question: &str) -> bool {
+    let trimmed = question.trim();
+    if trimmed.is_empty()
+        || RE_PATIENT_ID.is_match(trimmed)
+        || RE_CODE.is_match(trimmed)
+        || RE_DRUG.is_match(trimmed)
+        || contains_quoted_term(trimmed)
+        || RE_NAME_PAIR.is_match(trimmed)
+    {
+        return false;
+    }
+
+    let normalized = trimmed.to_ascii_lowercase();
+    let words: Vec<&str> = normalized
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "all" | "every" | "list" | "overview" | "recent" | "latest"
+        ) || word.starts_with("summar")
+    }) || normalized.contains("show me the")
+        || (normalized.starts_with("what ") && normalized.contains(" are there"))
+}
+
+/// Apply the semantic relevance gate using the score scale appropriate to the query.
+/// Broad questions use RRF scores, which are not comparable with reranker scores, so
+/// they are refused only when retrieval returned no passages.
+pub fn should_refuse_semantic(
+    standalone_question: &str,
+    top_score: Option<f64>,
+    score_gate: Option<f64>,
+) -> bool {
+    match top_score {
+        None => true,
+        Some(_) if is_broad_question(standalone_question) => false,
+        Some(score) => score_gate.is_some_and(|floor| score < floor),
+    }
+}
+
+fn contains_quoted_term(text: &str) -> bool {
+    ['"', '\''].into_iter().any(|quote| {
+        let mut parts = text.split(quote);
+        let _before = parts.next();
+        parts.next().is_some_and(|inside| !inside.trim().is_empty()) && parts.next().is_some()
+    })
+}
 
 /// Wrap ICD codes and all-caps drug tokens with double quotes so the MongoDB $text
 /// operator matches them exactly. Other query words are left unchanged.
@@ -101,19 +176,137 @@ fn enhance_text_query(query: &str) -> String {
     }
 }
 
-/// Run retrieval for a set of queries and return the top-k passages.
+/// A read allow-list applied to retrieval candidates (plan 05 §3, hook 3).
 ///
-/// `queries` is the primary query followed by any multi-query expansions; the primary
-/// (`queries[0]`) is what the reranker scores against. `mode` and `rerank_enabled` are
-/// taken per-request (falling back to config defaults at the call site) so the Chat UI
-/// can toggle them.
-pub async fn retrieve(
+/// The filter narrows *what an agent looks at*. It is not an access-control
+/// decision: every passage it can admit was already readable by this user, and
+/// authorisation stays entirely in `src/auth/`. Its job is relevance — stopping
+/// a Maternity question from answering out of `payments` rows.
+#[derive(Debug, Clone, Default)]
+pub struct RetrievalFilter {
+    /// Physical table names in scope. Empty = no table narrowing.
+    pub tables: Vec<String>,
+    /// Restrict to these ingested sources. Empty = all sources.
+    pub source_ids: Vec<String>,
+    /// Restrict to specific source rows (used by focus/handover). Empty = all.
+    pub row_pks: Vec<String>,
+    /// When set, keep only passages whose row primary key or text carries this
+    /// patient key.
+    pub patient_key: Option<String>,
+    /// `true` for a fixed service-line agent: the scope is a hard filter and an
+    /// empty result is an honest "not in this department's data".
+    /// `false` for Ask: the filter is advisory and never removes candidates.
+    pub explicit: bool,
+}
+
+impl RetrievalFilter {
+    /// Build the filter for an agent's scope. `explicit` mirrors
+    /// `AgentKind::scope_is_explicit`.
+    pub fn for_scope(tables: Vec<String>, explicit: bool) -> Self {
+        RetrievalFilter {
+            tables,
+            explicit,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this filter can remove anything at all.
+    fn is_active(&self) -> bool {
+        self.explicit
+            && (!self.tables.is_empty()
+                || !self.source_ids.is_empty()
+                || !self.row_pks.is_empty()
+                || self.patient_key.is_some())
+    }
+
+    /// Does a candidate hit survive the filter?
+    fn admits(&self, hit: &crate::documentdb::vector::Hit) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        if !self.tables.is_empty() && !self.tables.iter().any(|t| t == &hit.table) {
+            return false;
+        }
+        if !self.source_ids.is_empty() && !self.source_ids.iter().any(|s| s == &hit.source_id) {
+            return false;
+        }
+        if !self.row_pks.is_empty() && !self.row_pks.iter().any(|r| r == &hit.row_pk) {
+            return false;
+        }
+        if let Some(key) = &self.patient_key {
+            let key_lower = key.to_ascii_lowercase();
+            let in_pk = hit.row_pk.to_ascii_lowercase().contains(&key_lower);
+            let in_text = hit.text.to_ascii_lowercase().contains(&key_lower);
+            if !in_pk && !in_text {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Run retrieval while recording PHI-safe per-stage timings in the request summary.
+pub async fn retrieve_observed(
     db: &DocumentDb,
     config: &Config,
     queries: &[String],
     mode: RetrievalMode,
     rerank_enabled: bool,
     top_k: usize,
+    trace: &RequestTrace,
+) -> AppResult<Vec<Passage>> {
+    retrieve_inner(
+        db,
+        config,
+        queries,
+        mode,
+        rerank_enabled,
+        top_k,
+        Some(trace),
+        None,
+    )
+    .await
+}
+
+/// `retrieve_observed` with an agent scope applied to the candidate set.
+///
+/// Filtering happens after the search sides return and **before** RRF fusion, so
+/// ranks are computed over the admitted candidates only — filtering after fusion
+/// would leave gaps in the fused ranking and silently underfill `top_k`.
+#[allow(clippy::too_many_arguments)]
+pub async fn retrieve_observed_filtered(
+    db: &DocumentDb,
+    config: &Config,
+    queries: &[String],
+    mode: RetrievalMode,
+    rerank_enabled: bool,
+    top_k: usize,
+    trace: &RequestTrace,
+    filter: &RetrievalFilter,
+) -> AppResult<Vec<Passage>> {
+    retrieve_inner(
+        db,
+        config,
+        queries,
+        mode,
+        rerank_enabled,
+        top_k,
+        Some(trace),
+        Some(filter),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn retrieve_inner(
+    db: &DocumentDb,
+    config: &Config,
+    queries: &[String],
+    mode: RetrievalMode,
+    rerank_enabled: bool,
+    top_k: usize,
+    trace: Option<&RequestTrace>,
+    filter: Option<&RetrievalFilter>,
 ) -> AppResult<Vec<Passage>> {
     let queries: Vec<String> = queries
         .iter()
@@ -126,67 +319,172 @@ pub async fn retrieve(
 
     // Embed all queries in one batch — one spawn_blocking call, one fastembed
     // invocation, LRU cache checked for each before going to the model.
-    let query_vecs = embed::embed_queries(config, queries.clone()).await?;
+    let query_vecs = match trace {
+        Some(trace) => {
+            trace
+                .time(Stage::Embed, embed::embed_queries(config, queries.clone()))
+                .await?
+        }
+        None => embed::embed_queries(config, queries.clone()).await?,
+    };
 
     // Build every search future (vector + optional $text per query) and run
     // them all concurrently. Each future captures an owned DocumentDb clone
     // (cheap: it's a reference-counted MongoDB client handle).
     let per_side = config.retrieve_per_side;
     let mut futs: Vec<Pin<Box<dyn Future<Output = AppResult<Vec<Hit>>> + Send>>> = Vec::new();
+    let mut search_sides = Vec::new();
 
     for (q, qv) in queries.iter().zip(query_vecs) {
         let db_v = db.clone();
+        let trace_v = trace.cloned();
+        search_sides.push(true);
         futs.push(Box::pin(async move {
-            crate::documentdb::vector::vector_search(&db_v, qv, per_side).await
+            let search = crate::documentdb::vector::vector_search(&db_v, qv, per_side);
+            match trace_v {
+                Some(trace) => trace.time(Stage::SearchVector, search).await,
+                None => search.await,
+            }
         }));
         if mode == RetrievalMode::Hybrid {
+            search_sides.push(false);
             let db_t = db.clone();
             let enhanced = enhance_text_query(q);
+            let trace_t = trace.cloned();
             futs.push(Box::pin(async move {
-                crate::documentdb::vector::text_search(&db_t, &enhanced, per_side).await
+                let search = crate::documentdb::vector::text_search(&db_t, &enhanced, per_side);
+                match trace_t {
+                    Some(trace) => trace.time(Stage::SearchText, search).await,
+                    None => search.await,
+                }
             }));
         }
     }
 
     let mut by_id: HashMap<String, Hit> = HashMap::new();
     let mut rankings: Vec<Vec<String>> = Vec::new();
+    let mut vector_ranks = HashMap::new();
+    let mut text_ranks = HashMap::new();
 
-    for result in futures::future::join_all(futs).await {
-        rankings.push(collect(&mut by_id, result?));
+    for (is_vector, result) in search_sides
+        .into_iter()
+        .zip(futures::future::join_all(futs).await)
+    {
+        let mut hits = result?;
+        if let Some(filter) = filter {
+            hits.retain(|hit| filter.admits(hit));
+        }
+        let ranking = collect(&mut by_id, hits);
+        let rank_map = if is_vector {
+            &mut vector_ranks
+        } else {
+            &mut text_ranks
+        };
+        for (index, id) in ranking.iter().enumerate() {
+            rank_map
+                .entry(id.clone())
+                .and_modify(|rank: &mut usize| *rank = (*rank).min(index + 1))
+                .or_insert(index + 1);
+        }
+        rankings.push(ranking);
     }
 
-    let fused = rrf::fuse(&rankings, config.rrf_k);
+    let fused = match trace {
+        Some(trace) => trace.time_sync(Stage::Rrf, || rrf::fuse(&rankings, config.rrf_k)),
+        None => rrf::fuse(&rankings, config.rrf_k),
+    };
     if fused.is_empty() {
+        if let Some(trace) = trace {
+            trace.set_retrieval(0, 0, None);
+        }
         return Ok(Vec::new());
     }
 
+    // Keep the strongest chunk for each source row before truncation. Applying this
+    // after `top_k` could underfill the result even when lower-ranked unique rows exist.
+    let mut unique_rows = HashSet::new();
+    let fused: Vec<(String, f64)> = fused
+        .into_iter()
+        .filter(|(id, _)| {
+            by_id.get(id).is_some_and(|hit| {
+                unique_rows.insert((hit.source_id.clone(), hit.table.clone(), hit.row_pk.clone()))
+            })
+        })
+        .collect();
+
     // Rerank the fused top-N (bounded work for the cross-encoder); without reranking
     // we only need the top-k the caller asked for.
-    let cutoff = if rerank_enabled { config.rerank_top_n.max(top_k) } else { top_k };
+    let cutoff = if rerank_enabled {
+        adaptive_rerank_cutoff(&fused, top_k, config.rerank_top_n)
+    } else {
+        top_k
+    };
     let candidates: Vec<(String, f64)> = fused.into_iter().take(cutoff).collect();
 
     if !rerank_enabled {
-        return Ok(candidates
+        let candidates_in = candidates.len();
+        let mut seen_rows = HashSet::new();
+        let passages: Vec<Passage> = candidates
             .into_iter()
-            .filter_map(|(id, fused_score)| by_id.remove(&id).map(|h| Passage::from_hit(h, fused_score, false)))
+            .filter_map(|(id, fused_score)| {
+                let hit = by_id.remove(&id)?;
+                seen_rows
+                    .insert((hit.source_id.clone(), hit.table.clone(), hit.row_pk.clone()))
+                    .then(|| {
+                        let vector_rank = vector_ranks.get(&id).copied();
+                        let text_rank = text_ranks.get(&id).copied();
+                        Passage::from_hit(
+                            hit,
+                            fused_score,
+                            false,
+                            fused_score,
+                            vector_rank,
+                            text_rank,
+                        )
+                    })
+            })
             .take(top_k)
-            .collect());
+            .collect();
+        if let Some(trace) = trace {
+            trace.set_retrieval(candidates_in, passages.len(), None);
+        }
+        return Ok(passages);
     }
 
     // Cross-encoder rerank against the primary query. Keep ids aligned with the docs
     // we hand the reranker so we can map its (index, score) back to hits.
+    let fused_scores: HashMap<String, f64> = candidates.iter().cloned().collect();
     let ids: Vec<String> = candidates.iter().map(|(id, _)| id.clone()).collect();
     let docs: Vec<String> = ids
         .iter()
         .map(|id| by_id.get(id).map(|h| h.text.clone()).unwrap_or_default())
         .collect();
 
-    let ranked = rerank::rerank(config, queries[0].clone(), docs).await?;
+    let candidates_in = candidates.len();
+    let rerank_future = rerank::rerank(config, queries[0].clone(), docs);
+    let ranked = match trace {
+        Some(trace) => trace.time(Stage::Rerank, rerank_future).await?,
+        None => rerank_future.await?,
+    };
     let mut passages = Vec::with_capacity(top_k);
-    for (idx, score) in ranked.into_iter().take(top_k) {
+    let mut seen_rows = HashSet::new();
+    for (idx, score) in ranked {
         if let Some(id) = ids.get(idx) {
             if let Some(hit) = by_id.remove(id) {
-                passages.push(Passage::from_hit(hit, score as f64, true));
+                let row = (hit.source_id.clone(), hit.table.clone(), hit.row_pk.clone());
+                if seen_rows.insert(row) {
+                    passages.push(Passage::from_hit(
+                        hit,
+                        score as f64,
+                        true,
+                        fused_scores.get(id).copied().unwrap_or_default(),
+                        vector_ranks.get(id).copied(),
+                        text_ranks.get(id).copied(),
+                    ));
+                    if passages.len() == top_k {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -198,16 +496,42 @@ pub async fn retrieve(
         let half = gate / 2.0;
         while passages.len() > 1 {
             match passages.last() {
-                Some(p) if p.score < half => { passages.pop(); }
+                Some(p) if p.score < half => {
+                    passages.pop();
+                }
                 _ => break,
             }
         }
+    }
+
+    if let Some(trace) = trace {
+        trace.set_retrieval(
+            candidates_in,
+            passages.len(),
+            passages.first().map(|p| p.score),
+        );
     }
 
     Ok(passages)
 }
 
 /// Record each hit by id and return this list's id ordering (for RRF).
+fn adaptive_rerank_cutoff(fused: &[(String, f64)], top_k: usize, configured_max: usize) -> usize {
+    let maximum = configured_max.max(top_k).min(fused.len());
+    let minimum = top_k.max(8).min(maximum);
+    if maximum <= minimum {
+        return maximum;
+    }
+    for index in minimum..maximum {
+        let previous = fused[index - 1].1;
+        let next = fused[index].1;
+        if previous > 0.0 && next / previous < 0.65 {
+            return index;
+        }
+    }
+    maximum
+}
+
 fn collect(by_id: &mut HashMap<String, Hit>, hits: Vec<Hit>) -> Vec<String> {
     let mut order = Vec::with_capacity(hits.len());
     for hit in hits {
@@ -217,4 +541,56 @@ fn collect(by_id: &mut HashMap<String, Hit>, hits: Vec<Hit>) -> Vec<String> {
         by_id.entry(hit.id.clone()).or_insert(hit);
     }
     order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_broad_question, should_refuse_semantic};
+
+    #[test]
+    fn broad_question_heuristic_accepts_overviews_and_enumerations() {
+        for question in [
+            "Give me an overview of the most recent encounters.",
+            "how about all encounters",
+            "List all prescriptions",
+            "What diagnoses are there?",
+        ] {
+            assert!(is_broad_question(question), "question: {question}");
+        }
+    }
+
+    #[test]
+    fn broad_question_heuristic_rejects_specific_anchors() {
+        for question in [
+            "Summarize the medical history of patient SYN-2024-0001.",
+            "Does Jane Chebet have any allergies?",
+            "Which patients have E11.9?",
+            "Tell me about Jane Chebet",
+        ] {
+            assert!(!is_broad_question(question), "question: {question}");
+        }
+    }
+
+    #[test]
+    fn broad_question_with_passages_skips_score_gate_refusal() {
+        assert!(!should_refuse_semantic(
+            "how about all encounters",
+            Some(0.002),
+            Some(0.30),
+        ));
+        assert!(should_refuse_semantic(
+            "how about all encounters",
+            None,
+            Some(0.30),
+        ));
+    }
+
+    #[test]
+    fn pointed_question_retains_score_gate_refusal() {
+        assert!(should_refuse_semantic(
+            "Which patients have E11.9?",
+            Some(0.02),
+            Some(0.30),
+        ));
+    }
 }

@@ -70,3 +70,37 @@ export function createRafBuffer<T>(flush: (batch: T[]) => void) {
     },
   };
 }
+
+/** Batches independent event streams without ever mixing data between run IDs. */
+export function createKeyedRafBuffer<T>(flush: (key: string, batch: T[]) => void) {
+  const buffers = new Map<string, T[]>();
+  let handle: number | null = null;
+
+  const flushAll = () => {
+    handle = null;
+    for (const [key, batch] of buffers) flush(key, batch);
+    buffers.clear();
+  };
+
+  return {
+    push(key: string, item: T) {
+      const batch = buffers.get(key) ?? [];
+      batch.push(item);
+      buffers.set(key, batch);
+      if (handle === null) handle = requestAnimationFrame(flushAll);
+    },
+    flushNow(key: string) {
+      const batch = buffers.get(key);
+      if (!batch) return;
+      buffers.delete(key);
+      flush(key, batch);
+    },
+    reset() {
+      buffers.clear();
+      if (handle !== null) {
+        cancelAnimationFrame(handle);
+        handle = null;
+      }
+    },
+  };
+}

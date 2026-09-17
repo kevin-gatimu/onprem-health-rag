@@ -12,8 +12,10 @@ use sqlx::types::BigDecimal;
 use sqlx::types::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use sqlx::{Column, Row, ValueRef};
 
-use super::{ColumnSchema, FetchedRow, SourceConnector, SourceSpec, TableSchema, conn_err,
-            make_row_filtered};
+use super::{
+    ColumnSchema, FetchedRow, FkEdge, SourceConnector, SourceSpec, TableSchema, conn_err,
+    make_row_filtered,
+};
 use crate::error::AppResult;
 
 pub struct MysqlConnector {
@@ -42,6 +44,16 @@ impl MysqlConnector {
             .await
             .map_err(|e| conn_err("MySQL connection failed", e))
     }
+}
+
+fn mysql_plan_cost(value: &serde_json::Value) -> Option<f64> {
+    value
+        .get("query_block")?
+        .get("cost_info")?
+        .get("query_cost")?
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 #[async_trait]
@@ -98,9 +110,9 @@ impl SourceConnector for MysqlConnector {
         .await
         .map_err(|e| conn_err("MySQL column query failed", e))?;
 
-        // Precise FK detection via key_column_usage.
+        // FK columns with referenced table + column (for schema cards).
         let fk_rows = sqlx::query(
-            "SELECT TABLE_NAME, COLUMN_NAME \
+            "SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
              FROM information_schema.key_column_usage \
              WHERE TABLE_SCHEMA = DATABASE() AND REFERENCED_TABLE_NAME IS NOT NULL",
         )
@@ -111,10 +123,20 @@ impl SourceConnector for MysqlConnector {
         pool.close().await;
 
         let mut fk_set: HashSet<(String, String)> = HashSet::new();
+        let mut fk_edges_map: HashMap<String, Vec<FkEdge>> = HashMap::new();
         for row in &fk_rows {
             let t: String = row.try_get(0).unwrap_or_default();
             let c: String = row.try_get(1).unwrap_or_default();
-            fk_set.insert((t, c));
+            let ref_t: String = row.try_get(2).unwrap_or_default();
+            let ref_c: String = row.try_get(3).unwrap_or_default();
+            fk_set.insert((t.clone(), c.clone()));
+            if !ref_t.is_empty() {
+                fk_edges_map.entry(t).or_default().push(FkEdge {
+                    column: c,
+                    ref_table: ref_t,
+                    ref_column: ref_c,
+                });
+            }
         }
 
         let mut table_columns: HashMap<String, Vec<ColumnSchema>> = HashMap::new();
@@ -124,21 +146,30 @@ impl SourceConnector for MysqlConnector {
             let dtype: String = row.try_get(2).unwrap_or_default();
             let nullable: String = row.try_get(3).unwrap_or_default();
             let col_key: String = row.try_get(4).unwrap_or_default();
-            table_columns.entry(table.clone()).or_default().push(ColumnSchema {
-                is_primary_key: col_key == "PRI",
-                is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
-                nullable: nullable.eq_ignore_ascii_case("YES"),
-                name: col,
-                type_: dtype,
-                likely_pii: false,
-            });
+            table_columns
+                .entry(table.clone())
+                .or_default()
+                .push(ColumnSchema {
+                    is_primary_key: col_key == "PRI",
+                    is_foreign_key: fk_set.contains(&(table.clone(), col.clone())),
+                    nullable: nullable.eq_ignore_ascii_case("YES"),
+                    name: col,
+                    type_: dtype,
+                    likely_pii: false,
+                });
         }
 
         let mut schemas: Vec<TableSchema> = row_estimates
             .into_iter()
             .map(|(name, row_count)| {
                 let columns = table_columns.remove(&name).unwrap_or_default();
-                TableSchema { name, row_count, columns }
+                let fk_edges = fk_edges_map.remove(&name).unwrap_or_default();
+                TableSchema {
+                    name,
+                    row_count,
+                    columns,
+                    fk_edges,
+                }
             })
             .collect();
         schemas.sort_by(|a, b| a.name.cmp(&b.name));
@@ -160,23 +191,25 @@ impl SourceConnector for MysqlConnector {
         Ok(n)
     }
 
-    async fn fetch_table(
+    async fn fetch_table_page(
         &self,
         table: &str,
         excluded: &[String],
-        limit: Option<i64>,
+        order_by: Option<&str>,
+        offset: i64,
+        page_size: i64,
     ) -> AppResult<Vec<FetchedRow>> {
         let pool = self.pool(2).await?;
-        // Backtick-quote the identifier. The table was validated by start_ingest.
-        let mut sql = format!("SELECT * FROM `{table}`");
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {n}"));
-        }
+        let order = order_by
+            .map(|column| format!("`{column}`"))
+            .unwrap_or_else(|| "(SELECT NULL)".to_string());
+        let sql =
+            format!("SELECT * FROM `{table}` ORDER BY {order} LIMIT {page_size} OFFSET {offset}");
 
         let rows = sqlx::query(&sql)
             .fetch_all(&pool)
             .await
-            .map_err(|e| conn_err(&format!("MySQL fetch_table({table}) failed"), e))?;
+            .map_err(|e| conn_err(&format!("MySQL fetch_table_page({table}) failed"), e))?;
         pool.close().await;
 
         let out = rows
@@ -185,17 +218,91 @@ impl SourceConnector for MysqlConnector {
             .map(|(i, row)| {
                 let mut fields = Map::new();
                 for (col, column) in row.columns().iter().enumerate() {
-                    // Honour excluded columns here — skip building the field entirely
-                    // so PII bytes never reach the FetchedRow.
                     if excluded.iter().any(|e| e == column.name()) {
                         continue;
                     }
                     fields.insert(column.name().to_string(), cell_to_json(row, col));
                 }
-                make_row_filtered(fields, excluded, i)
+                make_row_filtered(fields, excluded, offset as usize + i)
             })
             .collect();
         Ok(out)
+    }
+
+    async fn estimate_cost(&self, sql: &str, timeout_secs: u64) -> AppResult<Option<f64>> {
+        let pool = self.pool(1).await?;
+        let timeout_ms = timeout_secs * 1_000;
+
+        sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+            .execute(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL set EXPLAIN timeout failed", e))?;
+
+        let explain_sql = format!("EXPLAIN FORMAT=JSON {sql}");
+        let row = sqlx::query(&explain_sql)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL EXPLAIN failed", e))?;
+        let value = row
+            .try_get::<String, _>(0)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+
+        sqlx::query("SET SESSION max_execution_time = 0")
+            .execute(&pool)
+            .await
+            .ok();
+        pool.close().await;
+        Ok(value.as_ref().and_then(mysql_plan_cost))
+    }
+
+    async fn run_select(
+        &self,
+        sql: &str,
+        max_rows: i64,
+        timeout_secs: u64,
+    ) -> AppResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+        let pool = self.pool(1).await?;
+        // max_execution_time is milliseconds; 0 = disabled (reset for the next caller).
+        let timeout_ms = timeout_secs * 1_000;
+
+        sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
+            .execute(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL set max_execution_time failed", e))?;
+
+        // The sql already carries LIMIT {max_rows} injected by validate_sql; the
+        // subquery wrap adds a hard safety cap in case validate_sql is bypassed.
+        let capped = format!("SELECT * FROM ({sql}) AS _q LIMIT {max_rows}");
+
+        let rows = sqlx::query(&capped)
+            .fetch_all(&pool)
+            .await
+            .map_err(|e| conn_err("MySQL run_select query failed", e))?;
+
+        // Reset so the pool's lingering connection doesn't timeout unrelated queries.
+        sqlx::query("SET SESSION max_execution_time = 0")
+            .execute(&pool)
+            .await
+            .ok();
+
+        pool.close().await;
+
+        if rows.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+
+        let columns: Vec<String> = rows[0]
+            .columns()
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+        let mut result_rows = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let values = (0..columns.len()).map(|i| cell_to_json(row, i)).collect();
+            result_rows.push(values);
+        }
+        Ok((columns, result_rows))
     }
 }
 
@@ -234,4 +341,23 @@ fn cell_to_json(row: &MySqlRow, i: usize) -> Value {
         return json!(B64.encode(v));
     }
     Value::Null
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mysql_plan_cost;
+    use serde_json::json;
+
+    #[test]
+    fn parses_mysql_string_plan_cost() {
+        let plan = json!({"query_block": {"cost_info": {"query_cost": "42.75"}}});
+        assert_eq!(mysql_plan_cost(&plan), Some(42.75));
+    }
+
+    #[test]
+    fn missing_or_invalid_mysql_plan_cost_returns_none() {
+        assert_eq!(mysql_plan_cost(&json!({"query_block": {}})), None);
+        let invalid = json!({"query_block": {"cost_info": {"query_cost": "unknown"}}});
+        assert_eq!(mysql_plan_cost(&invalid), None);
+    }
 }

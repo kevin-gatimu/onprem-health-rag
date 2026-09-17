@@ -5,7 +5,10 @@ use std::collections::HashMap;
 
 use crate::state::Bridge;
 use eventsource_stream::Eventsource;
-use futures_util::StreamExt;
+use futures_util::{
+    StreamExt,
+    future::{AbortHandle, Abortable},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tauri::{Emitter, State};
@@ -15,6 +18,13 @@ use tauri_plugin_store::StoreExt;
 /// The React layer maps it to a forced logout. Keep in sync with `SESSION_EXPIRED`
 /// in `src/lib/bridge.ts`.
 const SESSION_EXPIRED: &str = "__SESSION_EXPIRED__";
+
+/// Sentinel returned by `list_agents` when the server answers 404 on `GET /agents`
+/// (i.e. plan 05 is not yet built). The React agent registry uses this to distinguish
+/// "endpoint not implemented yet" from a real server error, so only the 404 case
+/// triggers the LEGACY_AGENTS fallback. Keep in sync with `ENDPOINT_NOT_FOUND`
+/// in `src/lib/bridge.ts`.
+const ENDPOINT_NOT_FOUND: &str = "__ENDPOINT_NOT_FOUND__";
 
 /// Public user identity, mirrored from the server's `UserInfo`. Every field the
 /// server adds here must be added in BOTH this struct and `src/lib/bridge.ts`, or
@@ -47,7 +57,11 @@ pub fn get_server_url(bridge: State<'_, Bridge>) -> String {
 /// Point the bridge at a different server. Also persists the URL to the store so
 /// it survives an app restart (critical on Android where the OS kills backgrounded apps).
 #[tauri::command]
-pub fn set_server_url(url: String, app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+pub fn set_server_url(
+    url: String,
+    app: tauri::AppHandle,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
     let trimmed = url.trim();
     if trimmed.is_empty() {
         return Err("server URL must not be empty".into());
@@ -100,7 +114,10 @@ pub async fn login(
         return Err(format!("login failed: HTTP {}", resp.status()));
     }
 
-    let body: LoginResponse = resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
+    let body: LoginResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
     // Clone the token so we can both store it in the Bridge and persist it to disk.
     bridge.set_token(Some(body.token.clone()));
     let store = app.store("bridge-store.json").map_err(|e| e.to_string())?;
@@ -123,7 +140,9 @@ pub async fn me(bridge: State<'_, Bridge>) -> Result<UserInfo, String> {
         .map_err(|e| format!("request failed: {e}"))?;
 
     check_auth(&bridge, &resp)?;
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// Clear the stored token from both the Bridge and the persistent store.
@@ -132,6 +151,7 @@ pub async fn me(bridge: State<'_, Bridge>) -> Result<UserInfo, String> {
 /// logout must always succeed.
 #[tauri::command]
 pub async fn logout(app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+    bridge.abort_all_runs();
     // Best-effort server-side revocation: bump our token_version so this token
     // dies immediately, not just at expiry. Any failure is ignored — local
     // logout must always succeed.
@@ -174,7 +194,9 @@ pub async fn list_users(bridge: State<'_, Bridge>) -> Result<Vec<UserInfo>, Stri
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<UserInfo>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<UserInfo>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /auth/users` — create a new user. Admin only.
@@ -209,7 +231,9 @@ pub async fn create_user(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /auth/users/<id>` — update a user's name, email, or role. Admin only.
@@ -239,7 +263,9 @@ pub async fn update_user(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /auth/users/<id>` — delete a user. Admin only. Ignores the `{ok:true}` body.
@@ -303,7 +329,9 @@ pub async fn update_me(name: String, bridge: State<'_, Bridge>) -> Result<UserIn
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<UserInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<UserInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /auth/me/password` — change own password. Any authenticated user.
@@ -367,7 +395,9 @@ pub async fn get_stats(bridge: State<'_, Bridge>) -> Result<DashboardStats, Stri
         .map_err(|e| format!("request failed: {e}"))?;
 
     check_auth(&bridge, &resp)?;
-    resp.json::<DashboardStats>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<DashboardStats>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -414,9 +444,11 @@ pub struct ModelSummary {
     pub loaded: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SelectModelResponse {
-    model: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SelectModelResponse {
+    pub model: String,
+    /// True when the server purged + re-downloaded corrupt cached weights en route.
+    pub repaired: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -432,6 +464,8 @@ pub struct EpRegistration {
 pub struct VariantInfo {
     pub id: String,
     pub alias: String,
+    pub accelerator: String,
+    pub supports_tool_calling: bool,
     pub cached: bool,
     pub loaded: bool,
     pub current: bool,
@@ -453,6 +487,8 @@ pub struct ModelRole {
     pub status: String,
     /// Whether this role is served by Foundry Local (downloadable/loadable variants).
     pub managed: bool,
+    /// Whether this role's model is currently resident in the server process.
+    pub loaded: bool,
     /// Downloadable/loadable variants for this role (empty for non-managed roles).
     pub variants: Vec<VariantInfo>,
     /// The persisted routing override for this role, if one has been saved. `None`
@@ -476,7 +512,9 @@ pub async fn get_hardware(bridge: State<'_, Bridge>) -> Result<HardwareInfo, Str
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<HardwareInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<HardwareInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /models` — the Foundry Local catalog with cached/loaded state.
@@ -495,12 +533,17 @@ pub async fn list_models(bridge: State<'_, Bridge>) -> Result<Vec<ModelSummary>,
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<ModelSummary>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<ModelSummary>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /models/select` — download (if needed), load, and select a chat model. Admin only.
 #[tauri::command]
-pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<String, String> {
+pub async fn select_model(
+    model: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SelectModelResponse, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url("/models/select");
     let resp = bridge
@@ -515,9 +558,11 @@ pub async fn select_model(model: String, bridge: State<'_, Bridge>) -> Result<St
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    let body: SelectModelResponse =
-        resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
-    Ok(body.model)
+    let body: SelectModelResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+    Ok(body)
 }
 
 /// `PUT /settings/router` — persist (or clear, when `variant_id` is `None`) a role's
@@ -535,6 +580,30 @@ pub async fn set_role_model(
         .put(&url)
         .bearer_auth(token)
         .json(&serde_json::json!({ "role": role, "variant_id": variant_id }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    Ok(())
+}
+
+/// `PUT /settings/router/shared` — route chat, classification, rewrite,
+/// extraction, and SQL through one concrete model variant. Admin only.
+#[tauri::command]
+pub async fn set_shared_model(
+    variant_id: Option<String>,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url("/settings/router/shared");
+    let resp = bridge
+        .client
+        .put(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "role": "shared_llm", "variant_id": variant_id }))
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -573,7 +642,9 @@ pub async fn delete_model(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /hardware/register-eps` — download + register all available execution providers
@@ -593,7 +664,9 @@ pub async fn register_eps(bridge: State<'_, Bridge>) -> Result<EpRegistration, S
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /models/roles` — the roles this deployment uses and which models serve them.
@@ -613,7 +686,30 @@ pub async fn model_roles(bridge: State<'_, Bridge>) -> Result<Vec<ModelRole>, St
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<ModelRole>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<ModelRole>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `POST /models/specialized/load` — download missing weights and initialize one
+/// fastembed model. The server accepts only the embeddings and reranker role keys.
+#[tauri::command]
+pub async fn load_specialized_model(role: String, bridge: State<'_, Bridge>) -> Result<(), String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url("/models/specialized/load");
+    let resp = bridge
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "role": role }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    Ok(())
 }
 
 /// `POST /generate` — stream a test completion. Consumes the server SSE and
@@ -659,6 +755,14 @@ pub async fn generate(
     Ok(())
 }
 
+/// Envelope stamped onto every `model://*` event so the boot-time listeners can
+/// route progress to the right variant's store entry (mirror of `ChatEvent`).
+#[derive(Serialize, Clone)]
+struct ModelEvent {
+    variant_id: String,
+    data: String,
+}
+
 /// `POST /models/pull` — download (with progress) and optionally load a variant.
 /// Consumes the server SSE and re-emits each event to the frontend: progress as
 /// `model://progress`, status transitions as `model://status`, ending with
@@ -690,20 +794,44 @@ pub async fn pull_model(
         let event = event.map_err(|e| format!("stream error: {e}"))?;
         match event.event.as_str() {
             "progress" => {
-                let _ = app.emit("model://progress", event.data);
+                let _ = app.emit(
+                    "model://progress",
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data,
+                    },
+                );
             }
             "status" => {
-                let _ = app.emit("model://status", event.data);
+                let _ = app.emit(
+                    "model://status",
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data,
+                    },
+                );
             }
             "error" => {
-                let _ = app.emit("model://error", event.data.clone());
+                let _ = app.emit(
+                    "model://error",
+                    ModelEvent {
+                        variant_id: variant_id.clone(),
+                        data: event.data.clone(),
+                    },
+                );
                 return Err(event.data);
             }
             "done" => break,
             _ => {}
         }
     }
-    let _ = app.emit("model://done", ());
+    let _ = app.emit(
+        "model://done",
+        ModelEvent {
+            variant_id: variant_id.clone(),
+            data: String::new(),
+        },
+    );
     Ok(())
 }
 
@@ -732,6 +860,29 @@ pub struct ServiceStatus {
     pub detail: Option<String>,
 }
 
+/// One mounted volume on the server host. Mirrors the server's `DiskSpec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskSpec {
+    pub mount: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+/// Server host machine facts. Mirrors the server's `ServerSpecs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerSpecs {
+    pub hostname: String,
+    pub os: String,
+    pub arch: String,
+    pub cpu_model: String,
+    pub logical_cores: usize,
+    pub physical_cores: Option<usize>,
+    pub total_memory_bytes: u64,
+    pub disks: Vec<DiskSpec>,
+    pub accelerators: Vec<String>,
+    pub server_version: String,
+}
+
 /// The single payload backing the Settings page. Degraded-safe: when Foundry is
 /// down the model/EP lists come back empty and `foundry_endpoint` is `""`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -749,6 +900,8 @@ pub struct SetupStatus {
     pub cached_models: Vec<String>,
     /// Same shape already mirrored for `get_hardware` (empty when Foundry is down).
     pub execution_providers: Vec<ExecutionProvider>,
+    /// Host machine facts (never Foundry-derived, so always populated).
+    pub server_specs: ServerSpecs,
 }
 
 /// `GET /setup-status` — one call powering the Settings page (GPU, active chat
@@ -769,7 +922,9 @@ pub async fn get_setup_status(bridge: State<'_, Bridge>) -> Result<SetupStatus, 
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SetupStatus>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SetupStatus>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /models/unload` — unload a variant from memory without deleting its
@@ -819,6 +974,102 @@ pub struct SourceInfo {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogStatus {
+    pub source_id: String,
+    pub active_version: String,
+    pub schema_hash: String,
+    pub captured_at: Option<String>,
+    pub table_count: i64,
+    pub status: String,
+    pub health: String,
+    pub last_check_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub drift_detected: bool,
+    pub consecutive_failures: i64,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogRefresh {
+    pub source_id: String,
+    pub tables_indexed: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaCatalogHistoryItem {
+    pub checked_at: Option<String>,
+    pub trigger: String,
+    pub outcome: String,
+    pub previous_hash: Option<String>,
+    pub observed_hash: Option<String>,
+    pub table_count: i64,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataAlias {
+    pub table: String,
+    pub column: Option<String>,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataRelationship {
+    pub from_table: String,
+    pub from_column: String,
+    pub to_table: String,
+    pub to_column: String,
+}
+
+/// Force a specific concept onto a table.
+///
+/// VERIFIED: `TableConceptOverride` in `onprem-rag-server/src/nl2sql/routes.rs`
+/// L62-67. `concept: None` marks the table Unknown, excluding it from every line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TableConceptOverride {
+    pub table: String,
+    pub concept: Option<String>,
+}
+
+/// Force a specific column role onto a column.
+///
+/// VERIFIED: `ColumnRoleOverride` in `onprem-rag-server/src/nl2sql/routes.rs`
+/// L69-76.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColumnRoleOverride {
+    pub table: String,
+    pub column: String,
+    pub role: String,
+}
+
+/// Admin metadata overrides for one source.
+///
+/// VERIFIED against `MetadataOverrides` in
+/// `onprem-rag-server/src/nl2sql/routes.rs` L78-93 — all five fields.
+///
+/// This mirror previously carried only `aliases` and `relationships`. Because
+/// `PUT /nl2sql/<id>/catalog/overrides` **replaces the whole document**
+/// (`replace_one(..).upsert(true)` in `save_catalog_overrides`,
+/// `onprem-rag-server/src/nl2sql/http.rs` L215-221), saving through that
+/// partial mirror silently erased every `table_concepts`, `column_roles` and
+/// `service_lines` entry an admin had set — the round trip dropped them on the
+/// way out, not on the way in. The three fields below close that hole; each
+/// carries `#[serde(default)]` so a response that omits them still parses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetadataOverrides {
+    #[serde(default)]
+    pub aliases: Vec<MetadataAlias>,
+    #[serde(default)]
+    pub relationships: Vec<MetadataRelationship>,
+    #[serde(default)]
+    pub table_concepts: Vec<TableConceptOverride>,
+    #[serde(default)]
+    pub column_roles: Vec<ColumnRoleOverride>,
+    #[serde(default)]
+    pub service_lines: Vec<String>,
+}
+
 /// Source definition sent from the add/test form. Mirrors the server's `SourceInput`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInput {
@@ -864,18 +1115,141 @@ pub async fn list_sources(bridge: State<'_, Bridge>) -> Result<Vec<SourceInfo>, 
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<SourceInfo>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<SourceInfo>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `GET /nl2sql/<source_id>/catalog` — inspect active schema metadata. Admin only.
+#[tauri::command]
+pub async fn get_schema_catalog(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SchemaCatalogStatus, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!("/nl2sql/{source_id}/catalog"));
+    let resp = bridge
+        .client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<SchemaCatalogStatus>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `POST /nl2sql/<source_id>/catalog/refresh` — rebuild schema metadata. Admin only.
+#[tauri::command]
+pub async fn refresh_schema_catalog(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SchemaCatalogRefresh, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!("/nl2sql/{source_id}/catalog/refresh"));
+    let resp = bridge
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<SchemaCatalogRefresh>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_schema_catalog_history(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<SchemaCatalogHistoryItem>, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .get(bridge.url(&format!("/nl2sql/{source_id}/catalog/history?limit=25")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn get_schema_metadata_overrides(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<MetadataOverrides, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .get(bridge.url(&format!("/nl2sql/{source_id}/catalog/overrides")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+#[tauri::command]
+pub async fn save_schema_metadata_overrides(
+    source_id: String,
+    overrides: MetadataOverrides,
+    bridge: State<'_, Bridge>,
+) -> Result<MetadataOverrides, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let resp = bridge
+        .client
+        .put(bridge.url(&format!("/nl2sql/{source_id}/catalog/overrides")))
+        .bearer_auth(token)
+        .json(&overrides)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /sources/test` — connect and verify without saving. Admin only.
 #[tauri::command]
 pub async fn test_source(source: SourceInput, bridge: State<'_, Bridge>) -> Result<(), String> {
-    post_source("/sources/test", &source, &bridge).await.map(|_| ())
+    post_source("/sources/test", &source, &bridge)
+        .await
+        .map(|_| ())
 }
 
 /// `POST /sources` — test then save (password encrypted server-side). Admin only.
 #[tauri::command]
-pub async fn save_source(source: SourceInput, bridge: State<'_, Bridge>) -> Result<SourceInfo, String> {
+pub async fn save_source(
+    source: SourceInput,
+    bridge: State<'_, Bridge>,
+) -> Result<SourceInfo, String> {
     let value = post_source("/sources", &source, &bridge).await?;
     serde_json::from_value(value).map_err(|e| format!("invalid response: {e}"))
 }
@@ -900,7 +1274,9 @@ async fn post_source(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /sources/<id>` — edit a saved source. Admin only.
@@ -924,12 +1300,17 @@ pub async fn update_source(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SourceInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SourceInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /sources/<id>/test` — re-test a saved source, persisting the outcome. Admin only.
 #[tauri::command]
-pub async fn test_saved_source(id: String, bridge: State<'_, Bridge>) -> Result<SourceInfo, String> {
+pub async fn test_saved_source(
+    id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<SourceInfo, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url(&format!("/sources/{id}/test"));
     let resp = bridge
@@ -943,7 +1324,9 @@ pub async fn test_saved_source(id: String, bridge: State<'_, Bridge>) -> Result<
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SourceInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SourceInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /sources/<id>` — remove a source and its ingested records. Admin only.
@@ -1004,6 +1387,10 @@ pub struct IngestProgress {
     pub failed_tables: i64,
     /// Cumulative UTF-8 bytes of embedded chunk text.
     pub db_size_bytes: i64,
+    /// Rows annotated by the clinical extractor (plan 25). 0 unless the server has
+    /// ONPREM_EXTRACT_ENABLED=true.
+    #[serde(default)]
+    pub extracted_rows: i64,
     /// Full current log; server-capped at 500. Client replaces wholesale each event.
     pub log: Vec<LogEntry>,
 }
@@ -1107,7 +1494,10 @@ pub async fn start_ingest(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    let started: IngestStarted = resp.json().await.map_err(|e| format!("invalid response: {e}"))?;
+    let started: IngestStarted = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
     let job_id = started.job_id;
 
     // Follow the progress stream to completion.
@@ -1179,7 +1569,9 @@ pub async fn get_schema(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<TableSchema>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<TableSchema>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /schema/analyze` — AI-assisted PII detection + schema summary.
@@ -1203,7 +1595,9 @@ pub async fn analyze_schema(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SchemaAnalysis>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SchemaAnalysis>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /ingest/history` — ingested-table records grouped by source. Any authenticated user.
@@ -1441,7 +1835,9 @@ pub async fn list_records(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<RecordsPage>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<RecordsPage>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /audit` — filterable, paginated audit log. Admin only (enforced server-side).
@@ -1486,7 +1882,9 @@ pub async fn get_audit(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<AuditPage>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<AuditPage>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /tables/<table_id>/info` — inspector for one indexed table. Any authenticated
@@ -1510,7 +1908,9 @@ pub async fn get_table_info(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<TableInfo>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<TableInfo>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /ingest/connection/<source_id>` — remove every indexed table and all
@@ -1522,7 +1922,10 @@ pub async fn delete_ingest_connection(
     bridge: State<'_, Bridge>,
 ) -> Result<serde_json::Value, String> {
     let token = bridge.token().ok_or("not logged in")?;
-    let url = bridge.url(&format!("/ingest/connection/{}", encode_path_segment(&source_id)));
+    let url = bridge.url(&format!(
+        "/ingest/connection/{}",
+        encode_path_segment(&source_id)
+    ));
     let resp = bridge
         .client
         .delete(&url)
@@ -1534,7 +1937,9 @@ pub async fn delete_ingest_connection(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /ingest/all` — clear every record and indexed-table entry across all
@@ -1555,7 +1960,9 @@ pub async fn clear_all_records(bridge: State<'_, Bridge>) -> Result<serde_json::
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<serde_json::Value>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1569,7 +1976,10 @@ pub async fn clear_all_records(bridge: State<'_, Bridge>) -> Result<serde_json::
 /// Idempotent: if a stream is already running this returns immediately. Runs until
 /// the connection ends (e.g. logout → 401), then clears the guard so it can restart.
 #[tauri::command]
-pub async fn start_log_stream(app: tauri::AppHandle, bridge: State<'_, Bridge>) -> Result<(), String> {
+pub async fn start_log_stream(
+    app: tauri::AppHandle,
+    bridge: State<'_, Bridge>,
+) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
     // Start at most once; `swap` returning true means a stream is already live.
@@ -1681,6 +2091,270 @@ pub struct StructuredResult {
     pub pipeline: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqlResult {
+    pub source_id: String,
+    pub sql: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    /// QuerySpec IR used to generate the SQL (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    /// Human-readable summary of what the query returned (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+}
+
+/// One step in a provenance path (plan 04/06).
+///
+/// NOTE: mirrors the plan-04 spec (`plans/new/04-structured-execution-and-fallbacks.md` §6).
+/// The server does not emit this payload yet — must be re-verified against a real server
+/// payload once plan 04 ships.
+///
+/// The server's `Rung` is a Rust enum (`Link(RungResult)`, `DeterministicSql(RungResult)`,
+/// …) where `RungResult` is `Hit | Miss(String) | Skipped(&str)`. This bridge struct
+/// flattens that to `{rung, result, reason}` strings. If the server serialises `Rung`
+/// with its default (untagged) or externally-tagged form, the round-trip will fail — this
+/// flattening must be verified against the actual wire format before plan 04 ships.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvenanceRung {
+    pub rung: String,
+    pub result: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Execution provenance for one turn (plan 04/06). Mirrors the server's `Provenance`.
+///
+/// NOTE: mirrors the plan-04/06 spec. The server does not emit this payload yet —
+/// must be re-verified against a real server payload once plan 04 ships.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Provenance {
+    pub path: Vec<ProvenanceRung>,
+    pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_line: Option<String>,
+    pub scope: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    /// String-keyed millisecond timings per rung. Typed as `HashMap<String, u64>` so
+    /// the bridge validates the shape (not `serde_json::Value`) and `Object.entries()`
+    /// on the TS side is safe. Mirrors `HashMap<&'static str, u64>` in the plan-04 spec.
+    pub elapsed_ms: HashMap<String, u64>,
+}
+
+/// One follow-up suggestion chip (plan 06). Mirrors the server's `Suggestion`.
+///
+/// NOTE: mirrors the plan-06 spec (`plans/new/06-conversation-memory-and-suggestions.md`).
+/// The server does not emit this payload yet — must be re-verified against a real server
+/// payload once plan 06 ships.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Suggestion {
+    pub text: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+/// Clarification request — emitted when the router cannot resolve a required slot.
+/// Mirrors the server's `Clarify` SSE payload and `StoredMessage.clarify` (plan 04/06).
+///
+/// NOTE: mirrors the plan-04/06 spec. The server does not emit this payload yet —
+/// must be re-verified against a real server payload once plan 04/06 ships.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarifyPayload {
+    pub question: String,
+    pub slot: String,
+    pub options: Vec<String>,
+}
+
+/// One source's table scope for one agent, as handed to the web layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSourceScope {
+    pub source_id: String,
+    pub tables: Vec<String>,
+}
+
+/// One roster entry as the React layer consumes it (`listAgents()` in `bridge.ts`).
+///
+/// This is a **projection**, not a 1:1 mirror: the server's `GET /agents` returns
+/// `{service_lines: [...], source_usable_lines: {source_id: [slug]}}` (see
+/// `onprem-rag-server/src/agents/registry.rs` `AgentsResponse`, L53-58), which is a
+/// different shape from plan 07 §1's `Vec<AgentInfo>`. `list_agents` below
+/// deserialises the real server shape into `ServerAgentsResponse` and folds it into
+/// this struct so the TypeScript mirror in `src/lib/bridge.ts` stays the single
+/// UI-facing contract.
+///
+/// Field provenance (all citations are `onprem-rag-server/src/agents/registry.rs`
+/// unless stated otherwise):
+///   `kind`              ← `ServiceLineInfo.slug`              L32   (verified)
+///   `label`             ← `ServiceLineInfo.label`             L33   (verified)
+///   `blurb`             ← `ServiceLineInfo.blurb`             L34   (verified)
+///   `tier`              ← `ServiceLineInfo.tier`              L35   (verified)
+///   `concepts`          ← `ServiceLineInfo.concepts`          L36   (verified)
+///   `example_questions` ← `ServiceLineInfo.example_questions` L41   (verified),
+///                          falling back to `examples[].question` L39 on a server
+///                          that predates the filtered/unfiltered split
+///   `modes`             ← `ServiceLineInfo.modes`             L44   (verified),
+///                          filled from `AgentMode::ALL` at L83 so the wire list
+///                          cannot drift from the enum; falls back to `["ask"]`
+///                          when a server omits the field, so the Trends/Handover
+///                          toggle stays hidden rather than pretending to work
+///   `usable`            ← derived: the slug appears in some `source_usable_lines[*]`
+///                          L106-114                            (verified input)
+///   `sources`           ← derived: sources whose usable list contains the slug, with
+///                          tables taken from `GET /sources/<id>/binding`
+///                          (`TableSummary.service_lines`,
+///                          onprem-rag-server/src/ontology/routes.rs) (verified)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub kind: String,
+    pub label: String,
+    pub blurb: String,
+    pub tier: u8,
+    pub usable: bool,
+    pub modes: Vec<String>,
+    pub sources: Vec<AgentSourceScope>,
+    pub example_questions: Vec<String>,
+    /// Entity concepts this line owns (verified: `ServiceLineInfo.concepts`).
+    pub concepts: Vec<String>,
+}
+
+// --- Real `GET /agents` wire shape (verified against server source) ----------
+//
+// onprem-rag-server/src/agents/registry.rs (the route moved here from
+// `ontology/routes.rs` in plan 05 §8; `main.rs` mounts `agents::registry::list_agents`):
+//   `AgentsResponse  { service_lines: Vec<ServiceLineInfo>, source_usable_lines: HashMap<String, Vec<String>> }`  L53-58
+//   `ServiceLineInfo { slug, label, blurb, tier, concepts, examples, example_questions, modes }`                  L30-45
+//   `ExampleInfo     { question, required_concepts }`                                                             L47-51
+//
+// `example_questions` is the FILTERED list — only examples whose required
+// concepts are actually bound for some connected source (`persona::bound_examples`,
+// onprem-rag-server/src/agents/persona.rs L277-290). `examples` is the unfiltered
+// superset. The roster prefers the filtered list so an agent never advertises a
+// question its schema cannot answer, and falls back to `examples` for a server
+// that predates the split.
+
+/// One `examples[]` entry from `GET /agents`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerExampleInfo {
+    pub question: String,
+    /// Part of the verified wire shape; the roster does not surface it yet.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub required_concepts: Vec<String>,
+}
+
+/// One `service_lines[]` entry from `GET /agents`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerServiceLineInfo {
+    pub slug: String,
+    pub label: String,
+    pub blurb: String,
+    pub tier: u8,
+    #[serde(default)]
+    pub concepts: Vec<String>,
+    #[serde(default)]
+    pub examples: Vec<ServerExampleInfo>,
+    /// Answerable examples only. VERIFIED: `ServiceLineInfo.example_questions`,
+    /// `onprem-rag-server/src/agents/registry.rs` L41. `Option` distinguishes
+    /// "server sent an empty list" (nothing is answerable — show nothing) from
+    /// "server has no such field" (fall back to the unfiltered `examples`).
+    #[serde(default)]
+    pub example_questions: Option<Vec<String>>,
+    /// VERIFIED: `ServiceLineInfo.modes`, `onprem-rag-server/src/agents/registry.rs`
+    /// L44, filled from `AgentMode::ALL` (L83) so the wire list cannot drift from
+    /// the enum — today `["ask", "trends", "handover"]` for every line. `Option`
+    /// so a server without the field falls back to `["ask"]` rather than
+    /// advertising a toggle that would do nothing.
+    #[serde(default)]
+    pub modes: Option<Vec<String>>,
+}
+
+/// Body of `GET /agents` exactly as the server sends it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerAgentsResponse {
+    #[serde(default)]
+    pub service_lines: Vec<ServerServiceLineInfo>,
+    #[serde(default)]
+    pub source_usable_lines: HashMap<String, Vec<String>>,
+}
+
+/// One `tables[]` entry of `GET /sources/<id>/binding`. Mirrors the server's
+/// `TableSummary` (`onprem-rag-server/src/ontology/routes.rs`). Only the two fields
+/// the roster needs are typed; the rest are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindingTableSummary {
+    pub table_name: String,
+    #[serde(default)]
+    pub service_lines: Vec<String>,
+}
+
+/// Subset of `GET /sources/<id>/binding` used to fill in per-line table scopes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BindingTablesResponse {
+    #[serde(default)]
+    pub tables: Vec<BindingTableSummary>,
+}
+
+/// Fold the server's `{service_lines, source_usable_lines}` plus per-source binding
+/// tables into the flat roster the React layer expects.
+///
+/// `source_tables` maps `source_id` → (`service_line_slug` → tables). A source missing
+/// from the map still yields an `AgentSourceScope` with an empty `tables` list, so the
+/// scope panel shows the source without claiming to know its tables.
+pub(crate) fn project_agent_roster(
+    resp: ServerAgentsResponse,
+    source_tables: &HashMap<String, HashMap<String, Vec<String>>>,
+) -> Vec<AgentInfo> {
+    // source_id lists are iterated in sorted order so the UI ordering is stable.
+    let mut source_ids: Vec<&String> = resp.source_usable_lines.keys().collect();
+    source_ids.sort();
+
+    resp.service_lines
+        .into_iter()
+        .map(|line| {
+            let sources: Vec<AgentSourceScope> = source_ids
+                .iter()
+                .filter(|sid| {
+                    resp.source_usable_lines
+                        .get(**sid)
+                        .is_some_and(|lines| lines.iter().any(|l| l == &line.slug))
+                })
+                .map(|sid| AgentSourceScope {
+                    source_id: (*sid).clone(),
+                    tables: source_tables
+                        .get(*sid)
+                        .and_then(|by_line| by_line.get(&line.slug))
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect();
+            AgentInfo {
+                kind: line.slug,
+                label: line.label,
+                blurb: line.blurb,
+                tier: line.tier,
+                usable: !sources.is_empty(),
+                // The server sends the real mode list; `["ask"]` is only a floor for
+                // a server that omits the field — never a guess layered over one that
+                // sent something.
+                modes: line.modes.unwrap_or_else(|| vec!["ask".to_string()]),
+                sources,
+                // Prefer the server's answerable-only list. An empty list from the
+                // server means "nothing is answerable", which must NOT fall back to
+                // the unfiltered set — hence `Option`, not `Vec` + `is_empty()`.
+                example_questions: line
+                    .example_questions
+                    .unwrap_or_else(|| line.examples.into_iter().map(|e| e.question).collect()),
+                concepts: line.concepts,
+            }
+        })
+        .collect()
+}
+
 /// One stored message in a conversation. Mirrors the server's `MessageOut`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredMessage {
@@ -1689,6 +2363,9 @@ pub struct StoredMessage {
     pub content: String,
     /// `None` for user messages; `Some(passages)` for assistant messages.
     pub citations: Option<Vec<Passage>>,
+    /// Persisted grounding verdict for verified assistant messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify: Option<serde_json::Value>,
     pub created_at: String,
     /// Present only for agent messages.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1696,6 +2373,28 @@ pub struct StoredMessage {
     /// Present only for structured-result agent messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<StructuredResult>,
+    /// Present for chat answers backed by a live operational SQL query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_result: Option<SqlResult>,
+    /// Execution provenance for this turn (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
+    /// QuerySpec IR or structured result spec attached to this message (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec: Option<serde_json::Value>,
+    /// Follow-up suggestion chips (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<Vec<Suggestion>>,
+    /// Active focus entities used to scope the answer (plan 06).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_used: Option<Vec<String>>,
+    /// Clarification request (plan 04/06) — typed so `question` is reachable on the
+    /// persisted path without a cast. Mirrors `ClarifyPayload` in `src/lib/bridge.ts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clarify: Option<ClarifyPayload>,
+    /// Mode the conversation was in when this answer was produced (plan 07).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Envelope stamped onto every `chat://*` event so the frontend can drop events
@@ -1732,7 +2431,9 @@ pub async fn search(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<SearchResponse>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<SearchResponse>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /chat` — grounded RAG answer streamed as SSE. Emits `chat://citations`
@@ -1754,63 +2455,124 @@ pub async fn chat(
 ) -> Result<(), String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url("/chat");
-    let resp = bridge
-        .client
-        .post(&url)
-        .bearer_auth(token)
-        .json(&serde_json::json!({
-            "question": question,
-            "history": history,
-            "mode": opts.mode,
-            "rerank": opts.rerank,
-            "top_k": opts.top_k,
-            "conversation_id": conversation_id,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-    check_auth(&bridge, &resp)?;
-    if !resp.status().is_success() {
-        return Err(error_body(resp).await);
-    }
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    bridge.register_run(run_id.clone(), abort_handle);
+    // Start watching stages before the POST, so none are missed while the server
+    // routes, retrieves and plans — the whole opaque part of the request.
+    let stage_relay = spawn_stage_relay(
+        bridge.client.clone(),
+        bridge.url(&format!("/runs/{}/progress", encode_path_segment(&run_id))),
+        token.clone(),
+        run_id.clone(),
+        "chat",
+        app.clone(),
+    );
+    let result = Abortable::new(
+        async {
+            let resp = bridge
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "question": question,
+                    "history": history,
+                    "mode": opts.mode,
+                    "rerank": opts.rerank,
+                    "top_k": opts.top_k,
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            check_auth(&bridge, &resp)?;
+            if !resp.status().is_success() {
+                return Err(error_body(resp).await);
+            }
 
-    let mut events = resp.bytes_stream().eventsource();
-    while let Some(event) = events.next().await {
-        let event = event.map_err(|e| format!("stream error: {e}"))?;
-        match event.event.as_str() {
-            "routed" => {
-                // Intent Router v2: the decision payload ({route,intent,tier,cached,backend}).
-                // Relayed for the activity strip; older UIs simply ignore chat://routed.
-                let _ = app.emit(
-                    "chat://routed",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
+            let mut events = resp.bytes_stream().eventsource();
+            while let Some(event) = events.next().await {
+                let event = event.map_err(|e| format!("stream error: {e}"))?;
+                match event.event.as_str() {
+                    "routed" => {
+                        // Intent Router v2: the decision payload ({route,intent,tier,cached,backend}).
+                        // Relayed for the activity strip; older UIs simply ignore chat://routed.
+                        let _ = app.emit(
+                            "chat://routed",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "citations" => {
+                        let _ = app.emit(
+                            "chat://citations",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // `provenance` / `suggestions` / `clarify` are the plan 06 answer
+                    // annotations. They are relayed on the same envelope as the agent
+                    // stream so `src/components/answer/*` can be shared between the two
+                    // screens. The current server does not emit them (see the report on
+                    // this workstream); the arms are inert until it does.
+                    "sql" | "columns" | "rows" | "provenance" | "suggestions" | "clarify" => {
+                        let channel = format!("chat://{}", event.event);
+                        let _ = app.emit(
+                            &channel,
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "token" => {
+                        let _ = app.emit(
+                            "chat://token",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: decode_token(&event.data),
+                            },
+                        );
+                    }
+                    "error" => {
+                        let _ = app.emit(
+                            "chat://error",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data.clone(),
+                            },
+                        );
+                        return Err(event.data);
+                    }
+                    "done" => break,
+                    _ => {}
+                }
             }
-            "citations" => {
-                let _ = app.emit(
-                    "chat://citations",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            "token" => {
-                let _ = app.emit(
-                    "chat://token",
-                    ChatEvent { run_id: run_id.clone(), data: decode_token(&event.data) },
-                );
-            }
-            "error" => {
-                let _ = app.emit(
-                    "chat://error",
-                    ChatEvent { run_id: run_id.clone(), data: event.data.clone() },
-                );
-                return Err(event.data);
-            }
-            "done" => break,
-            _ => {}
-        }
-    }
-    let _ = app.emit("chat://done", ChatEvent { run_id: run_id.clone(), data: String::new() });
-    Ok(())
+            let _ = app.emit(
+                "chat://done",
+                ChatEvent {
+                    run_id: run_id.clone(),
+                    data: String::new(),
+                },
+            );
+            Ok(())
+        },
+        abort_registration,
+    )
+    .await;
+    stage_relay.abort();
+    bridge.remove_run(&run_id);
+    result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
+}
+
+#[tauri::command]
+pub fn cancel_run(run_id: String, bridge: State<'_, Bridge>) -> bool {
+    bridge.abort_run(&run_id);
+    true
 }
 
 /// `GET /conversations` — all conversations for the authenticated user (sorted by most recent).
@@ -1829,7 +2591,9 @@ pub async fn list_conversations(bridge: State<'_, Bridge>) -> Result<Vec<Convers
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<Conversation>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<Conversation>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /conversations` — create a new conversation with an optional title and agent kind.
@@ -1855,7 +2619,9 @@ pub async fn create_conversation(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Conversation>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Conversation>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `PATCH /conversations/<id>` — rename a conversation. Returns the updated entry.
@@ -1879,7 +2645,9 @@ pub async fn rename_conversation(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Conversation>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Conversation>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `DELETE /conversations/<id>` — delete a conversation and cascade its messages.
@@ -1904,7 +2672,10 @@ pub async fn delete_conversation(id: String, bridge: State<'_, Bridge>) -> Resul
 
 /// `GET /conversations/<id>/messages` — all messages in a conversation (ascending by time).
 #[tauri::command]
-pub async fn get_messages(id: String, bridge: State<'_, Bridge>) -> Result<Vec<StoredMessage>, String> {
+pub async fn get_messages(
+    id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<Vec<StoredMessage>, String> {
     let token = bridge.token().ok_or("not logged in")?;
     let url = bridge.url(&format!("/conversations/{id}/messages"));
     let resp = bridge
@@ -1918,7 +2689,9 @@ pub async fn get_messages(id: String, bridge: State<'_, Bridge>) -> Result<Vec<S
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<StoredMessage>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<StoredMessage>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `GET /agent-conversations?kind=<kind>` — agent conversations for one kind,
@@ -1929,7 +2702,10 @@ pub async fn list_agent_conversations(
     bridge: State<'_, Bridge>,
 ) -> Result<Vec<Conversation>, String> {
     let token = bridge.token().ok_or("not logged in")?;
-    let url = bridge.url(&format!("/agent-conversations?kind={}", encode_path_segment(&kind)));
+    let url = bridge.url(&format!(
+        "/agent-conversations?kind={}",
+        encode_path_segment(&kind)
+    ));
     let resp = bridge
         .client
         .get(&url)
@@ -1941,26 +2717,48 @@ pub async fn list_agent_conversations(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
-    resp.json::<Vec<Conversation>>().await.map_err(|e| format!("invalid response: {e}"))
+    resp.json::<Vec<Conversation>>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
 }
 
 /// `POST /agents/<kind>` — AI Agents SSE endpoint. The server emits a `routed` event
-/// first (payload: the resolved agent kind as a JSON string), then path-specific events:
-///   - Structured kinds (health_query, trends): `spec`, `rows`, `pipeline`, then `token`*.
-///   - Semantic kinds (summarize, patient_lookup, chat): `citations`, then `token`*.
-/// `kind` may be `"auto"` — the server resolves the real kind and announces it via
-/// the first `routed` event.
+/// first, then path-specific events.
+///
+/// VERIFIED (plan 05): the `routed` payload is a JSON **object** —
+/// `RouteDecision::to_sse_json()` (`onprem-rag-server/src/router/mod.rs` L179-235),
+/// assigned at `onprem-rag-server/src/agents/routes.rs` L408 and yielded as the first
+/// event. It carries `route` / `intent` / `backend` / `tier` / `cached` /
+/// `tier2_attempted`, plus `service_line` / `deterministic` / `scope_size` /
+/// `source_id` on the v3 paths, plus `question` / `slot` for a clarify route. It is
+/// NOT the bare JSON-encoded agent-kind string the pre-plan-05 server sent.
+/// The relay below is deliberately verbatim, so the shape stays the server's.
+///
+/// New optional parameters (plan 05 / 06 / 07):
+///   `mode`           — "ask" | "trends" | "handover" (plan 07 mode toggle).
+///   `source_id`      — pin this run to one source's schema scope (plan 05).
+///   `suggestion_spec`— forward a suggestion's embedded query spec (plan 06).
+///
+/// New SSE events forwarded when the server emits them (plan 06):
+///   `provenance`  → `agent://provenance`
+///   `suggestions` → `agent://suggestions`
+///   `clarify`     → `agent://clarify`
 ///
 /// All events are wrapped in `ChatEvent { run_id, data }` so the frontend can drop events
-/// from a superseded run, mirroring the `/chat` stream contract exactly.
-/// `conversation_id`, when `Some`, instructs the server to persist the exchange and load
-/// history from the DB.
+/// from a superseded run.
 #[tauri::command]
 pub async fn agent(
     kind: String,
     question: String,
     conversation_id: Option<String>,
     run_id: String,
+    mode: Option<String>,
+    source_id: Option<String>,
+    suggestion_spec: Option<serde_json::Value>,
+    // Enumeration paging. Sent through untouched so a "next page" control can ask for
+    // rows 50-99 without the server re-planning the list to change one integer.
+    limit: Option<u32>,
+    offset: Option<u32>,
     app: tauri::AppHandle,
     bridge: State<'_, Bridge>,
 ) -> Result<(), String> {
@@ -1968,14 +2766,300 @@ pub async fn agent(
     // Build the path dynamically; `kind` is validated server-side (unknown kinds
     // return a 400 from the Rocket route guard, caught by `check_auth` / `error_body`).
     let url = bridge.url(&format!("/agents/{}", encode_path_segment(&kind)));
+    let (abort_handle, abort_registration) = AbortHandle::new_pair();
+    bridge.register_run(run_id.clone(), abort_handle);
+    // Subscribed before the POST so the strip sees every stage; see `spawn_stage_relay`.
+    let stage_relay = spawn_stage_relay(
+        bridge.client.clone(),
+        bridge.url(&format!("/runs/{}/progress", encode_path_segment(&run_id))),
+        token.clone(),
+        run_id.clone(),
+        "agent",
+        app.clone(),
+    );
+    let result = Abortable::new(
+        async {
+            let resp = bridge
+                .client
+                .post(&url)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "question": question,
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                    // Plan 07 / 05 / 06 extensions — null when not provided;
+                    // current server ignores unknown JSON fields.
+                    "mode": mode,
+                    "source_id": source_id,
+                    "suggestion_spec": suggestion_spec,
+                    "limit": limit,
+                    "offset": offset,
+                }))
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            check_auth(&bridge, &resp)?;
+            if !resp.status().is_success() {
+                return Err(error_body(resp).await);
+            }
+
+            let mut events = resp.bytes_stream().eventsource();
+            while let Some(event) = events.next().await {
+                let event = event.map_err(|e| format!("stream error: {e}"))?;
+                match event.event.as_str() {
+                    // First event: the full `RouteDecision` object (see this command's
+                    // doc comment). Relayed VERBATIM — do not `decode_token` it and do
+                    // not re-encode it; the frontend parses the object in
+                    // `bridge.ts::parseRoutedPayload`. Treating it as a JSON string here
+                    // is the pre-plan-05 behaviour and would mangle the payload.
+                    "routed" => {
+                        let _ = app.emit(
+                            "agent://routed",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: the parsed aggregation spec (provenance).
+                    "spec" => {
+                        let _ = app.emit(
+                            "agent://spec",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: chart-ready rows [{label, value}].
+                    "rows" => {
+                        let _ = app.emit(
+                            "agent://rows",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Structured path: the MongoDB pipeline used (explain / audit trail).
+                    "pipeline" => {
+                        let _ = app.emit(
+                            "agent://pipeline",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Enumeration path: {collection, total, offset, limit, returned,
+                    // has_more} — everything a pager needs, without re-counting.
+                    "page" => {
+                        let _ = app.emit(
+                            "agent://page",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Semantic path: citation passages backing the answer.
+                    "citations" => {
+                        let _ = app.emit(
+                            "agent://citations",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Both paths: streamed narration / answer tokens (JSON-encoded to preserve spaces).
+                    "token" => {
+                        let _ = app.emit(
+                            "agent://token",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: decode_token(&event.data),
+                            },
+                        );
+                    }
+                    // Plan 07 §3: agents may return a live SQL result. SPEC-DERIVED —
+                    // the current agents route (`onprem-rag-server/src/agents/routes.rs`)
+                    // emits only `routed`, `spec`, `rows`, `pipeline`, `citations`,
+                    // `token`, `error`, `done`. These two arms are relay plumbing for
+                    // when the source_sql backend reaches the agents route; they are
+                    // inert against today's server. Named to match the `chat://`
+                    // channel so the store can reuse the chat accumulator.
+                    "sql" => {
+                        let _ = app.emit(
+                            "agent://sql",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "columns" => {
+                        let _ = app.emit(
+                            "agent://columns",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Plan 06: execution provenance after the answer is complete.
+                    "provenance" => {
+                        let _ = app.emit(
+                            "agent://provenance",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Plan 06: follow-up suggestion chips.
+                    "suggestions" => {
+                        let _ = app.emit(
+                            "agent://suggestions",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    // Plan 06: clarification request (missing slot).
+                    "clarify" => {
+                        let _ = app.emit(
+                            "agent://clarify",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data,
+                            },
+                        );
+                    }
+                    "error" => {
+                        let _ = app.emit(
+                            "agent://error",
+                            ChatEvent {
+                                run_id: run_id.clone(),
+                                data: event.data.clone(),
+                            },
+                        );
+                        return Err(event.data);
+                    }
+                    "done" => break,
+                    _ => {}
+                }
+            }
+            let _ = app.emit(
+                "agent://done",
+                ChatEvent {
+                    run_id: run_id.clone(),
+                    data: String::new(),
+                },
+            );
+            Ok(())
+        },
+        abort_registration,
+    )
+    .await;
+    stage_relay.abort();
+    bridge.remove_run(&run_id);
+    result.unwrap_or_else(|_| Err("__RUN_STOPPED__".to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Plan 05: hospital agents roster + schema binding admin commands.
+// ---------------------------------------------------------------------------
+
+/// `GET /agents` — the server's service-line roster, projected into the flat
+/// `AgentInfo` list the React registry consumes.
+///
+/// The server answers with `{service_lines, source_usable_lines}` (see
+/// `ServerAgentsResponse`), **not** the `Vec<AgentInfo>` plan 07 §1 assumed. The
+/// projection happens here so `bridge.ts` keeps one UI-facing shape.
+///
+/// Table scopes for the Scope panel are not part of `GET /agents`; they come from
+/// `GET /sources/<id>/binding` (`TableSummary.service_lines`), fetched once per source
+/// listed in `source_usable_lines`. A binding fetch that fails is skipped — the agent
+/// still appears, with an empty table list, rather than the whole roster failing.
+///
+/// Returns `ENDPOINT_NOT_FOUND` on 404 so the store can distinguish "endpoint not built"
+/// from a real server error.
+#[tauri::command]
+pub async fn list_agents(bridge: State<'_, Bridge>) -> Result<Vec<AgentInfo>, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url("/agents");
     let resp = bridge
         .client
-        .post(&url)
+        .get(&url)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        // `GET /agents` is not implemented on this server. Return the sentinel so the
+        // store can fall back to LEGACY_AGENTS instead of treating this as an error.
+        return Err(ENDPOINT_NOT_FOUND.into());
+    }
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    let roster = resp
+        .json::<ServerAgentsResponse>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))?;
+
+    // Per-source table scopes, grouped by service line. Best-effort: a source whose
+    // binding cannot be read simply contributes no tables.
+    let mut source_tables: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    for source_id in roster.source_usable_lines.keys() {
+        let b_url = bridge.url(&format!(
+            "/sources/{}/binding",
+            encode_path_segment(source_id)
+        ));
+        let Ok(b_resp) = bridge.client.get(&b_url).bearer_auth(&token).send().await else {
+            continue;
+        };
+        if !b_resp.status().is_success() {
+            continue;
+        }
+        let Ok(binding) = b_resp.json::<BindingTablesResponse>().await else {
+            continue;
+        };
+        let mut by_line: HashMap<String, Vec<String>> = HashMap::new();
+        for table in binding.tables {
+            for line in &table.service_lines {
+                by_line
+                    .entry(line.clone())
+                    .or_default()
+                    .push(table.table_name.clone());
+            }
+        }
+        for tables in by_line.values_mut() {
+            tables.sort();
+            tables.dedup();
+        }
+        source_tables.insert(source_id.clone(), by_line);
+    }
+
+    Ok(project_agent_roster(roster, &source_tables))
+}
+
+/// `GET /sources/<id>/binding` — full schema binding for a source: coverage per service
+/// line, orphan tables, confidence scores, and history diff. Any authenticated user.
+#[tauri::command]
+pub async fn get_source_binding(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<serde_json::Value, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!("/sources/{}/binding", encode_path_segment(&source_id)));
+    let resp = bridge
+        .client
+        .get(&url)
         .bearer_auth(token)
-        .json(&serde_json::json!({
-            "question": question,
-            "conversation_id": conversation_id,
-        }))
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -1983,66 +3067,137 @@ pub async fn agent(
     if !resp.status().is_success() {
         return Err(error_body(resp).await);
     }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
 
-    let mut events = resp.bytes_stream().eventsource();
-    while let Some(event) = events.next().await {
-        let event = event.map_err(|e| format!("stream error: {e}"))?;
-        match event.event.as_str() {
-            // First event: the server's resolved agent kind (JSON-encoded string).
-            "routed" => {
-                let _ = app.emit(
-                    "agent://routed",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Structured path: the parsed aggregation spec (provenance).
-            "spec" => {
-                let _ = app.emit(
-                    "agent://spec",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Structured path: chart-ready rows [{label, value}].
-            "rows" => {
-                let _ = app.emit(
-                    "agent://rows",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Structured path: the MongoDB pipeline used (explain / audit trail).
-            "pipeline" => {
-                let _ = app.emit(
-                    "agent://pipeline",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Semantic path: citation passages backing the answer.
-            "citations" => {
-                let _ = app.emit(
-                    "agent://citations",
-                    ChatEvent { run_id: run_id.clone(), data: event.data },
-                );
-            }
-            // Both paths: streamed narration / answer tokens (JSON-encoded to preserve spaces).
-            "token" => {
-                let _ = app.emit(
-                    "agent://token",
-                    ChatEvent { run_id: run_id.clone(), data: decode_token(&event.data) },
-                );
-            }
-            "error" => {
-                let _ = app.emit(
-                    "agent://error",
-                    ChatEvent { run_id: run_id.clone(), data: event.data.clone() },
-                );
-                return Err(event.data);
-            }
-            "done" => break,
-            _ => {}
-        }
+/// `POST /sources/<id>/binding/rebuild` — rebuild the schema binding after overrides are
+/// saved or the catalog is refreshed. Returns the new binding summary. Admin only.
+#[tauri::command]
+pub async fn rebuild_source_binding(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<serde_json::Value, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!(
+        "/sources/{}/binding/rebuild",
+        encode_path_segment(&source_id)
+    ));
+    let resp = bridge
+        .client
+        .post(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
     }
-    let _ = app.emit("agent://done", ChatEvent { run_id: run_id.clone(), data: String::new() });
-    Ok(())
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `GET /nl2sql/<id>/catalog/overrides` — fetch extended overrides including
+/// `table_concepts`, `column_roles`, and `service_lines`. Admin only.
+#[tauri::command]
+pub async fn get_catalog_overrides(
+    source_id: String,
+    bridge: State<'_, Bridge>,
+) -> Result<serde_json::Value, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!(
+        "/nl2sql/{}/catalog/overrides",
+        encode_path_segment(&source_id)
+    ));
+    let resp = bridge
+        .client
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// `PUT /nl2sql/<id>/catalog/overrides` — save extended overrides and trigger a binding
+/// rebuild. Returns the updated overrides. Admin only.
+#[tauri::command]
+pub async fn save_catalog_overrides(
+    source_id: String,
+    body: serde_json::Value,
+    bridge: State<'_, Bridge>,
+) -> Result<serde_json::Value, String> {
+    let token = bridge.token().ok_or("not logged in")?;
+    let url = bridge.url(&format!(
+        "/nl2sql/{}/catalog/overrides",
+        encode_path_segment(&source_id)
+    ));
+    let resp = bridge
+        .client
+        .put(&url)
+        .bearer_auth(token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_auth(&bridge, &resp)?;
+    if !resp.status().is_success() {
+        return Err(error_body(resp).await);
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid response: {e}"))
+}
+
+/// Subscribe to the server's live pipeline stages for `run_id` and relay them to
+/// the frontend as `<prefix>://stage`.
+///
+/// This is a second connection on purpose: the server publishes stages while it is
+/// still assembling the answer, which is *before* the answer stream opens, so they
+/// cannot ride along with it (see the server's `progress.rs`). Best-effort — if it
+/// fails, the user loses the activity strip detail, never the answer.
+fn spawn_stage_relay(
+    client: reqwest::Client,
+    url: String,
+    token: String,
+    run_id: String,
+    prefix: &'static str,
+    app: tauri::AppHandle,
+) -> tauri::async_runtime::JoinHandle<()> {
+    let channel = format!("{prefix}://stage");
+    tauri::async_runtime::spawn(async move {
+        let Ok(resp) = client.get(&url).bearer_auth(token).send().await else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        let mut events = resp.bytes_stream().eventsource();
+        while let Some(Ok(event)) = events.next().await {
+            match event.event.as_str() {
+                "stage" => {
+                    let _ = app.emit(
+                        &channel,
+                        ChatEvent {
+                            run_id: run_id.clone(),
+                            data: event.data,
+                        },
+                    );
+                }
+                "done" => break,
+                _ => {}
+            }
+        }
+    })
 }
 
 /// The server JSON-encodes `token` payloads so SSE doesn't strip their leading

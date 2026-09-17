@@ -35,6 +35,25 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// A PHI-free label for the *class* of failure.
+    ///
+    /// `Display` for these variants interpolates the inner message, and those
+    /// messages can echo a bound parameter or a driver's rendering of a row —
+    /// so `Display` must never reach execution provenance (plan 04a §7). This
+    /// gives the provenance path something safe to report instead.
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            AppError::Unauthorized => "unauthorized",
+            AppError::Forbidden => "forbidden",
+            AppError::NotFound => "not found",
+            AppError::BadRequest(_) => "bad request",
+            AppError::Database(_) => "database error",
+            AppError::Unavailable(_) => "service unavailable",
+            AppError::Internal(_) => "internal error",
+            AppError::TooManyRequests(_) => "too many requests",
+        }
+    }
+
     fn status(&self) -> Status {
         match self {
             AppError::Unauthorized => Status::Unauthorized,

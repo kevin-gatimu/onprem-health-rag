@@ -2,12 +2,19 @@
 // the server directly — every call goes through `invoke` into src-tauri, which
 // holds the JWT and performs the actual HTTP request.
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import type { Role, User } from "./types";
 
 /** Sentinel the bridge returns (as a rejected invoke) when the server rejects
  *  our token with 401. Kept in sync with `SESSION_EXPIRED` in commands.rs. */
 export const SESSION_EXPIRED = "__SESSION_EXPIRED__";
+
+/**
+ * Sentinel returned by `listAgents` when the server 404s on `GET /agents`
+ * (i.e. plan 05 is not yet built). Kept in sync with `ENDPOINT_NOT_FOUND`
+ * in commands.rs. Only this exact error should trigger the legacy-agent fallback;
+ * any other failure (500, network error, parse error) is a real error.
+ */
+export const ENDPOINT_NOT_FOUND = "__ENDPOINT_NOT_FOUND__";
 
 type SessionExpiredHandler = () => void;
 let onSessionExpired: SessionExpiredHandler | null = null;
@@ -140,9 +147,16 @@ export function listModels(): Promise<ModelSummary[]> {
   return authedInvoke<ModelSummary[]>("list_models");
 }
 
-/** Download (if needed), load, and select a chat model. Returns the resolved variant id. Admin only. */
-export function selectModel(model: string): Promise<string> {
-  return authedInvoke<string>("select_model", { model });
+export interface SelectModelResult {
+  /** Resolved variant id now loaded and selected. */
+  model: string;
+  /** True when the server purged + re-downloaded corrupt cached weights en route. */
+  repaired: boolean;
+}
+
+/** Download (if needed), load, and select a chat model. Admin only. */
+export function selectModel(model: string): Promise<SelectModelResult> {
+  return authedInvoke<SelectModelResult>("select_model", { model });
 }
 
 export interface EpRegistration {
@@ -170,6 +184,8 @@ export function generate(prompt: string): Promise<void> {
 export interface VariantInfo {
   id: string;
   alias: string;
+  accelerator: string;
+  supports_tool_calling: boolean;
   cached: boolean;
   loaded: boolean;
   current: boolean;
@@ -196,6 +212,8 @@ export interface ModelRole {
   status: string;
   /** Whether this role is served by Foundry Local (downloadable/loadable variants). */
   managed: boolean;
+  /** Whether this role's model is currently resident in the server process. */
+  loaded: boolean;
   /** Downloadable/loadable variants for this role (empty for non-managed roles). */
   variants: VariantInfo[];
   /** The persisted routing override for this role, if an admin has saved one; `null` otherwise. */
@@ -207,9 +225,19 @@ export function getModelRoles(): Promise<ModelRole[]> {
   return authedInvoke<ModelRole[]>("model_roles");
 }
 
+/** Download missing weights and initialize an embeddings or reranker model. Admin only. */
+export function loadSpecializedModel(role: string): Promise<void> {
+  return authedInvoke<void>("load_specialized_model", { role });
+}
+
 /** Persist (or clear, when `variantId` is `null`) a role's model routing override. Admin only. */
 export function setRoleModel(role: string, variantId: string | null): Promise<void> {
   return authedInvoke<void>("set_role_model", { role, variantId });
+}
+
+/** Route chat, classification, rewrite, extraction, and SQL through one variant. */
+export function setSharedModel(variantId: string | null): Promise<void> {
+  return authedInvoke<void>("set_shared_model", { variantId });
 }
 
 /** Result of `deleteModel` — the roles whose saved default named the deleted variant. */
@@ -225,44 +253,23 @@ export function deleteModel(variantId: string): Promise<DeleteModelResult> {
   return authedInvoke<DeleteModelResult>("delete_model", { variantId });
 }
 
-/** Callbacks for the `pullModel` wrapper below. All fields are optional. */
-export interface PullCallbacks {
-  /** Called for each download-progress update, 0..100. */
-  onProgress?: (pct: number) => void;
-  /** Called on each status transition (e.g. `"loading"`, `"loaded"`). */
-  onStatus?: (s: string) => void;
-  /** Called if the server emits an error event. */
-  onError?: (e: string) => void;
-  /** Called when the stream ends normally. */
-  onDone?: () => void;
+/**
+ * Envelope on every `model://*` event (mirror of the bridge's `ModelEvent`) so the
+ * boot-time listeners in bridgeEvents.ts can route progress to the right variant.
+ */
+export interface ModelEvent {
+  variant_id: string;
+  data: string;
 }
 
 /**
- * Download (if needed) and optionally load a model variant, relaying progress via
- * callbacks. Registers all `model://*` listeners **before** invoking so no early
- * event is missed, and unlistens them all when the stream ends (success or error).
+ * Download (if needed) and optionally load a model variant. Progress streams back
+ * as `model://progress|status` events (handled once, at boot, in bridgeEvents.ts →
+ * the models store). Resolves when the stream ends; rejects with the server's
+ * error payload. Drive this via `useModels.startDownload`, not directly.
  */
-export async function pullModel(
-  variantId: string,
-  load: boolean,
-  cb: PullCallbacks,
-): Promise<void> {
-  const unlistenProgress = await listen<string>("model://progress", (ev) => {
-    const pct = parseFloat(ev.payload);
-    if (!Number.isNaN(pct)) cb.onProgress?.(pct);
-  });
-  const unlistenStatus = await listen<string>("model://status", (ev) => cb.onStatus?.(ev.payload));
-  const unlistenError = await listen<string>("model://error", (ev) => cb.onError?.(ev.payload));
-  const unlistenDone = await listen("model://done", () => cb.onDone?.());
-
-  try {
-    await authedInvoke<void>("pull_model", { variantId, load });
-  } finally {
-    unlistenProgress();
-    unlistenStatus();
-    unlistenError();
-    unlistenDone();
-  }
+export function pullModel(variantId: string, load: boolean): Promise<void> {
+  return authedInvoke<void>("pull_model", { variantId, load });
 }
 
 // --- Stage 8: Models + Settings — setup status + per-variant unload ---
@@ -284,6 +291,28 @@ export interface ServiceStatus {
   detail: string | null;
 }
 
+/** One mounted volume on the server host. Mirrors the bridge's `DiskSpec`. */
+export interface DiskSpec {
+  mount: string;
+  total_bytes: number;
+  available_bytes: number;
+}
+
+/** Server host machine facts for the Settings "Server specs" card. Mirrors `ServerSpecs`. */
+export interface ServerSpecs {
+  hostname: string;
+  os: string;
+  arch: string;
+  cpu_model: string;
+  logical_cores: number;
+  physical_cores: number | null;
+  total_memory_bytes: number;
+  disks: DiskSpec[];
+  /** GPU/NPU names, formatted "KIND — name". */
+  accelerators: string[];
+  server_version: string;
+}
+
 /**
  * The single payload backing the Settings page. Mirrors the server's `SetupStatus`
  * (and the bridge's `SetupStatus` struct) — keep all three in sync. Degraded-safe:
@@ -303,6 +332,8 @@ export interface SetupStatus {
   cached_models: string[];
   /** Same shape as `HardwareInfo.execution_providers` (empty when Foundry is down). */
   execution_providers: ExecutionProvider[];
+  /** Host machine facts (never Foundry-derived, so always populated). */
+  server_specs: ServerSpecs;
 }
 
 /** `GET /setup-status` — one call backing the Settings page. Any authenticated user. */
@@ -387,6 +418,120 @@ export function listSources(): Promise<SourceInfo[]> {
   return authedInvoke<SourceInfo[]>("list_sources");
 }
 
+export interface SchemaCatalogStatus {
+  source_id: string;
+  active_version: string;
+  schema_hash: string;
+  captured_at: string | null;
+  table_count: number;
+  status: string;
+  health: string;
+  last_check_at: string | null;
+  last_success_at: string | null;
+  drift_detected: boolean;
+  consecutive_failures: number;
+  last_error: string | null;
+}
+
+export interface SchemaCatalogRefresh {
+  source_id: string;
+  tables_indexed: number;
+}
+
+/** Inspect the active schema metadata generation. Admin only. */
+export function getSchemaCatalog(sourceId: string): Promise<SchemaCatalogStatus> {
+  return authedInvoke<SchemaCatalogStatus>("get_schema_catalog", { sourceId });
+}
+
+/** Rebuild and atomically activate schema metadata. Admin only. */
+export function refreshSchemaCatalog(sourceId: string): Promise<SchemaCatalogRefresh> {
+  return authedInvoke<SchemaCatalogRefresh>("refresh_schema_catalog", { sourceId });
+}
+
+export interface SchemaCatalogHistoryItem {
+  checked_at: string | null;
+  trigger: string;
+  outcome: string;
+  previous_hash: string | null;
+  observed_hash: string | null;
+  table_count: number;
+  error: string | null;
+}
+
+export interface MetadataAlias {
+  table: string;
+  column: string | null;
+  alias: string;
+}
+
+export interface MetadataRelationship {
+  from_table: string;
+  from_column: string;
+  to_table: string;
+  to_column: string;
+}
+
+/** Force a concept onto a table; `concept: null` marks it Unknown.
+ *  VERIFIED: `TableConceptOverride`, `onprem-rag-server/src/nl2sql/routes.rs` L62-67. */
+export interface TableConceptOverride {
+  table: string;
+  concept: string | null;
+}
+
+/** Force a role onto a column.
+ *  VERIFIED: `ColumnRoleOverride`, `onprem-rag-server/src/nl2sql/routes.rs` L69-76. */
+export interface ColumnRoleOverride {
+  table: string;
+  column: string;
+  /** Role slug, e.g. "event_time", "patient_id", "pii". */
+  role: string;
+}
+
+/**
+ * Admin metadata overrides for one source — the body of both
+ * `GET` and `PUT /nl2sql/<id>/catalog/overrides`.
+ *
+ * VERIFIED: `MetadataOverrides`, `onprem-rag-server/src/nl2sql/routes.rs`
+ * L78-93 (all five fields).
+ *
+ * Every field is REQUIRED on purpose. The server replaces the whole document on
+ * PUT (`replace_one(..).upsert(true)`, `onprem-rag-server/src/nl2sql/http.rs`
+ * L215-221), so a caller that omits a field erases it. Making them optional
+ * would let that erasure type-check.
+ */
+export interface MetadataOverrides {
+  aliases: MetadataAlias[];
+  relationships: MetadataRelationship[];
+  table_concepts: TableConceptOverride[];
+  column_roles: ColumnRoleOverride[];
+  /** Service-line slugs to force on; empty means automatic detection. */
+  service_lines: string[];
+}
+
+/** An empty override document — use as the initial state so no field is dropped. */
+export const EMPTY_METADATA_OVERRIDES: MetadataOverrides = {
+  aliases: [],
+  relationships: [],
+  table_concepts: [],
+  column_roles: [],
+  service_lines: [],
+};
+
+export function getSchemaCatalogHistory(sourceId: string): Promise<SchemaCatalogHistoryItem[]> {
+  return authedInvoke<SchemaCatalogHistoryItem[]>("get_schema_catalog_history", { sourceId });
+}
+
+export function getSchemaMetadataOverrides(sourceId: string): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("get_schema_metadata_overrides", { sourceId });
+}
+
+export function saveSchemaMetadataOverrides(
+  sourceId: string,
+  overrides: MetadataOverrides,
+): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("save_schema_metadata_overrides", { sourceId, overrides });
+}
+
 /** Connect and verify a source without saving. Admin only. */
 export function testSource(source: SourceInput): Promise<void> {
   return authedInvoke<void>("test_source", { source });
@@ -448,6 +593,8 @@ export interface IngestProgress {
   failed_tables: number;
   /** Cumulative UTF-8 bytes of embedded chunk text. */
   db_size_bytes: number;
+  /** Rows annotated by the clinical extractor (plan 25); 0 when it is disabled. */
+  extracted_rows: number;
   /** Full current log; server-capped at 500. Replace wholesale each event. */
   log: LogEntry[];
 }
@@ -790,17 +937,57 @@ export interface Conversation {
 }
 
 /** One stored message in a conversation. Mirrors the server's `MessageOut`. */
+export interface SqlResult {
+  source_id: string;
+  sql: string;
+  columns: string[];
+  rows: unknown[][];
+  /** QuerySpec IR used to generate the SQL (plan 06). */
+  spec?: unknown;
+  /** Human-readable summary of what the query returned (plan 06). */
+  explanation?: string;
+}
+
 export interface StoredMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   /** `null` for user messages; passage array for assistant messages. */
   citations: Passage[] | null;
+  /** Persisted grounding verdict for verified assistant messages. */
+  verify?: VerifyReport;
   created_at: string;
   /** Present only for agent messages. */
   agent_kind?: string;
   /** Present only for structured-result agent messages. */
   structured?: StructuredResult;
+  /** Present for chat answers backed by a live operational SQL query. */
+  sql_result?: SqlResult;
+  /**
+   * Mode the answer was produced in. VERIFIED: `MessageOut.mode`,
+   * `onprem-rag-server/src/routes/conversations.rs` L72 (`#[serde(skip_serializing_if
+   * = "Option::is_none")]`, so it is absent — never null — on messages written
+   * before plan 05).
+   */
+  mode?: AgentMode;
+  // ── SPEC-DERIVED, UNCONFIRMED ─────────────────────────────────────────────
+  // The server's persisted message DTO is `MessageOut` in
+  // `onprem-rag-server/src/routes/conversations.rs` L57-80. As of this commit it
+  // carries `id`, `role`, `content`, `citations`, `verify`, `agent_kind`, `mode`,
+  // `structured`, `sql_result`, `created_at` — but NONE of the five fields below.
+  // They are mirrored ahead of plans 04/06 landing, and each is optional so an
+  // absent field is simply undefined rather than a parse error. Re-verify every
+  // one of them against `MessageOut` before treating any as delivered.
+  /** Execution provenance for this turn (plan 06 `provenance` SSE event). */
+  provenance?: Provenance;
+  /** QuerySpec IR or structured result spec attached to this message (plan 06). */
+  spec?: unknown;
+  /** Follow-up suggestion chips (plan 06). */
+  suggestions?: Suggestion[];
+  /** Active focus entities used to scope the answer (plan 06). */
+  focus_used?: string[];
+  /** Clarification request — present when the router could not resolve a slot (plan 06). */
+  clarify?: ClarifyPayload;
 }
 
 /**
@@ -810,6 +997,89 @@ export interface StoredMessage {
 export interface ChatEvent {
   run_id: string;
   data: string;
+}
+
+// --- Intent Router v3 types (plan 02) ---
+
+/** The five slot types that can trigger a Clarify decision. */
+export type MissingSlot = "subject" | "patient" | "time_range" | "dimension" | "metric";
+
+/**
+ * Route class label as emitted by the server's `route_label()`.
+ *
+ * VERIFIED, exhaustive against `RouteDecision::route_label`
+ * (`onprem-rag-server/src/router/mod.rs` L152-161). `"capability"` is the plan-05
+ * addition: `RouteClass::Capability` (same file, L80) is produced by
+ * `capability_decision` (`onprem-rag-server/src/agents/routes.rs` L585-597) and by
+ * the `/chat` capability arm (`onprem-rag-server/src/rag/routes.rs` L335).
+ */
+export type RouteLabel =
+  | "conversational"
+  | "capability"
+  | "conversation_meta"
+  | "structured"
+  | "semantic"
+  | "hybrid"
+  | "clarify";
+
+/**
+ * Payload parsed from the `chat://routed` and `agent://routed` SSE events.
+ *
+ * v2-compatible fields: `route`, `intent`, `backend`, `tier`, `cached`.
+ * v3 additions (present when `ONPREM_ROUTER_V3=true`): `service_line`,
+ * `deterministic`, `scope_size`, `source_id`.
+ * Clarify-specific (only when `route === "clarify"`): `question`, `slot`.
+ */
+export interface RoutedPayload {
+  route: RouteLabel;
+  intent?: string | null;
+  /**
+   * VERIFIED against `RouteDecision::to_sse_json` in
+   * `onprem-rag-server/src/router/mod.rs` (≈L176-186): the server emits
+   * `"source_sql"` or `"document_db"`, and `null` for non-structured routes.
+   * (An earlier mirror here said `"doc_db"`, which never matched.)
+   */
+  backend?: "document_db" | "source_sql" | null;
+  tier: number;
+  cached: boolean;
+  /**
+   * True when the Tier-2 model branch was *entered* for this question —
+   * regardless of whether the model responded, the cache hit, or foundry was
+   * unavailable.  False for Tier 0 / 1 / 1.5 decisions that never reached
+   * Tier 2.  Can drive an "AI-assisted routing" indicator in the UI.
+   */
+  tier2_attempted?: boolean;
+  /** v3: active service line (e.g. "pharmacy", "ward_board"). */
+  service_line?: string | null;
+  /** v3: true when the decision came from the deterministic Tier 1.5 parse. */
+  deterministic?: boolean;
+  /** v3: number of tables in the backend scope. */
+  scope_size?: number;
+  /** v3: live SQL source id when backend is source_sql. */
+  source_id?: string | null;
+  /** Clarify: the clarification question to display to the user. */
+  question?: string;
+  /** Clarify: which slot was missing. */
+  slot?: MissingSlot;
+  /**
+   * SPEC-DERIVED, UNCONFIRMED. Plan 07 §1 says `routed` "now includes
+   * `focus_used`", but `RouteDecision::to_sse_json`
+   * (`onprem-rag-server/src/router/mod.rs` L171-227) emits no such key today —
+   * it emits `route`, `intent`, `backend`, `tier`, `cached`, `tier2_attempted`,
+   * and conditionally `service_line`, `deterministic`, `scope_size`,
+   * `source_id`, `question`, `slot`. Optional here so the field simply stays
+   * `undefined` until a server emits it.
+   */
+  focus_used?: string[];
+}
+
+/** Parse a `chat://routed` or `agent://routed` event's `data` string. */
+export function parseRoutedPayload(data: string): RoutedPayload | null {
+  try {
+    return JSON.parse(data) as RoutedPayload;
+  } catch {
+    return null;
+  }
 }
 
 /** `GET /conversations` — all conversations for the current user, most-recent first. */
@@ -834,6 +1104,51 @@ export const deleteConversation = (id: string): Promise<void> =>
 export const getMessages = (id: string): Promise<StoredMessage[]> =>
   authedInvoke<StoredMessage[]>("get_messages", { id });
 
+/** One claim the faithfulness verifier lifted out of an answer, with its verdict. */
+export interface ClaimCheck {
+  claim: string;
+  supported: boolean;
+  /** 1-based indices into the citation list. Empty when unsupported. */
+  passages: number[];
+}
+
+/**
+ * One pipeline step, relayed live from the server as `chat://stage` /
+ * `agent://stage` while the answer is still being assembled. Mirrors the
+ * server's `ProgressEvent` (`progress.rs`).
+ *
+ * The server does its retrieval, planning and DB work *before* the answer stream
+ * opens, so these arrive on a separate subscription the bridge opens for the run
+ * — that is the only reason the strip can show anything during the long wait.
+ */
+export interface StageEvent {
+  /** Stable stage key, e.g. `"search_vector"`. */
+  stage: string;
+  /** Human-readable label, e.g. `"Searching records by meaning"`. */
+  label: string;
+  status: "start" | "end" | "done";
+  /** Wall time for the step; present on `"end"`. */
+  ms?: number;
+  /** PHI-free detail, e.g. `"kept the best 6 of 30 passages"`. */
+  detail?: string;
+  /** Monotonic per-run sequence, used to dedupe a replayed backlog. */
+  seq: number;
+}
+
+/**
+ * Post-stream grounding report (plan 25), delivered as a `chat://verify` event
+ * after the answer has finished streaming. `skipped` means the check did not run
+ * or could not be trusted — never treat it as a pass; `reason` says why.
+ */
+export interface VerifyReport {
+  status: "supported" | "partial" | "unsupported" | "skipped";
+  claims: ClaimCheck[];
+  unsupported: number;
+  reason?: string;
+  /** `[N]` markers in the answer pointing past the end of the citation list. */
+  citation_overflow?: number[];
+}
+
 /**
  * Ask a grounded question. The passages backing the answer arrive first as a
  * `chat://citations` event (payload: `ChatEvent` with `data` = JSON `Passage[]`),
@@ -853,6 +1168,10 @@ export function chat(
   runId: string,
 ): Promise<void> {
   return authedInvoke<void>("chat", { question, history, opts, conversationId, runId });
+}
+
+export function cancelRun(runId: string): Promise<boolean> {
+  return authedInvoke<boolean>('cancel_run', { runId });
 }
 
 // --- Live log stream: server `tracing` events surfaced in the app ---
@@ -878,10 +1197,163 @@ export function startLogStream(): Promise<void> {
 
 // --- Workstream 7: AI Agents ---
 
-/** The agent kinds. `"auto"` lets the server resolve the real kind (announced via the `routed` event). */
-export type AgentKind = "auto" | "health_query" | "trends" | "patient_lookup" | "summarize" | "chat";
+/**
+ * Agent kind — a service-line slug such as "ask", "maternity", "pharmacy", …
+ * or one of the legacy kinds the current server still accepts
+ * ("auto", "health_query", "trends", "patient_lookup", "summarize", "chat").
+ * Validation is server-side; the bridge passes the string through unchanged.
+ */
+export type AgentKind = string;
+
+/** Mode sent alongside every agent turn. */
+export type AgentMode = "ask" | "trends" | "handover";
+
+/** One source's table scope as reported by `GET /agents`. */
+export interface AgentSourceScope {
+  source_id: string;
+  tables: string[];
+}
+
+/**
+ * One entry in the agent roster as the bridge hands it over.
+ *
+ * This is NOT the raw `GET /agents` body. The server answers with
+ * `{service_lines: [...], source_usable_lines: {...}}`
+ * (`onprem-rag-server/src/agents/registry.rs` `AgentsResponse` L54-59, VERIFIED — the
+ * route moved out of `ontology/routes.rs` in plan 05 §8); the Rust bridge folds that —
+ * plus `GET /sources/<id>/binding` for table scopes — into this flat shape. See
+ * `AgentInfo` in `src-tauri/src/commands.rs` for the per-field provenance table.
+ *
+ * `modes` and `example_questions` are REAL server fields, not synthesised:
+ * `ServiceLineInfo.modes` (`agents/registry.rs` L44, filled from `AgentMode::ALL` at
+ * L83) and `ServiceLineInfo.example_questions` (same file L41, the answerable-only
+ * list from `persona::bound_examples`). The bridge only falls back to `["ask"]` /
+ * the unfiltered `examples` when a server omits the field entirely — never over a
+ * value the server actually sent, including an explicitly empty one.
+ */
+export interface AgentInfo {
+  kind: AgentKind;
+  label: string;
+  blurb: string;
+  /** Display tier: 1 = daily tabs, 2 = service-line, 3 = management. */
+  tier: 1 | 2 | 3;
+  /** True when at least one connected source can serve this line. */
+  usable: boolean;
+  modes: AgentMode[];
+  sources: AgentSourceScope[];
+  example_questions: string[];
+  /** Entity concepts this line owns (verified: `ServiceLineInfo.concepts`). */
+  concepts: string[];
+}
+
+/**
+ * Clarification request emitted when the router cannot resolve a required slot.
+ * Mirrors the server's `Clarify` SSE payload and the persisted `StoredMessage.clarify`
+ * field.
+ *
+ * NOTE: mirrors the plan-04/06 spec (plans/new/04-structured-execution-and-fallbacks.md §6
+ * and plans/new/06-conversation-memory-and-suggestions.md). The server does not emit this
+ * payload yet — must be re-verified against a real server payload once plan 04/06 ships.
+ */
+export interface ClarifyPayload {
+  question: string;
+  slot: string;
+  options: string[];
+}
+
+/**
+ * One follow-up suggestion delivered after an agent answer.
+ *
+ * NOTE: mirrors the plan-06 spec (plans/new/06-conversation-memory-and-suggestions.md).
+ * The server does not emit this payload yet — must be re-verified against a real server
+ * payload once plan 06 ships.
+ *
+ * `kind` carries an explicit escape hatch (`string & {}`) so an unrecognised value from
+ * the server arrives as a visible string rather than silently violating the narrowed union.
+ */
+export interface Suggestion {
+  text: string;
+  kind: "drill" | "widen" | "compare" | "switch" | "explain" | (string & {});
+  /** Backend-specific query spec to send back as `suggestionSpec`. */
+  spec?: unknown;
+  /** Target agent kind for "switch" suggestions. */
+  agent?: AgentKind;
+}
+
+/**
+ * One step in a provenance path.
+ *
+ * NOTE: mirrors the plan-04 spec (plans/new/04-structured-execution-and-fallbacks.md §6).
+ * The server does not emit this payload yet — must be re-verified against a real server
+ * payload once plan 04 ships.
+ *
+ * The bridge flattens the server's `Rung(RungResult)` enum as `{rung, result, reason}`.
+ * See commands.rs `ProvenanceRung` for the transformation note.
+ *
+ * `result` carries an explicit escape hatch (`string & {}`) so an unrecognised value
+ * arrives as a visible string rather than silently violating the narrowed union.
+ */
+export type ProvenanceRung = {
+  rung: string;
+  result: "hit" | "miss" | "skipped" | (string & {});
+  /** PHI-free reason shown on hover for misses. */
+  reason?: string;
+};
+
+/**
+ * Execution provenance delivered as the `provenance` SSE event after each answer.
+ * Mirrors the server's `Provenance` struct (plan 04/06).
+ *
+ * NOTE: mirrors the plan-04/06 spec. The server does not emit this payload yet —
+ * must be re-verified against a real server payload once plan 04 ships.
+ *
+ * `backend` carries an explicit escape hatch (`string & {}`) so an unrecognised value
+ * arrives as a visible string rather than silently violating the narrowed union.
+ */
+export interface Provenance {
+  path: ProvenanceRung[];
+  backend: "source_sql" | "document_db" | "semantic" | "hybrid" | "none" | (string & {});
+  service_line?: string;
+  scope: string[];
+  source_id?: string;
+  elapsed_ms: Record<string, number>;
+}
+
+/**
+ * The `chat://routed` / `agent://routed` payload. Plan 07 §2 names this `RoutedEvent`;
+ * it is the same wire format as `RoutedPayload` above, so it is an alias rather than a
+ * second near-duplicate interface that could drift.
+ *
+ * Deliberate divergence from plan 07's prose, which types `deterministic: boolean` as
+ * required: `to_sse_json` only inserts `service_line` / `deterministic` / `scope_size` /
+ * `source_id` when `deterministic || service_line.is_some() || !scope.is_empty()`
+ * (`onprem-rag-server/src/router/mod.rs` ≈L196). They are genuinely optional on the
+ * wire, so they are optional here.
+ *
+ * `focus_used` is **spec-derived, unconfirmed** — no server code emits it yet.
+ */
+export type RoutedEvent = RoutedPayload;
 
 /** One row from a structured aggregation result (chart-ready). */
+/** `agent://page` — where one page of an enumeration answer sits in the result set.
+ *
+ * Mirrors the `page` SSE event from `onprem-rag-server/src/agents/routes.rs`
+ * (`run_docdb_list`). `has_more` is computed server-side: deriving it per client is how
+ * a last page ends up offering a "next" that returns nothing.
+ */
+export interface AgentPage {
+  collection: string;
+  /** Total matching records, not just this page. */
+  total: number;
+  /** 0-based offset of the first row on this page. */
+  offset: number;
+  /** Page size actually applied (server default 50, capped at 200). */
+  limit: number;
+  /** Rows on this page — smaller than `limit` on the last one. */
+  returned: number;
+  has_more: boolean;
+}
+
 export interface AggRow {
   label: string;
   value: number;
@@ -906,25 +1378,164 @@ export interface StructuredResult {
 }
 
 /**
+ * Fetch the server's agent roster. Returns `AgentInfo[]` with usability and scope
+ * per connected source. Depends on plan 05 (`GET /agents`); callers must provide
+ * a fallback when this rejects (the registry store does this automatically).
+ */
+export function listAgents(): Promise<AgentInfo[]> {
+  return authedInvoke<AgentInfo[]>("list_agents");
+}
+
+/**
  * Invoke the AI Agents endpoint. Events are relayed centrally through
- * bridgeEvents.ts as `agent://routed|spec|rows|pipeline|citations|token|error|done`,
- * each enveloped as `ChatEvent` and stamped with `runId` so stale runs are dropped.
- * `conversationId`, when non-null, tells the server to persist the exchange and load
- * history from the DB. `kind` may be "auto" (server resolves the real kind and emits
- * it via the `routed` event first).
+ * bridgeEvents.ts as `agent://routed|spec|rows|pipeline|citations|provenance|
+ * suggestions|clarify|token|error|done`, each enveloped as `ChatEvent` and stamped
+ * with `runId` so stale runs are dropped.
+ *
+ * `conversationId`, when non-null, tells the server to persist the exchange.
+ * `opts.mode` (plan 07) targets Ask / Trends / Handover processing.
+ * `opts.sourceId` (plan 05) pins the run to one source's schema scope.
+ * `opts.suggestionSpec` (plan 06) forwards a suggestion's embedded query spec.
  */
 export function agent(
   kind: AgentKind,
   question: string,
   conversationId: string | null,
   runId: string,
+  opts?: {
+    mode?: AgentMode;
+    sourceId?: string;
+    suggestionSpec?: unknown;
+    /** Enumeration page size (server default 50, capped at 200). */
+    limit?: number;
+    /** Enumeration row offset, 0-based. Pass with `limit` to page without re-planning. */
+    offset?: number;
+  },
 ): Promise<void> {
-  return authedInvoke<void>("agent", { kind, question, conversationId, runId });
+  return authedInvoke<void>("agent", {
+    kind,
+    question,
+    conversationId,
+    runId,
+    mode: opts?.mode ?? null,
+    sourceId: opts?.sourceId ?? null,
+    suggestionSpec: opts?.suggestionSpec ?? null,
+    limit: opts?.limit ?? null,
+    offset: opts?.offset ?? null,
+  });
 }
 
 /** `GET /agent-conversations?kind=` — agent conversations for one kind, most-recent first. */
 export const listAgentConversations = (kind: AgentKind): Promise<Conversation[]> =>
   authedInvoke<Conversation[]>("list_agent_conversations", { kind });
+
+// --- Plan 05: schema binding admin ---
+//
+// Every shape below is VERIFIED against the server structs that serialise it —
+// file and line are cited on each interface. `ServiceLine` is a fieldless serde
+// enum with `rename_all = "snake_case"`
+// (`onprem-rag-server/src/ontology/service_line.rs` L20-22), so every service
+// line crosses the wire as its plain slug string, never as an object.
+
+/**
+ * Binding coverage counters.
+ *
+ * VERIFIED: `BindingCoverage` in `onprem-rag-server/src/ontology/binding.rs`
+ * L75-85.
+ */
+export interface BindingCoverage {
+  total_tables: number;
+  /** Tables with a concept other than Unknown. */
+  bound_tables: number;
+  /** Tables the binder could not attach to any concept — the orphan warning. */
+  orphan_tables: number;
+  /** Tables bound at confidence >= 0.80. */
+  exact_concepts: number;
+  /** Service-line slugs with at least one owned concept bound. */
+  usable_lines: string[];
+}
+
+/**
+ * One table row of a source's binding.
+ *
+ * VERIFIED: `TableSummary` in `onprem-rag-server/src/ontology/routes.rs`
+ * L66-74, built by `BindingResponse::from_binding` (same file, L75-99).
+ */
+export interface BindingTable {
+  table_name: string;
+  /** Concept slug; `"unknown"` for an orphan table. */
+  concept: string;
+  confidence: number;
+  /** Service-line slugs this table feeds. */
+  service_lines: string[];
+  event_time_col: string | null;
+  patient_path_hops: number | null;
+}
+
+/**
+ * `GET /sources/<id>/binding` response.
+ *
+ * VERIFIED: `BindingResponse` in `onprem-rag-server/src/ontology/routes.rs`
+ * (`source_id`, `bound_at`, `degraded`, `coverage`, `usable_lines`, `orphans`,
+ * `tables`). Note the route guard is a bare `AuthUser` (L154-158) with no
+ * `require_admin()`, so this is readable by any signed-in user — the bridge's
+ * `list_agents` relies on that to build each agent's table scope.
+ */
+export interface SourceBinding {
+  source_id: string;
+  /** RFC-3339 timestamp of when the binding was computed. */
+  bound_at: string;
+  degraded: boolean;
+  coverage: BindingCoverage;
+  usable_lines: string[];
+  /**
+   * Tables in the schema catalog that fall in no service line's scope. The
+   * invariant is `[]`; a non-empty list is an admin-visible ontology gap, not an
+   * error. Optional here because a server that predates plan 05 §3 omits it —
+   * the Data Binding banner then falls back to `coverage.orphan_tables`.
+   */
+  orphans?: string[];
+  tables: BindingTable[];
+}
+
+/**
+ * `POST /sources/<id>/binding/rebuild` response.
+ *
+ * VERIFIED: the `json!` literal in `rebuild_binding`,
+ * `onprem-rag-server/src/ontology/routes.rs` L214-221.
+ */
+export interface RebuildBindingResult {
+  status: string;
+  source_id: string;
+  tables: number;
+  bound: number;
+  orphans: number;
+  usable_lines: string[];
+}
+
+/** `GET /sources/<id>/binding` — full binding for a source, coverage per line, orphans. */
+export function getSourceBinding(sourceId: string): Promise<SourceBinding> {
+  return authedInvoke<SourceBinding>("get_source_binding", { sourceId });
+}
+
+/** `POST /sources/<id>/binding/rebuild` — rebuild the schema binding after a catalog refresh. Admin only. */
+export function rebuildSourceBinding(sourceId: string): Promise<RebuildBindingResult> {
+  return authedInvoke<RebuildBindingResult>("rebuild_source_binding", { sourceId });
+}
+
+/** `GET /nl2sql/<id>/catalog/overrides` — fetch extended overrides (concept + column-role + service-line). Admin only. */
+export function getCatalogOverrides(sourceId: string): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("get_catalog_overrides", { sourceId });
+}
+
+/** `PUT /nl2sql/<id>/catalog/overrides` — save extended overrides. Admin only.
+ *  The server replaces the whole document, so `body` must carry every field back. */
+export function saveCatalogOverrides(
+  sourceId: string,
+  body: MetadataOverrides,
+): Promise<MetadataOverrides> {
+  return authedInvoke<MetadataOverrides>("save_catalog_overrides", { sourceId, body });
+}
 
 // --- Stage 9: Profile + User Management ---
 

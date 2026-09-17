@@ -13,13 +13,24 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 
+use regex::Regex;
 use serde::Serialize;
 use tokio::sync::broadcast;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+
+/// Matches ANSI SGR color/reset sequences (e.g. `\x1b[32m`, `\x1b[0m`). Rocket's
+/// own request-logging tracing calls (`Matched: (name) GET /path`) embed these
+/// directly in the event's message text for its colored terminal output — they
+/// aren't added by `tracing_subscriber`'s fmt layer, so they survive into any
+/// event data a `Layer` reads, this one included. Strip them here so the app's
+/// plain-text log viewer shows readable text instead of raw escape codes; the
+/// terminal's own `fmt::layer()` is unaffected (it reads the same raw event
+/// independently and still renders the color).
+static ANSI_SGR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*m").unwrap());
 
 /// How many recent lines to retain for replay to a freshly-connected client.
 const RING_CAP: usize = 300;
@@ -54,7 +65,10 @@ pub struct LogHub {
 impl LogHub {
     fn new() -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAP);
-        LogHub { tx, ring: Mutex::new(VecDeque::with_capacity(RING_CAP)) }
+        LogHub {
+            tx,
+            ring: Mutex::new(VecDeque::with_capacity(RING_CAP)),
+        }
     }
 
     /// Record a line: append to the ring (evicting the oldest past `RING_CAP`),
@@ -100,7 +114,7 @@ impl<S: Subscriber> Layer<S> for BroadcastLayer {
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             level: meta.level().as_str().to_string(),
             target: meta.target().to_string(),
-            message: visitor.finish(),
+            message: ANSI_SGR.replace_all(&visitor.finish(), "").into_owned(),
         };
         hub().push(line);
     }

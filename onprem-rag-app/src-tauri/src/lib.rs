@@ -1,6 +1,10 @@
 mod commands;
 mod state;
 
+// Wire-format assertions for the bridge mirrors (JSON text, not Rust round-trips).
+#[cfg(test)]
+mod wire_tests;
+
 use state::Bridge;
 
 /// Default server URL when the app hasn't been pointed elsewhere. Overridable at
@@ -10,8 +14,27 @@ const DEFAULT_SERVER_URL: &str = "http://localhost:8000";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Desktop-only: single-instance must be the FIRST registered plugin so a second
+    // launch is intercepted before anything else initializes; window-state restores
+    // size/position from the previous run.
+    #[cfg(desktop)]
+    {
+        builder = builder
+            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }))
+            .plugin(tauri_plugin_window_state::Builder::default().build());
+    }
+
+    builder
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(Bridge::new(DEFAULT_SERVER_URL.to_string()))
         .setup(|app| {
@@ -47,14 +70,21 @@ pub fn run() {
             commands::list_models,
             commands::select_model,
             commands::set_role_model,
+            commands::set_shared_model,
             commands::register_eps,
             commands::model_roles,
+            commands::load_specialized_model,
             commands::pull_model,
             commands::delete_model,
             commands::get_setup_status,
             commands::unload_model,
             commands::generate,
             commands::list_sources,
+            commands::get_schema_catalog,
+            commands::refresh_schema_catalog,
+            commands::get_schema_catalog_history,
+            commands::get_schema_metadata_overrides,
+            commands::save_schema_metadata_overrides,
             commands::test_source,
             commands::save_source,
             commands::update_source,
@@ -72,9 +102,15 @@ pub fn run() {
             commands::search,
             commands::chat,
             commands::agent,
+            commands::cancel_run,
             commands::start_log_stream,
             commands::list_conversations,
+            commands::list_agents,
             commands::list_agent_conversations,
+            commands::get_source_binding,
+            commands::rebuild_source_binding,
+            commands::get_catalog_overrides,
+            commands::save_catalog_overrides,
             commands::create_conversation,
             commands::rename_conversation,
             commands::delete_conversation,

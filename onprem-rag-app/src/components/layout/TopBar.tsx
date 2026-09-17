@@ -1,9 +1,10 @@
 // Mobile app bar (< md). Shows the brand + current screen title on the left and a
 // menu button that opens the full-nav sheet. Hidden at md+ where the rail/sidebar
 // carries navigation.
-import { Activity, Menu } from "lucide-react";
+import { Menu } from "lucide-react";
 import { useUi, currentRoute } from "../../stores/ui";
 import { navItem } from "../../app/navigation";
+import logo from "../../assets/logo.png";
 
 export function TopBar() {
   const openSheet = useUi((s) => s.openSheet);
@@ -12,7 +13,7 @@ export function TopBar() {
 
   return (
     <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border bg-surface px-4 md:hidden">
-      <Activity size={20} className="text-accent shrink-0" />
+      <img src={logo} alt="Health RAG" className="h-5 w-5 shrink-0 rounded object-contain" />
       <span className="min-w-0 flex-1 truncate font-semibold text-fg">
         {item?.label ?? "Health RAG"}
       </span>
